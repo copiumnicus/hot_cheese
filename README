@@ -1,2 +1,11 @@
 nm -gU ./libtouchid.dylib 
 swiftc -emit-library -emit-objc-header -emit-objc-header-path touchid.h -o libtouchid.dylib main.swift
+
+
+mkdir -p MyApp.app/Contents/MacOS
+cp target/debug/your_project MyApp.app/Contents/MacOS/
+import Foundation
+open MyApp.app
+
+
+cargo build && cp ./target/debug/cc_sstore ./MyApp.app/Contents/MacOS && cp ./target/debug/libtouchid.dylib ./MyApp.app/Contents/Frameworks
