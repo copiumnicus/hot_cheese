@@ -1,0 +1,2 @@
+nm -gU ./libtouchid.dylib 
+swiftc -emit-library -emit-objc-header -emit-objc-header-path touchid.h -o libtouchid.dylib main.swift
