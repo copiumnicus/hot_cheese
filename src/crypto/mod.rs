@@ -7,6 +7,7 @@ use aes::{
     Aes128,
 };
 use err_mac::create_err_with_impls;
+use k256::ecdsa::SigningKey;
 use rand::{CryptoRng, Rng};
 use scrypt::{scrypt, Params as ScryptParams};
 use std::{
@@ -19,6 +20,10 @@ use tiny_keccak::{Hasher, Keccak};
 mod bytes_hex;
 mod keystore;
 pub use keystore::{CipherparamsJson, CryptoJson, EthKeystore, KdfparamsType};
+
+pub fn random_pk<R: Rng + CryptoRng>(rng: &mut R) -> SigningKey {
+    SigningKey::random(rng)
+}
 
 /// convert hex str to a vec of bytes
 pub fn to_vec(mut s: &str) -> Option<Vec<u8>> {

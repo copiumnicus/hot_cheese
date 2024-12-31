@@ -1,17 +1,37 @@
-use cc_sstore::get_password_from_keychain;
+use cc_sstore::generate_key;
 use cc_sstore::run_menu;
 use cc_sstore::toast;
-use cc_sstore::touch_id_auth;
-use std::ffi::CStr;
-use std::ffi::CString;
-use std::net::SocketAddr;
-use std::time::Duration;
+use cc_sstore::BIND;
 use tiny_http::Method;
 use tiny_http::StatusCode;
 use tiny_http::{Response, Server};
 
-const STORE_PATH: &str = "~/Documents/SSTORE";
-const BIND: &str = "127.0.0.1:5555";
+fn is_valid_string_name(name: &str) -> bool {
+    // Check that all characters in the name are valid (a-z, A-Z, _)
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn handle_request(path: &str) -> Option<String> {
+    if let Some(name) = path.strip_prefix("/generate/") {
+        if is_valid_string_name(name) {
+            match generate_key(name) {
+                Ok(_) => {
+                    toast("Generate", format!("Success generating: {}", name));
+                    return Some(format!("Generated: {}", name));
+                }
+                Err(e) => {
+                    toast("Generate error", format!("{:?}", e));
+                }
+            }
+        }
+    } else if let Some(name) = path.strip_prefix("/read/") {
+        if is_valid_string_name(name) {
+            return Some(format!("Read: {}", name));
+        }
+    }
+
+    None
+}
 
 fn main() {
     let server = Server::https(
@@ -44,34 +64,14 @@ fn main() {
                 )
                 .as_str(),
             );
-            let response = Response::from_string("hello world");
-            request
-                .respond(response)
-                .unwrap_or(println!("Failed to respond to request"));
-        }
-    });
-
-    std::thread::spawn(|| {
-        if !touch_id_auth("authorize access to `CC_PROD_0`") {
-            toast("Owner Auth", "Authorization failed");
-            return;
-        }
-        // Define the service and account
-        let service = CString::new("com.example.myapp").expect("CString::new failed");
-        let account = CString::new("myusername").expect("CString::new failed");
-
-        // Call the Swift function
-        let password_ptr =
-            unsafe { get_password_from_keychain(service.as_ptr(), account.as_ptr()) };
-
-        if !password_ptr.is_null() {
-            // Convert the returned C string to a Rust string
-            let password = unsafe { CStr::from_ptr(password_ptr) }
-                .to_str()
-                .expect("Failed to convert CStr to &str");
-            println!("Password: {}", password);
-        } else {
-            println!("Password not found or an error occurred.");
+            match handle_request(request.url()) {
+                Some(r) => {
+                    let _ = request.respond(Response::from_string(r));
+                }
+                None => {
+                    let _ = request.respond(Response::empty(StatusCode(400)));
+                }
+            }
         }
     });
     // need on main thread
