@@ -8,4 +8,5 @@ import Foundation
 open MyApp.app
 
 
-cargo build && cp ./target/debug/cc_sstore ./MyApp.app/Contents/MacOS && cp ./target/debug/libtouchid.dylib ./MyApp.app/Contents/Frameworks
+security add-generic-password -a myusername -s com.example.myapp -w mypassword
+need "My Development Certificate"

@@ -5,3 +5,15 @@ edition = "2021"
 
 [dependencies]
 tiny_http = { version = "0.12.0", features = ["ssl-openssl"] }
+err_mac = { git = "https://github.com/copiumnicus/err_mac.git", rev = "08f6335" }
+scrypt = { version = "0.10.0" }
+aes = "0.8.0"
+ctr = "0.9.0"
+k256 = { version = "0.13.1", default-features = false, features = [
+    "ecdsa",
+    "std",
+] }
+serde = { version = "1.0.217", features = ["derive"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+rand = "0.8.5"
+serde_json = "1.0.134"
