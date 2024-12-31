@@ -3,3 +3,4 @@ MyApp.app
 MacOS
 Frameworks
 .DS_Store
+*.pem

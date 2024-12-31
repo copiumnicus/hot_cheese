@@ -2,6 +2,43 @@ import LocalAuthentication
 import Foundation
 import Security
 import UserNotifications
+import Cocoa
+
+@_silgen_name("run_menu")
+public func run_menu(){
+    // MARK: - Main Entry Point
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory) // Prevents Dock icon
+
+    // Create the Status Bar Item
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    // Set up the status bar button
+    if let button = statusItem.button {
+        button.image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "CC_SSTORE")
+        // button.action = #selector(statusBarClicked)
+    }
+
+    // Set up the menu
+    let menu = NSMenu()
+    // menu.addItem(NSMenuItem(title: "Authenticate with Touch ID", action: #selector(authenticate), keyEquivalent: ""))
+    // menu.addItem(NSMenuItem(title: "Get Password", action: #selector(getPassword), keyEquivalent: ""))
+    // menu.addItem(NSMenuItem(title: "Show Toast", action: #selector(showToast), keyEquivalent: ""))
+    // menu.addItem(NSMenuItem.separator())
+    // menu.addItem(NSMenuItem(title: "Quit", action:  NSApplication.shared.terminate(nil), keyEquivalent: "q"))
+    menu.addItem(NSMenuItem(title: "Quit CC_SSTORE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+
+    // Attach the menu to the status item
+    statusItem.menu = menu
+
+    // Run the app
+    app.run() //.run()
+}
+func quitApp() {
+    NSApplication.shared.terminate(nil)
+}
+
 
 @_silgen_name("authenticate_with_touch_id")
 public func authenticateWithTouchID(reason: UnsafePointer<CChar>) -> Bool {
