@@ -1,6 +1,6 @@
 mod crypto;
 use std::{
-    ffi::{CStr, CString, NulError},
+    ffi::{c_void, CStr, CString, NulError},
     path::{Path, PathBuf},
     str::Utf8Error,
 };
@@ -15,6 +15,7 @@ extern "C" {
     fn get_password_from_keychain(service: *const i8, account: *const i8) -> *const i8;
     fn authenticate_with_touch_id(reason: *const i8) -> bool;
     fn show_toast_notification(title: *const i8, message: *const i8) -> bool;
+    fn free(ptr: *mut std::ffi::c_void);
 }
 pub fn toast(title: impl ToString, message: impl ToString) {
     let title = CString::new(title.to_string()).expect("CString::new failed");
@@ -50,9 +51,11 @@ pub fn generate_key(name: &str) -> Result<(), UserErr> {
         return Err(UserErr::KeyExists);
     }
     let mut rng = rand::rngs::OsRng::default();
-    let pk = random_pk(&mut rng);
-    let password = aquire_encryption_key()?;
-    encrypt_key(store(), &mut rng, pk.to_bytes().to_vec(), password, name)?;
+    let mut pk = random_pk(&mut rng).to_bytes().to_vec();
+    let mut password = aquire_encryption_key()?;
+    encrypt_key(store(), &mut rng, &pk, &password, name)?;
+    pk.fill(0);
+    password.fill(0);
     Ok(())
 }
 
@@ -69,8 +72,17 @@ fn aquire_encryption_key() -> Result<Vec<u8>, UserErr> {
 
     if !password_ptr.is_null() {
         // Convert the returned C string to a Rust string
-        let password = unsafe { CStr::from_ptr(password_ptr) }.to_str()?;
-        return Ok(password.bytes().into_iter().collect());
+        let password_vec = unsafe {
+            let password_cstr = CStr::from_ptr(password_ptr);
+            let password_bytes = password_cstr.to_bytes().to_vec();
+
+            // Zero out the C string before freeing it
+            std::ptr::write_bytes(password_ptr as *mut u8, 0, password_bytes.len());
+            free(password_ptr as *mut c_void);
+
+            password_bytes
+        };
+        return Ok(password_vec);
     }
     Err(UserErr::FailGetPassword)
 }
