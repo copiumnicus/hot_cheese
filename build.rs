@@ -5,4 +5,6 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=main");
     // pass rpath config to linker
     println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+    println!("cargo:rustc-link-lib=framework=Security");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
 }

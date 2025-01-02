@@ -75,6 +75,7 @@ dependencies = [
  "serde_json",
  "tiny-keccak",
  "tiny_http",
+ "zeroize",
 ]
 
 [[package]]

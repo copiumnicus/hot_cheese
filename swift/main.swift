@@ -1,21 +1,22 @@
-import LocalAuthentication
+import Cocoa
 import Foundation
+import LocalAuthentication
 import Security
 import UserNotifications
-import Cocoa
 
 @_silgen_name("run_menu")
-public func run_menu(){
+public func run_menu() {
     // MARK: - Main Entry Point
     let app = NSApplication.shared
-    app.setActivationPolicy(.accessory) // Prevents Dock icon
+    app.setActivationPolicy(.accessory)  // Prevents Dock icon
 
     // Create the Status Bar Item
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     // Set up the status bar button
     if let button = statusItem.button {
-        button.image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "CC_SSTORE")
+        button.image = NSImage(
+            systemSymbolName: "shield.fill", accessibilityDescription: "CC_SSTORE")
         // button.action = #selector(statusBarClicked)
     }
 
@@ -26,19 +27,20 @@ public func run_menu(){
     // menu.addItem(NSMenuItem(title: "Show Toast", action: #selector(showToast), keyEquivalent: ""))
     // menu.addItem(NSMenuItem.separator())
     // menu.addItem(NSMenuItem(title: "Quit", action:  NSApplication.shared.terminate(nil), keyEquivalent: "q"))
-    menu.addItem(NSMenuItem(title: "Quit CC_SSTORE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
+    menu.addItem(
+        NSMenuItem(
+            title: "Quit CC_SSTORE", action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"))
 
     // Attach the menu to the status item
     statusItem.menu = menu
 
     // Run the app
-    app.run() //.run()
+    app.run()  //.run()
 }
 func quitApp() {
     NSApplication.shared.terminate(nil)
 }
-
 
 @_silgen_name("authenticate_with_touch_id")
 public func authenticateWithTouchID(reason: UnsafePointer<CChar>) -> Bool {
@@ -54,7 +56,8 @@ public func authenticateWithTouchID(reason: UnsafePointer<CChar>) -> Bool {
         var success = false
         let semaphore = DispatchSemaphore(value: 0)
 
-        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reasonString) { result, evaluateError in
+        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reasonString) {
+            result, evaluateError in
             if let authError = evaluateError as? LAError {
                 // Handle specific errors if needed
                 switch authError.code {
@@ -80,31 +83,10 @@ public func authenticateWithTouchID(reason: UnsafePointer<CChar>) -> Bool {
     }
 }
 
-@_silgen_name("get_password_from_keychain")
-public func getPasswordFromKeychain(service: UnsafePointer<CChar>, account: UnsafePointer<CChar>) -> UnsafePointer<CChar>? {
-    let serviceString = String(cString: service)
-    let accountString = String(cString: account)
-
-    let query: [CFString: Any] = [
-        kSecClass: kSecClassGenericPassword,
-        kSecAttrService: serviceString,
-        kSecAttrAccount: accountString,
-        kSecReturnData: true
-    ]
-
-    var result: AnyObject?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-    if status == errSecSuccess, let data = result as? Data, let password = String(data: data, encoding: .utf8) {
-        // Use strdup to create a C-compatible string and cast to UnsafePointer
-        return UnsafePointer(strdup(password))
-    } else {
-        return nil
-    }
-}
-
 @_silgen_name("show_toast_notification")
-public func showToastNotification(title: UnsafePointer<CChar>, message: UnsafePointer<CChar>) -> Bool {
+public func showToastNotification(title: UnsafePointer<CChar>, message: UnsafePointer<CChar>)
+    -> Bool
+{
     let titleString = String(cString: title)
     let messageString = String(cString: message)
 
@@ -142,7 +124,7 @@ public func showToastNotification(title: UnsafePointer<CChar>, message: UnsafePo
     let request = UNNotificationRequest(
         identifier: UUID().uuidString,
         content: content,
-        trigger: nil // Trigger immediately
+        trigger: nil  // Trigger immediately
     )
 
     // Add the notification

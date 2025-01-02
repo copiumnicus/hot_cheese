@@ -10,3 +10,8 @@ open MyApp.app
 
 security add-generic-password -a myusername -s com.example.myapp -w mypassword
 need "My Development Certificate"
+
+sudo gcore -o ./dump.txt <PID>
+grep -a "mypassword" dump.txt
+
+sudo rm dump.txt && sudo gcore -o dump.txt $(pgrep cc_sstore)

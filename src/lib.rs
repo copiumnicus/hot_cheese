@@ -1,21 +1,20 @@
 mod crypto;
+mod get_password;
 use std::{
-    ffi::{c_void, CStr, CString, NulError},
-    path::{Path, PathBuf},
-    str::Utf8Error,
+    ffi::{c_void, CStr, CString, NulError}, io::Read, path::{Path, PathBuf}, str::Utf8Error
 };
 
-use crypto::{encrypt_key, random_pk, CryptoErr};
+use crypto::{decrypt_key, encrypt_key, random_pk, to_str, CryptoErr};
 use err_mac::create_err_with_impls;
+use get_password::{get_password_from_keychain, GetPasswordErr};
 use rand::rngs::{OsRng, ThreadRng};
+use zeroize::Zeroize;
 
 // this has to be in lib.rs, not main.rs otherwise linking fails
 extern "C" {
     pub fn run_menu();
-    fn get_password_from_keychain(service: *const i8, account: *const i8) -> *const i8;
     fn authenticate_with_touch_id(reason: *const i8) -> bool;
     fn show_toast_notification(title: *const i8, message: *const i8) -> bool;
-    fn free(ptr: *mut std::ffi::c_void);
 }
 pub fn toast(title: impl ToString, message: impl ToString) {
     let title = CString::new(title.to_string()).expect("CString::new failed");
@@ -35,12 +34,13 @@ pub const BIND: &str = "127.0.0.1:5555";
 create_err_with_impls!(
     #[derive(Debug)]
     pub UserErr,
+    Password(GetPasswordErr),
     FailAuthorize,
-    FailGetPassword,
     Utf(Utf8Error),
     Nul(NulError),
     KeyExists,
-    Crypto(CryptoErr)
+    KeyNotExists,
+    Crypto(CryptoErr),
     ;
 );
 
@@ -54,37 +54,68 @@ pub fn generate_key(name: &str) -> Result<(), UserErr> {
     let mut pk = random_pk(&mut rng).to_bytes().to_vec();
     let mut password = aquire_encryption_key()?;
     encrypt_key(store(), &mut rng, &pk, &password, name)?;
-    pk.fill(0);
-    password.fill(0);
+    pk.zeroize();
+    password.zeroize();
     Ok(())
+}
+
+pub struct ZeroizingVecReader {
+    data: Vec<u8>,
+    position: usize,
+}
+
+impl ZeroizingVecReader {
+    pub fn new(data: Vec<u8>) -> Self {
+        ZeroizingVecReader {
+            data,
+            position: 0,
+        }
+    }
+}
+impl Read for ZeroizingVecReader {
+    /// Reads bytes from the internal buffer into the provided buffer and zeroizes the read bytes.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.data.len() {
+            return Ok(0); // EOF
+        }
+        let remaining = &mut self.data[self.position..];
+        let bytes_to_read = remaining.len().min(buf.len());
+        buf[..bytes_to_read].copy_from_slice(&remaining[..bytes_to_read]);
+
+        // Zeroize the read bytes
+        for byte in &mut remaining[..bytes_to_read] {
+            *byte = 0;
+        }
+
+        self.position += bytes_to_read;
+
+        Ok(bytes_to_read)
+    }
+}
+impl Drop for ZeroizingVecReader {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
+}
+
+pub fn read_key(name: &str) -> Result<String, UserErr> {
+    let path = Path::new(&store()).join(name);
+    if !path.exists() {
+        return Err(UserErr::KeyNotExists);
+    }
+    let mut password = aquire_encryption_key()?;
+    let key = decrypt_key(path, &password)?;
+    password.zeroize();
+    Ok(to_str(key))
 }
 
 fn aquire_encryption_key() -> Result<Vec<u8>, UserErr> {
     if !touch_id_auth("authorize access to vault")? {
         return Err(UserErr::FailAuthorize);
     }
-    // Define the service and account
-    let service = CString::new("com.example.myapp")?;
-    let account = CString::new("myusername")?;
-
-    // Call the Swift function
-    let password_ptr = unsafe { get_password_from_keychain(service.as_ptr(), account.as_ptr()) };
-
-    if !password_ptr.is_null() {
-        // Convert the returned C string to a Rust string
-        let password_vec = unsafe {
-            let password_cstr = CStr::from_ptr(password_ptr);
-            let password_bytes = password_cstr.to_bytes().to_vec();
-
-            // Zero out the C string before freeing it
-            std::ptr::write_bytes(password_ptr as *mut u8, 0, password_bytes.len());
-            free(password_ptr as *mut c_void);
-
-            password_bytes
-        };
-        return Ok(password_vec);
-    }
-    Err(UserErr::FailGetPassword)
+    let service = "com.example.myapp";
+    let account = "myusername";
+    Ok(get_password_from_keychain(service, account)?)
 }
 
 fn store() -> PathBuf {
