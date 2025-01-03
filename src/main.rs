@@ -1,13 +1,17 @@
+use std::time::SystemTime;
+
 use cc_sstore::generate_key;
 use cc_sstore::read_key;
 use cc_sstore::run_menu;
 use cc_sstore::toast;
 use cc_sstore::ZeroizingVecReader;
 use cc_sstore::BIND;
+use httpdate::HttpDate;
 use tiny_http::Header;
 use tiny_http::Method;
 use tiny_http::StatusCode;
 use tiny_http::{Response, Server};
+use zeroize::Zeroize;
 
 fn is_valid_string_name(name: &str) -> bool {
     // Check that all characters in the name are valid (a-z, A-Z, _)
@@ -77,21 +81,36 @@ fn main() {
             );
             match handle_request(request.url()) {
                 Some(r) => {
-                    let dl = r.len();
-                    let res = Response::new(
-                        StatusCode(200),
-                        vec![Header::from_bytes(
-                            &b"Content-Type"[..],
-                            &b"text/plain; charset=UTF-8"[..],
-                        )
-                        .unwrap()],
-                        ZeroizingVecReader::new(r.into_bytes()),
-                        Some(dl),
-                        None,
-                    );
+                    // let dl = r.len();
+                    // let res = Response::new(
+                    //     StatusCode(200),
+                    //     vec![Header::from_bytes(
+                    //         &b"Content-Type"[..],
+                    //         &b"text/plain; charset=UTF-8"[..],
+                    //     )
+                    //     .unwrap()],
+                    //     ZeroizingVecReader::new(r.into_bytes()),
+                    //     Some(dl),
+                    //     None,
+                    // );
                     // mby can use this to prevent leaving sensitive info in memory
                     // request.into_writer()
-                    let _ = request.respond(res);
+                    let mut w = request.into_writer();
+                    let mut res = vec![];
+                    res.push("HTTP/1.1 200 OK");
+                    res.push("Server: HotCheese (Rust)");
+                    let d = format!("Date: {}", HttpDate::from(SystemTime::now()).to_string());
+                    res.push(d.as_str());
+                    res.push("Content-Type: text/plain; charset=UTF-8");
+                    let cl = format!("Content-Length: {}", r.len());
+                    res.push(cl.as_str());
+                    res.push("");
+                    res.push(r.as_str());
+                    let res = res.join("\r\n");
+                    let mut res_bytes = res.into_bytes();
+                    let _ = w.write_all(&res_bytes);
+                    let _ = w.flush();
+                    res_bytes.zeroize();
                 }
                 None => {
                     let _ = request.respond(Response::empty(StatusCode(400)));

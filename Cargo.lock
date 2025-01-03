@@ -68,6 +68,7 @@ dependencies = [
  "aes",
  "ctr",
  "err_mac",
+ "httpdate",
  "k256",
  "rand",
  "scrypt",
