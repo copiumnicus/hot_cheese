@@ -1,7 +1,12 @@
 mod crypto;
 mod get_password;
+mod server;
+pub use server::run_server;
 use std::{
-    ffi::{c_void, CStr, CString, NulError}, io::Read, path::{Path, PathBuf}, str::Utf8Error
+    ffi::{c_void, CStr, CString, NulError},
+    io::Read,
+    path::{Path, PathBuf},
+    str::Utf8Error,
 };
 
 use crypto::{decrypt_key, encrypt_key, random_pk, to_str, CryptoErr};
@@ -66,10 +71,7 @@ pub struct ZeroizingVecReader {
 
 impl ZeroizingVecReader {
     pub fn new(data: Vec<u8>) -> Self {
-        ZeroizingVecReader {
-            data,
-            position: 0,
-        }
+        ZeroizingVecReader { data, position: 0 }
     }
 }
 impl Read for ZeroizingVecReader {

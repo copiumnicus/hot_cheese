@@ -19,3 +19,14 @@ rand = "0.8.5"
 serde_json = "1.0.134"
 zeroize = "1.8.1"
 httpdate = "1.0.3"
+
+tokio = { version = "1.42.0", features = ["io-std", "macros", "net", "rt-multi-thread"] }
+rustls-pemfile = "2"
+pki-types = { package = "rustls-pki-types", version = "1" }
+http = "1"
+hyper = { version = "1", default-features = false }
+# hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "tokio"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["tls12", "ring"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false }
