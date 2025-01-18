@@ -1,61 +1,64 @@
 use std::time::SystemTime;
 
-use cc_sstore::generate_key;
-use cc_sstore::read_key;
-use cc_sstore::run_menu;
-use cc_sstore::run_server;
-use cc_sstore::toast;
-use cc_sstore::ZeroizingVecReader;
-use cc_sstore::BIND;
-use httpdate::HttpDate;
-use tiny_http::Header;
-use tiny_http::Method;
-use tiny_http::StatusCode;
-use tiny_http::{Response, Server};
-use zeroize::Zeroize;
+// use cc_sstore::generate_key;
+// use cc_sstore::read_key;
+// use cc_sstore::run_menu;
+// use cc_sstore::run_server;
+// use cc_sstore::toast;
+// use cc_sstore::ZeroizingVecReader;
+// use cc_sstore::BIND;
+// use httpdate::HttpDate;
+// use tiny_http::Header;
+// use tiny_http::Method;
+// use tiny_http::StatusCode;
+// use tiny_http::{Response, Server};
+// use zeroize::Zeroize;
 
 fn is_valid_string_name(name: &str) -> bool {
     // Check that all characters in the name are valid (a-z, A-Z, _)
     name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn handle_request(path: &str) -> Option<String> {
-    if let Some(name) = path.strip_prefix("/generate/") {
-        if is_valid_string_name(name) {
-            match generate_key(name) {
-                Ok(_) => {
-                    toast("Generate", format!("Success generating: {}", name));
-                    return Some(format!("Generated: {}", name));
-                }
-                Err(e) => {
-                    toast("Generate error", format!("{:?}", e));
-                }
-            }
-        }
-    } else if let Some(name) = path.strip_prefix("/read/") {
-        if is_valid_string_name(name) {
-            match read_key(name) {
-                Ok(key) => {
-                    toast("Read", format!("Success read: {}", name));
-                    return Some(key);
-                }
-                Err(e) => {
-                    toast("Read error", format!("{:?}", e));
-                }
-            }
-        }
-    }
+// fn handle_request(path: &str) -> Option<String> {
+//     if let Some(name) = path.strip_prefix("/generate/") {
+//         if is_valid_string_name(name) {
+//             match generate_key(name) {
+//                 Ok(_) => {
+//                     toast("Generate", format!("Success generating: {}", name));
+//                     return Some(format!("Generated: {}", name));
+//                 }
+//                 Err(e) => {
+//                     toast("Generate error", format!("{:?}", e));
+//                 }
+//             }
+//         }
+//     } else if let Some(name) = path.strip_prefix("/read/") {
+//         if is_valid_string_name(name) {
+//             match read_key(name) {
+//                 Ok(key) => {
+//                     toast("Read", format!("Success read: {}", name));
+//                     return Some(key);
+//                 }
+//                 Err(e) => {
+//                     toast("Read error", format!("{:?}", e));
+//                 }
+//             }
+//         }
+//     }
 
-    None
-}
+//     None
+// }
 
 fn main() {
-    std::thread::spawn(move || {
-        if let Err(_) = run_server() {
-            std::process::exit(1);
-        }
-    });
-    loop {}
+    // if let Err(_) = run_server() {
+    //     std::process::exit(1);
+    // }
+    // std::thread::spawn(move || {
+    //     if let Err(_) = run_server() {
+    //         std::process::exit(1);
+    //     }
+    // });
+    // loop {}
     // let server = Server::https(
     //     BIND,
     //     tiny_http::SslConfig {
@@ -126,5 +129,5 @@ fn main() {
     //     }
     // });
     // need on main thread
-    unsafe { run_menu() };
+    // unsafe { run_menu() };
 }
