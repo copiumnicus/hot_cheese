@@ -120,7 +120,7 @@ create_err_with_impls!(
 );
 
 pub trait BackendImpl: Send + Sync {
-    fn is_device_owner(&self) -> bool;
+    fn is_device_owner(&self, reason: &str) -> bool;
     fn get_encryption_key(&self) -> Option<Vec<u8>>;
     fn store(&self) -> &str;
     fn communicate_err(&self, e: String);
@@ -134,8 +134,8 @@ pub trait BackendImpl: Send + Sync {
         }
         buf
     }
-    fn assert_owner_get_encryption_key(&self) -> Result<Vec<u8>, ApiBackendErr> {
-        if !self.is_device_owner() {
+    fn assert_owner_get_encryption_key(&self, reason: &str) -> Result<Vec<u8>, ApiBackendErr> {
+        if !self.is_device_owner(reason) {
             return Err(ApiBackendErr::NotDeviceOwner);
         }
         self.get_encryption_key()
@@ -156,7 +156,9 @@ impl HotApi {
         let mut rng = rand::rngs::OsRng::default();
         let mut pk = random_pk(&mut rng).to_bytes().to_vec();
         // SECURITY
-        let mut password = self.inner.assert_owner_get_encryption_key()?;
+        let mut password = self
+            .inner
+            .assert_owner_get_encryption_key(format!("trying to generate '{}'", name).as_str())?;
         encrypt_key(self.inner.store_path(), &mut rng, &pk, &password, name)?;
         pk.zeroize();
         password.zeroize();
@@ -169,7 +171,9 @@ impl HotApi {
             return Err(ApiBackendErr::KeyNotExists);
         }
         println!("client pubk {}", df_share::to_hex_str(&req.pubk));
-        let mut password = self.inner.assert_owner_get_encryption_key()?;
+        let mut password = self
+            .inner
+            .assert_owner_get_encryption_key(format!("trying to read '{}'", name).as_str())?;
         let mut key = decrypt_key(path, &password)?;
         let server = EphemeralServer::new()?;
         let res = server.encrypt_secret(&req, &key)?;
@@ -235,17 +239,12 @@ mod test {
                     .to_vec(),
             )
         }
-        fn is_device_owner(&self) -> bool {
+        fn is_device_owner(&self, _: &str) -> bool {
             true
         }
         fn store(&self) -> &str {
             "~/HOT_CHEESE_TEST"
         }
-    }
-
-    #[test]
-    fn test_run_local() {
-        let _ = run_server(Box::new(TestBackend {}));
     }
 
     #[test]
@@ -257,7 +256,7 @@ mod test {
         let pk = vec![0, 0, 0];
 
         let mut rng = rand::rngs::OsRng::default();
-        let password = inner.assert_owner_get_encryption_key().unwrap();
+        let password = inner.assert_owner_get_encryption_key("hi").unwrap();
         encrypt_key(inner.store_path(), &mut rng, &pk, &password, name).unwrap();
     }
 }

@@ -56,6 +56,7 @@ impl HotCheeseAgent {
     pub fn read(&self, name: &str) -> Result<Vec<u8>, HotAgentErr> {
         let client = EphemeralClient::new()?;
         let (to_send, decryptor) = client.sendable();
+        println!("send pubk {}", to_hex_str(&to_send.pubk));
         let res = self
             .agent
             .get(format!("{}{}{}", self.base, "/read/", name).as_str())
@@ -81,8 +82,8 @@ fn main() {
     let agent = HotCheeseAgent::new("https://localhost:5555");
     let health = agent.health().unwrap();
     println!("{}", health);
-    // let res = agent.generate("test3").unwrap();
+    // let res = agent.generate("test4").unwrap();
     // println!("{}", res);
-    let res = agent.read("test3").unwrap();
+    let res = agent.read("test4").unwrap();
     println!("{}", to_hex_str(&res));
 }
