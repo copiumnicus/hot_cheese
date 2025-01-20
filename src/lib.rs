@@ -1,2 +1,3 @@
-mod mac;
 mod crypto;
+mod mac;
+mod server;

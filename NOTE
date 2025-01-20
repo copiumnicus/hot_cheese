@@ -15,3 +15,6 @@ sudo gcore -o ./dump.txt <PID>
 grep -a "mypassword" dump.txt
 
 sudo rm dump.txt && sudo gcore -o dump.txt $(pgrep cc_sstore)
+
+
+openssl s_client -connect localhost:5555 -showcerts

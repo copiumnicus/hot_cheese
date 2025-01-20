@@ -1,10 +1,9 @@
 [package]
-name = "cc_sstore"
+name = "hot_cheese"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tiny_http = { version = "0.12.0", features = ["ssl-openssl"] }
 err_mac = { git = "https://github.com/copiumnicus/err_mac.git", rev = "08f6335" }
 scrypt = { version = "0.10.0" }
 aes = "0.8.0"
@@ -18,7 +17,6 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 rand = "0.8.5"
 serde_json = "1.0.134"
 zeroize = "1.8.1"
-httpdate = "1.0.3"
 
 tokio = { version = "1.42.0", features = [
     "io-std",
@@ -45,3 +43,7 @@ tokio-rustls = { version = "0.26", default-features = false }
 objc = "0.2.7"
 block = "0.1.6"
 dispatch = "0.2.0"
+df-share = "0.1.0"
+
+[dev-dependencies]
+ureq = "2.12.1"

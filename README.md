@@ -33,7 +33,6 @@ let shared_secret = ecdh_compute_shared_secret(server_private_key, ephemeral_pub
 let aes_key = hkdf(shared_secret);
 let private_key = decrypt_with_user_authorization();
 let encrypted_key = aes_gcm_encrypt(aes_key, private_key);
-// It's not a vulnerability to receive a wrong private key in our usecases, you could pin the public key otherwise if you need to
 send_to_client(encrypted_key, server_public_key, nonce);
 
 // requesting server:

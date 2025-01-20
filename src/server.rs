@@ -1,4 +1,6 @@
 use crate::crypto::{decrypt_key, encrypt_key, random_pk, to_str, CryptoErr};
+use df_share::error::Unspecified;
+use df_share::{ClientReq, EphemeralServer};
 use err_mac::create_err_with_impls;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -10,6 +12,8 @@ use pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::fs::create_dir_all;
+use std::io::{BufReader, Cursor};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,10 +31,16 @@ fn resolve_path(path: &str) -> PathBuf {
     PathBuf::from(path) // Fallback: return the path as-is
 }
 
-fn error(err: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err)
+fn load_certs() -> io::Result<Vec<CertificateDer<'static>>> {
+    let cert = include_bytes!("ssl-cert.pem");
+    let mut reader = BufReader::new(Cursor::new(cert));
+    rustls_pemfile::certs(&mut reader).collect()
 }
-
+fn load_private_key() -> io::Result<PrivateKeyDer<'static>> {
+    let key = include_bytes!("ssl-key.pem");
+    let mut reader = BufReader::new(Cursor::new(key));
+    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
+}
 #[tokio::main]
 pub async fn run_server(
     backend: Box<dyn BackendImpl>,
@@ -41,10 +51,8 @@ pub async fn run_server(
     let port = 5555;
     let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
 
-    // Load public certificate.
-    let certs = load_certs("src/ssl-cert.pem")?;
-    // Load private key.
-    let key = load_private_key("src/ssl-key.pem")?;
+    let certs = load_certs()?;
+    let key = load_private_key()?;
 
     println!("Starting to serve on https://{}", addr);
 
@@ -55,7 +63,7 @@ pub async fn run_server(
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| error(e.to_string()))?;
+        .unwrap();
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -102,8 +110,10 @@ create_err_with_impls!(
     #[derive(Debug)]
     pub ApiBackendErr,
     KeyExists,
+    Serde(serde_json::Error),
     KeyNotExists,
     NotDeviceOwner,
+    Unspecified(Unspecified),
     FailedToGetEncryptionKey,
     Crypto(CryptoErr)
     ;
@@ -116,7 +126,20 @@ pub trait BackendImpl: Send + Sync {
     fn communicate_err(&self, e: String);
 
     fn store_path(&self) -> PathBuf {
-        resolve_path(self.store())
+        let buf = resolve_path(self.store());
+        if !buf.exists() {
+            if let Err(e) = create_dir_all(buf.clone()) {
+                eprintln!("failed create keys dir {}", e)
+            }
+        }
+        buf
+    }
+    fn assert_owner_get_encryption_key(&self) -> Result<Vec<u8>, ApiBackendErr> {
+        if !self.is_device_owner() {
+            return Err(ApiBackendErr::NotDeviceOwner);
+        }
+        self.get_encryption_key()
+            .ok_or(ApiBackendErr::FailedToGetEncryptionKey)
     }
 }
 
@@ -133,85 +156,45 @@ impl HotApi {
         let mut rng = rand::rngs::OsRng::default();
         let mut pk = random_pk(&mut rng).to_bytes().to_vec();
         // SECURITY
-        let mut password = self.assert_owner_get_encryption_key()?;
+        let mut password = self.inner.assert_owner_get_encryption_key()?;
         encrypt_key(self.inner.store_path(), &mut rng, &pk, &password, name)?;
         pk.zeroize();
         password.zeroize();
         Ok(())
     }
-    pub fn read(&self, name: &str) -> Result<String, ApiBackendErr> {
+    pub fn read(&self, body: &[u8], name: &str) -> Result<Vec<u8>, ApiBackendErr> {
+        let req: ClientReq = serde_json::from_slice(&body)?;
         let path = Path::new(&self.inner.store_path()).join(name);
         if !path.exists() {
             return Err(ApiBackendErr::KeyNotExists);
         }
-        let mut password = self.assert_owner_get_encryption_key()?;
-        let key = decrypt_key(path, &password)?;
+        println!("client pubk {}", df_share::to_hex_str(&req.pubk));
+        let mut password = self.inner.assert_owner_get_encryption_key()?;
+        let mut key = decrypt_key(path, &password)?;
+        let server = EphemeralServer::new()?;
+        let res = server.encrypt_secret(&req, &key)?;
         password.zeroize();
-        Ok(to_str(key))
-    }
-    fn assert_owner_get_encryption_key(&self) -> Result<Vec<u8>, ApiBackendErr> {
-        if !self.inner.is_device_owner() {
-            return Err(ApiBackendErr::NotDeviceOwner);
-        }
-        self.inner
-            .get_encryption_key()
-            .ok_or(ApiBackendErr::FailedToGetEncryptionKey)
+        key.zeroize();
+        Ok(serde_json::to_vec(&res)?)
     }
 }
 
-pub struct VecZeroize {
-    v: Vec<u8>,
-    pos: usize, // Track the position in the buffer
-}
-impl VecZeroize {
-    fn new(v: Vec<u8>) -> Self {
-        VecZeroize { v, pos: 0 }
-    }
-    fn zeroize_data(&mut self) {
-        println!("zeroize");
-        self.v.zeroize();
-        self.pos = 0; // Reset position as well after zeroizing
-    }
-}
-impl Drop for VecZeroize {
-    fn drop(&mut self) {
-        self.zeroize_data();
-    }
-}
-impl Buf for VecZeroize {
-    fn remaining(&self) -> usize {
-        let a = self.v.len() - self.pos;
-        println!("remaininig {}", a);
-        a
-    }
-    fn chunk(&self) -> &[u8] {
-        println!("chunk {}", self.pos);
-        &self.v[self.pos..]
-    }
-    fn advance(&mut self, cnt: usize) {
-        println!("advance {}", cnt);
-        self.pos = self.pos.saturating_add(cnt);
-        // You can zeroize data if you want to clear it when advancing:
-        // This is optional depending on your security requirements.
-        if self.pos >= self.v.len() {
-            self.zeroize_data(); // If we reach the end, zeroize the data
-        }
-    }
-}
-
-async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<VecZeroize>>, hyper::Error> {
+async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let mut response = Response::new(Full::default());
 
-    let hot = req.extensions().get::<Arc<HotApi>>().unwrap();
+    let hot = req.extensions().get::<Arc<HotApi>>().unwrap().clone();
 
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
+    println!("req {}", path);
+    if path.ends_with("/health") {
+        *response.body_mut() = "ok".as_bytes().to_vec().into();
+    }
     if let Some(name) = path.strip_prefix("/read/") {
         if is_valid_string_name(name) {
-            println!("read");
-            match hot.read(name) {
-                Ok(mut v) => {
-                    *response.body_mut() = Full::new(VecZeroize::new(v.as_bytes().to_vec()));
-                    v.zeroize();
+            let body = req.collect().await?.to_bytes();
+            match hot.read(&body, name) {
+                Ok(v) => {
+                    *response.body_mut() = v.into();
                 }
                 Err(e) => {
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -222,11 +205,9 @@ async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<VecZeroize
     }
     if let Some(name) = path.strip_prefix("/generate/") {
         if is_valid_string_name(name) {
-            println!("generate");
             match hot.generate(name) {
                 Ok(_) => {
-                    *response.body_mut() =
-                        Full::new(VecZeroize::new("success".as_bytes().to_vec()));
+                    *response.body_mut() = "success".as_bytes().to_vec().into();
                 }
                 Err(e) => {
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -236,28 +217,6 @@ async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<VecZeroize
         }
     }
     Ok(response)
-}
-
-// Load public certificate from file.
-fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
-    // Open certificate file.
-    let certfile = fs::File::open(filename)
-        .map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
-    let mut reader = io::BufReader::new(certfile);
-
-    // Load and return certificate.
-    rustls_pemfile::certs(&mut reader).collect()
-}
-
-// Load private key from file.
-fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
-    // Open keyfile.
-    let keyfile = fs::File::open(filename)
-        .map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
-    let mut reader = io::BufReader::new(keyfile);
-
-    // Load and return a single private key.
-    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
 }
 
 #[cfg(test)]
@@ -287,5 +246,18 @@ mod test {
     #[test]
     fn test_run_local() {
         let _ = run_server(Box::new(TestBackend {}));
+    }
+
+    #[test]
+    fn encrypt_existing() {
+        let inner = TestBackend {};
+
+        // input
+        let name = "encrypt_existing";
+        let pk = vec![0, 0, 0];
+
+        let mut rng = rand::rngs::OsRng::default();
+        let password = inner.assert_owner_get_encryption_key().unwrap();
+        encrypt_key(inner.store_path(), &mut rng, &pk, &password, name).unwrap();
     }
 }
