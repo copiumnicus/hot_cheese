@@ -137,3 +137,18 @@ pub fn get_password_from_keychain(service: &str, account: &str) -> Result<Vec<u8
         Ok(buffer)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::crypto::to_str;
+
+    #[test]
+    fn test_get_password() -> Result<(), GetPasswordErr> {
+        let service = "com.example.myapp";
+        let account = "myusername";
+        let v = get_password_from_keychain(service, account)?;
+        println!("{:?}", to_str(v));
+        Ok(())
+    }
+}
