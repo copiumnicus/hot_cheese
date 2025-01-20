@@ -17,7 +17,6 @@ where
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<String>>()
                 .join("")
-                .to_string()
         )
         .as_str(),
     )

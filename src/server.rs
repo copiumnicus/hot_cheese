@@ -1,23 +1,21 @@
-use crate::crypto::{decrypt_key, encrypt_key, random_pk, to_str, CryptoErr};
+use crate::crypto::{decrypt_key, encrypt_key, random_pk, CryptoErr};
 use df_share::error::Unspecified;
 use df_share::{ClientReq, EphemeralServer};
 use err_mac::create_err_with_impls;
-use http::{Method, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Buf, Bytes, Incoming};
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use std::borrow::Cow;
-use std::fmt::Display;
 use std::fs::create_dir_all;
+use std::io;
 use std::io::{BufReader, Cursor};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{env, fs, io};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroize;
@@ -153,7 +151,7 @@ impl HotApi {
         if path.exists() {
             return Err(ApiBackendErr::KeyExists);
         }
-        let mut rng = rand::rngs::OsRng::default();
+        let mut rng = rand::rngs::OsRng;
         let mut pk = random_pk(&mut rng).to_bytes().to_vec();
         // SECURITY
         let mut password = self
@@ -165,7 +163,7 @@ impl HotApi {
         Ok(())
     }
     pub fn read(&self, body: &[u8], name: &str) -> Result<Vec<u8>, ApiBackendErr> {
-        let req: ClientReq = serde_json::from_slice(&body)?;
+        let req: ClientReq = serde_json::from_slice(body)?;
         let path = Path::new(&self.inner.store_path()).join(name);
         if !path.exists() {
             return Err(ApiBackendErr::KeyNotExists);
@@ -255,7 +253,7 @@ mod test {
         let name = "encrypt_existing";
         let pk = vec![0, 0, 0];
 
-        let mut rng = rand::rngs::OsRng::default();
+        let mut rng = rand::rngs::OsRng;
         let password = inner.assert_owner_get_encryption_key("hi").unwrap();
         encrypt_key(inner.store_path(), &mut rng, &pk, &password, name).unwrap();
     }

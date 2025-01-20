@@ -25,16 +25,7 @@ pub fn random_pk<R: Rng + CryptoRng>(rng: &mut R) -> SigningKey {
     SigningKey::random(rng)
 }
 
-pub fn to_str(v: Vec<u8>) -> String {
-    format!(
-        "0x{}",
-        v.into_iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join("")
-            .to_string()
-    )
-}
+
 /// convert hex str to a vec of bytes
 pub fn to_vec(mut s: &str) -> Option<Vec<u8>> {
     if s.starts_with("0x") {

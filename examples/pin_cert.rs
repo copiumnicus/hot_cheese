@@ -2,13 +2,10 @@ use df_share::*;
 use err_mac::create_err_with_impls;
 use error::Unspecified;
 use pki_types::pem::PemObject;
-use pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use std::io;
-use std::net::TcpStream;
+use pki_types::CertificateDer;
+use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
-use std::{fs, net::ToSocketAddrs};
-use ureq::{self, Agent, ReadWrite, TlsConnector, Transport};
+use ureq::{self, Agent};
 
 pub struct HotCheeseAgent {
     agent: Agent,
