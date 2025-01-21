@@ -1,6 +1,6 @@
 # Hot Cheese 🔥🧀  
 
-**Hot Cheese** is a secure HTTPS server designed for the **distribution of private keys** during live service restarts. It leverages the macOS **Keychain** for secure storage and **Touch ID** for request-level authorization. All communication is protected with **SSL certificate pinning** and **Diffie-Hellman key exchange (via `df-share`)**, ensuring robust encryption.
+**Hot Cheese** is a secure HTTPS server designed for the **distribution of private keys** during live service restarts. It leverages the macOS **Keychain** for secure storage and **Touch ID** for request-level authorization. All communication is protected with **SSL certificate pinning** and **Diffie-Hellman key exchange (via [df-share](https://github.com/copiumnicus/df-share))**, ensuring robust encryption.
 
 ---
 
