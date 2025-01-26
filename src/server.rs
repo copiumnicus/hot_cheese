@@ -1,6 +1,6 @@
-use crate::crypto::{decrypt_key, encrypt_key, random_pk, CryptoErr};
+use crate::crypto::{decrypt_key, encrypt_key, keccak256, random_pk, CryptoErr};
 use df_share::error::Unspecified;
-use df_share::{ClientReq, EphemeralServer};
+use df_share::{to_hex_str, ClientReq, EphemeralServer};
 use err_mac::create_err_with_impls;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -108,6 +108,7 @@ create_err_with_impls!(
     #[derive(Debug)]
     pub ApiBackendErr,
     KeyExists,
+    FailCastToEvmKey(String),
     Serde(serde_json::Error),
     KeyNotExists,
     NotDeviceOwner,
@@ -145,7 +146,33 @@ pub struct HotApi {
     inner: Box<dyn BackendImpl>,
 }
 
+fn sk_to_adr(key: &[u8]) -> Result<String, ApiBackendErr> {
+    use k256::{ecdsa::SigningKey, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+    let sk =
+        SigningKey::from_slice(key).map_err(|e| ApiBackendErr::FailCastToEvmKey(e.to_string()))?;
+    let pubk = PublicKey::from_secret_scalar(sk.as_nonzero_scalar());
+    let pubk = pubk.to_encoded_point(/* compress = */ false);
+    let pubk = pubk.as_bytes();
+    debug_assert_eq!(pubk[0], 0x04);
+    let hash = keccak256(pubk[1..].to_vec());
+    Ok(to_hex_str(&hash[12..]))
+}
+
 impl HotApi {
+    pub fn address(&self, name: &str) -> Result<String, ApiBackendErr> {
+        let path = Path::new(&self.inner.store_path()).join(name);
+        if !path.exists() {
+            return Err(ApiBackendErr::KeyNotExists);
+        }
+        let mut password = self.inner.assert_owner_get_encryption_key(
+            format!("trying to get address '{}'", name).as_str(),
+        )?;
+        let mut key = decrypt_key(path, &password)?;
+        let addr = sk_to_adr(&key)?;
+        password.zeroize();
+        key.zeroize();
+        Ok(addr)
+    }
     pub fn generate(&self, name: &str) -> Result<(), ApiBackendErr> {
         let path = Path::new(&self.inner.store_path()).join(name);
         if path.exists() {
@@ -205,11 +232,25 @@ async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, h
             }
         }
     }
-    if let Some(name) = path.strip_prefix("/generate/") {
+    if let Some(name) = path.strip_prefix("/evm_generate/") {
         if is_valid_string_name(name) {
             match hot.generate(name) {
                 Ok(_) => {
                     *response.body_mut() = "success".as_bytes().to_vec().into();
+                }
+                Err(e) => {
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    hot.inner.communicate_err(e.to_string());
+                }
+            }
+        }
+    }
+    // useful for safely verifying that encryption process was successful
+    if let Some(name) = path.strip_prefix("/evm_address/") {
+        if is_valid_string_name(name) {
+            match hot.address(name) {
+                Ok(addr) => {
+                    *response.body_mut() = addr.as_bytes().to_vec().into();
                 }
                 Err(e) => {
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;

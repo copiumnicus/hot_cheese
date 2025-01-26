@@ -46,7 +46,7 @@ impl HotCheeseAgent {
     pub fn generate(&self, name: &str) -> Result<String, HotAgentErr> {
         let res = self
             .agent
-            .get(format!("{}{}{}", self.base, "/generate/", name).as_str())
+            .get(format!("{}{}{}", self.base, "/evm_generate/", name).as_str())
             .call()?;
         Ok(res.into_string().unwrap_or_default())
     }
