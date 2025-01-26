@@ -195,7 +195,7 @@ impl HotApi {
         if !path.exists() {
             return Err(ApiBackendErr::KeyNotExists);
         }
-        println!("client pubk {}", df_share::to_hex_str(&req.pubk));
+        println!("client pubk:\n{}", df_share::generate_ascii_art(&req.pubk));
         let mut password = self
             .inner
             .assert_owner_get_encryption_key(format!("trying to read '{}'", name).as_str())?;

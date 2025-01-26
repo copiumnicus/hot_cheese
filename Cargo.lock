@@ -229,15 +229,16 @@ dependencies = [
 
 [[package]]
 name = "df-share"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1efce39b4ec03b36456e8d55d7fe6b9710e0e0e729308a90ed599cdc0151d3b"
+checksum = "de0e030a6e737e72bd9a7182a3ad0257630709628d4f3fb337d4ab3889e1d5b3"
 dependencies = [
  "aes-gcm",
  "rand",
  "ring 0.16.20",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
