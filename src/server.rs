@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroize;
 
-fn resolve_path(path: &str) -> PathBuf {
+pub fn resolve_path(path: &str) -> PathBuf {
     if path.starts_with("~/") {
         if let Ok(home_dir) = std::env::var("HOME") {
             return PathBuf::from(home_dir).join(path.trim_start_matches("~/"));
@@ -30,12 +30,12 @@ fn resolve_path(path: &str) -> PathBuf {
 }
 
 fn load_certs() -> io::Result<Vec<CertificateDer<'static>>> {
-    let cert = include_bytes!("ssl-cert.pem");
+    let cert = include_bytes!("conf/ssl-cert.pem");
     let mut reader = BufReader::new(Cursor::new(cert));
     rustls_pemfile::certs(&mut reader).collect()
 }
 fn load_private_key() -> io::Result<PrivateKeyDer<'static>> {
-    let key = include_bytes!("ssl-key.pem");
+    let key = include_bytes!("conf/ssl-key.pem");
     let mut reader = BufReader::new(Cursor::new(key));
     rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
 }

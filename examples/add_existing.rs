@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 /// after this go to keychain and verify that it looks like you want to
 /// `cargo run --example add_existing <name>`
 pub fn main() {
-    let bytes = include_bytes!("../src/cheese_config.json");
+    let bytes = include_bytes!("../src/conf/cheese_config.json");
     let conf: Config = serde_json::from_slice(bytes.as_slice()).unwrap();
 
     let name = args().last().expect("expect name of key");

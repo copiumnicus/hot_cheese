@@ -11,7 +11,7 @@ fn verify_password(password: &str) -> bool {
 /// after this go to keychain and verify that it looks like you want to
 /// cargo run --example add_master
 pub fn main() {
-    let bytes = include_bytes!("../src/cheese_config.json");
+    let bytes = include_bytes!("../src/conf/cheese_config.json");
     let conf: Config = serde_json::from_slice(bytes.as_slice()).unwrap();
     println!("reading password");
     let mut master_password = read_password().expect("Failed to read password");

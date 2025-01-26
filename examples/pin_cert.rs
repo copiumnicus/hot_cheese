@@ -13,7 +13,7 @@ pub struct HotCheeseAgent {
 }
 impl HotCheeseAgent {
     pub fn new(base: impl ToString) -> Self {
-        let cert_bytes = include_bytes!("../src/ssl-cert.pem");
+        let cert_bytes = include_bytes!("../src/conf/ssl-cert.pem");
         let pinned_cert = CertificateDer::from_pem_slice(cert_bytes).unwrap();
 
         let mut root_store = RootCertStore::empty();
@@ -50,6 +50,13 @@ impl HotCheeseAgent {
             .call()?;
         Ok(res.into_string().unwrap_or_default())
     }
+    pub fn address(&self, name: &str) -> Result<String, HotAgentErr> {
+        let res = self
+            .agent
+            .get(format!("{}{}{}", self.base, "/evm_address/", name).as_str())
+            .call()?;
+        Ok(res.into_string().unwrap_or_default())
+    }
     pub fn read(&self, name: &str) -> Result<Vec<u8>, HotAgentErr> {
         let client = EphemeralClient::new()?;
         let (to_send, decryptor) = client.sendable();
@@ -81,6 +88,6 @@ fn main() {
     println!("{}", health);
     // let res = agent.generate("test4").unwrap();
     // println!("{}", res);
-    let res = agent.read("test4").unwrap();
-    println!("{}", to_hex_str(&res));
+    let res = agent.address("CL_GNOSIS_COWSWAP0").unwrap();
+    println!("{}", res);
 }

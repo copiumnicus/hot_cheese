@@ -1,5 +1,6 @@
 pub use crypto::encrypt_key;
 pub use mac::MacBackend;
+pub use server::resolve_path;
 pub use server::run_server;
 pub use server::BackendImpl;
 

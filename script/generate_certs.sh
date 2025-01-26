@@ -1,6 +1,6 @@
 #!/bin/bash
 openssl req -x509 -newkey rsa:4096 -nodes \
-    -keyout src/ssl-key.pem -out src/ssl-cert.pem \
+    -keyout src/conf/ssl-key.pem -out src/conf/ssl-cert.pem \
     -days 865 \
     -subj "/CN=localhost" \
     -addext "basicConstraints=critical,CA:FALSE" \
