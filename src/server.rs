@@ -166,7 +166,7 @@ impl HotApi {
             return Err(ApiBackendErr::KeyNotExists);
         }
         let mut password = self.inner.assert_owner_get_encryption_key(
-            format!("trying to get address '{}'", name).as_str(),
+            format!("get address '{}'", name).as_str(),
         )?;
         let mut key = decrypt_key(path, &password)?;
         let addr = sk_to_adr(&key)?;
@@ -181,7 +181,7 @@ impl HotApi {
             return Err(ApiBackendErr::KeyNotExists);
         }
         let mut password = self.inner.assert_owner_get_encryption_key(
-            format!("trying to get solana address '{}'", name).as_str(),
+            format!("get solana address '{}'", name).as_str(),
         )?;
         let mut key = decrypt_key(path, &password)?;
         let keypair = solana_keypair::Keypair::from_bytes(&key)
@@ -200,7 +200,7 @@ impl HotApi {
         let mut pk = solana_keypair::Keypair::new().to_bytes();
         // SECURITY
         let mut password = self.inner.assert_owner_get_encryption_key(
-            format!("trying to generate solana key '{}'", name).as_str(),
+            format!("generate solana key '{}'", name).as_str(),
         )?;
         let mut rng = rand::rngs::OsRng;
         encrypt_key(self.inner.store_path(), &mut rng, &pk, &password, name)?;
@@ -218,7 +218,7 @@ impl HotApi {
         // SECURITY
         let mut password = self
             .inner
-            .assert_owner_get_encryption_key(format!("trying to generate '{}'", name).as_str())?;
+            .assert_owner_get_encryption_key(format!("generate '{}'", name).as_str())?;
         encrypt_key(self.inner.store_path(), &mut rng, &pk, &password, name)?;
         pk.zeroize();
         password.zeroize();
@@ -234,7 +234,7 @@ impl HotApi {
         println!("client pubk:\n{}", df_share::generate_ascii_art(&req.pubk));
         let mut password = self
             .inner
-            .assert_owner_get_encryption_key(format!("trying to read '{}'", name).as_str())?;
+            .assert_owner_get_encryption_key(format!("read '{}'", name).as_str())?;
         let mut key = decrypt_key(path, &password)?;
         let server = EphemeralServer::new()?;
         let res = server.encrypt_secret(&req, &key)?;
