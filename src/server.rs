@@ -108,6 +108,7 @@ create_err_with_impls!(
     #[derive(Debug)]
     pub ApiBackendErr,
     KeyExists,
+    FailReadKeypair,
     FailCastToEvmKey(String),
     Serde(serde_json::Error),
     KeyNotExists,
@@ -173,6 +174,40 @@ impl HotApi {
         key.zeroize();
         Ok(addr)
     }
+    pub fn address_solana(&self, name: &str) -> Result<String, ApiBackendErr> {
+        use solana_signer::Signer;
+        let path = Path::new(&self.inner.store_path()).join(name);
+        if !path.exists() {
+            return Err(ApiBackendErr::KeyNotExists);
+        }
+        let mut password = self.inner.assert_owner_get_encryption_key(
+            format!("trying to get solana address '{}'", name).as_str(),
+        )?;
+        let mut key = decrypt_key(path, &password)?;
+        let keypair = solana_keypair::Keypair::from_bytes(&key)
+            .map_err(|_| ApiBackendErr::FailReadKeypair)?;
+        let addr = keypair.pubkey();
+        keypair.to_bytes().zeroize();
+        password.zeroize();
+        key.zeroize();
+        Ok(addr.to_string())
+    }
+    pub fn generate_solana(&self, name: &str) -> Result<(), ApiBackendErr> {
+        let path = Path::new(&self.inner.store_path()).join(name);
+        if path.exists() {
+            return Err(ApiBackendErr::KeyExists);
+        }
+        let mut pk = solana_keypair::Keypair::new().to_bytes();
+        // SECURITY
+        let mut password = self.inner.assert_owner_get_encryption_key(
+            format!("trying to generate solana key '{}'", name).as_str(),
+        )?;
+        let mut rng = rand::rngs::OsRng;
+        encrypt_key(self.inner.store_path(), &mut rng, &pk, &password, name)?;
+        pk.zeroize();
+        password.zeroize();
+        Ok(())
+    }
     pub fn generate(&self, name: &str) -> Result<(), ApiBackendErr> {
         let path = Path::new(&self.inner.store_path()).join(name);
         if path.exists() {
@@ -189,6 +224,7 @@ impl HotApi {
         password.zeroize();
         Ok(())
     }
+    /// read works for both solana/evm
     pub fn read(&self, body: &[u8], name: &str) -> Result<Vec<u8>, ApiBackendErr> {
         let req: ClientReq = serde_json::from_slice(body)?;
         let path = Path::new(&self.inner.store_path()).join(name);
@@ -249,6 +285,33 @@ async fn service_impl(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, h
     if let Some(name) = path.strip_prefix("/evm_address/") {
         if is_valid_string_name(name) {
             match hot.address(name) {
+                Ok(addr) => {
+                    *response.body_mut() = addr.as_bytes().to_vec().into();
+                }
+                Err(e) => {
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    hot.inner.communicate_err(e.to_string());
+                }
+            }
+        }
+    }
+    // solana
+    if let Some(name) = path.strip_prefix("/solana_generate/") {
+        if is_valid_string_name(name) {
+            match hot.generate_solana(name) {
+                Ok(_) => {
+                    *response.body_mut() = "success".as_bytes().to_vec().into();
+                }
+                Err(e) => {
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    hot.inner.communicate_err(e.to_string());
+                }
+            }
+        }
+    }
+    if let Some(name) = path.strip_prefix("/solana_address/") {
+        if is_valid_string_name(name) {
+            match hot.address_solana(name) {
                 Ok(addr) => {
                     *response.body_mut() = addr.as_bytes().to_vec().into();
                 }
