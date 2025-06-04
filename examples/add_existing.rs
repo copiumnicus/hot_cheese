@@ -7,7 +7,7 @@ use zeroize::Zeroize;
 
 /// script for adding master password to keychain
 /// after this go to keychain and verify that it looks like you want to
-/// `cargo run --example add_existing <name> solana|ethereum`
+/// `cargo run --example add_existing <name> solana|ethereum|bytes
 pub fn main() {
     let bytes = include_bytes!("../src/conf/cheese_config.json");
     let conf: Config = serde_json::from_slice(bytes.as_slice()).unwrap();
@@ -37,8 +37,14 @@ pub fn main() {
         let pk = bs58::decode(&pks).into_vec().unwrap();
         pks.zeroize();
         pk
+    } else if key_type == "bytes" {
+        println!("provide utf8 string to save");
+        let mut pks = read_password().expect("fail read pk");
+        let pk = pks.as_bytes().to_vec();
+        pks.zeroize();
+        pk
     } else {
-        panic!("expected key_type to be 'solana' or 'ethereum'")
+        panic!("expected key_type to be 'solana', 'ethereum' or 'bytes'")
     };
 
     // more important so get second
