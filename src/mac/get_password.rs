@@ -143,6 +143,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[ignore = "interactive: triggers a Keychain access prompt; run manually with `cargo test -- --ignored`"]
     fn test_get_password() -> Result<(), GetPasswordErr> {
         let service = "com.example.myapp";
         let account = "myusername";

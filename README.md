@@ -1,334 +1,538 @@
 # Hot Cheese 🔥🧀
 
-**Hot Cheese** is a secure HTTPS server designed for the **distribution of private keys** during live service restarts. It leverages the macOS **Keychain** for secure storage and **Touch ID** for request-level authorization. All communication is protected with **SSL certificate pinning** and **Diffie-Hellman key exchange (via [df-share](https://github.com/copiumnicus/df-share))**, ensuring robust encryption.
+**Hot Cheese** is a macOS HTTPS daemon that hands **EVM** and **Solana** signing
+keys to local services when they restart. Keys live on disk as an **envelope**:
+a random Data Encryption Key (DEK) encrypts each keystore, and the DEK is itself
+wrapped under one or more **Key Encryption Keys (KEKs)** — a **Secure Enclave key
+bound to Touch ID** and/or a **recovery passphrase**. There is **no extractable
+master password** anymore.
+
+Every key read is gated by a **cryptographic** Touch ID step (not a UI prompt you
+could bypass), traffic is protected by **TLS certificate pinning**, and each
+secret is delivered over a per-request **Diffie-Hellman key exchange** (via
+[df-share](https://github.com/copiumnicus/df-share)) so only the calling client
+can decrypt it. Because the DEK never touches disk in the clear, the store is
+**safe to back up anywhere**, and a new machine can be **bootstrapped over SSH**
+without the DEK ever crossing the wire in plaintext.
+
+> Upgrading from the old Keychain-master build? See **[MIGRATION.md](./MIGRATION.md)**
+> for the non-destructive, verify-before-finalize cutover runbook.
 
 ---
 
 ## Table of Contents
 
-1. [Key Features](#key-features)  
-2. [How It Works](#how-it-works)  
-3. [Installation & Setup](#installation--setup)  
-   - [1. Create a Cheese Config](#1-create-a-cheese-config)  
-   - [2. Add a Master Password](#2-add-a-master-password)  
-   - [3. (Optional) Add an Existing Private Key](#3-optional-add-an-existing-private-key)  
-   - [4. Generate SSL Certificates](#4-generate-ssl-certificates)  
-   - [5. Build & Run Hot Cheese](#5-build--run-hot-cheese)  
-4. [Server Endpoints](#server-endpoints)  
-5. [Client Integration Example](#client-integration-example)  
-6. [Backup Strategy](#backup-strategy)  
-   - [1. Master Encryption Key](#1-master-encryption-key)  
-   - [2. Encrypted Keys](#2-encrypted-keys)  
-   - [3. Automated Backup Script](#3-automated-backup-script)  
-   - [4. Restoring from Backup](#4-restoring-from-backup)  
-7. [Security Highlights](#security-highlights)  
-8. [FAQ](#faq)  
+1. [Key Features](#key-features)
+2. [How It Works](#how-it-works)
+3. [Requirements](#requirements)
+4. [Code Signing (Secure Enclave path)](#code-signing-secure-enclave-path)
+5. [Try It Without Signing (demo)](#try-it-without-signing-demo)
+6. [Quickstart](#quickstart)
+   - [1. Initialize](#1-initialize)
+   - [2. (Optional) Enroll the Secure Enclave](#2-optional-enroll-the-secure-enclave)
+   - [3. Add or generate keys](#3-add-or-generate-keys)
+   - [4. Serve](#4-serve)
+6. [CLI Reference](#cli-reference)
+7. [Configuration](#configuration)
+8. [Server Endpoints](#server-endpoints)
+9. [Client Integration](#client-integration)
+10. [Backups](#backups)
+11. [SSH Bootstrap](#ssh-bootstrap)
+12. [Migration](#migration)
+13. [Security Model & Residual Risks](#security-model--residual-risks)
+14. [FAQ](#faq)
 
 ---
 
 ## Key Features
 
-1. **Secure Key Management**  
-   - **Master encryption key** stored as a **generic password** in the macOS Keychain.  
-   - Users can define their own master encryption key, its size, and method of generation.  
-   - Encrypted keys are stored on disk in a user-specified directory.  
-   - Each request to decrypt keys requires **Touch ID authorization**.
-
-2. **End-to-End Encryption**  
-   - **Diffie-Hellman key exchange** ensures that keys are encrypted specifically for the requesting client.  
-   - **SSL certificate pinning** to prevent man-in-the-middle attacks.
-
-3. **Customizable Backend Configuration**  
-   - Specify:
-     - **Keychain entry name** (service name).  
-     - **Keychain account name** (user-defined).  
-     - **Storage directory** for encrypted keys.  
-   - All of these can be managed via a simple JSON config (see [Installation & Setup](#installation--setup)).
-
-4. **Port Forwarding-Friendly**  
-   - Forward its HTTPS port to a remote VM for seamless integration with distributed systems.
+1. **Envelope key storage** — a random DEK (XChaCha20-Poly1305) encrypts every
+   keystore; the DEK is wrapped in `keyring.json` under each enrolled KEK. The
+   plaintext DEK is **never** written to disk.
+2. **Cryptographic Touch ID** — a Secure Enclave key bound to Touch ID is a real
+   KEK. Each `/read` (and generate/address) unwraps the DEK by doing a
+   Touch-ID-gated ECDH inside the Secure Enclave: no biometric ⇒ no ECDH ⇒ no DEK
+   ⇒ no decrypt. Per-request human approval is preserved.
+3. **Recovery passphrase backstop** — an Argon2id-derived KEK that can unwrap the
+   same DEK on any machine. It is the only cross-machine restore path (Secure
+   Enclave keys are device-bound).
+4. **Safe-to-replicate backups** — best-effort `rsync` push after every mutation,
+   auto-pull on `serve` when the local store is missing, and manual
+   `backup push` / `backup pull`. The remote only ever sees ciphertext.
+5. **End-to-end encrypted reads** — per-request Diffie-Hellman exchange means the
+   secret is encrypted specifically for the requesting client, on top of pinned
+   TLS.
+6. **SSH bootstrap ritual** — provision a fresh machine from an authority over
+   SSH; the DEK is delivered via ECIES sealed to the new machine's Secure Enclave
+   key and re-wrapped there under its own KEKs.
 
 ---
 
 ## How It Works
 
-1. **Key Storage**  
-   - **Encrypted private keys** are stored in a designated on-disk folder.  
-   - A **master encryption key** (from the macOS Keychain) encrypts/decrypts those keys.  
-   - Each decryption request is further gated by **Touch ID** (physical user presence required).
+```
+                         keyring.json  (safe to back up — no plaintext DEK)
+                        ┌──────────────────────────────────────────────┐
+                        │  enrollment: Secure Enclave  → wrapped DEK     │
+   Touch ID ─ ECDH ────▶│  enrollment: recovery passphrase → wrapped DEK │◀── Argon2id
+   (Secure Enclave)     └──────────────────────────────────────────────┘
+                                          │ unwraps
+                                          ▼
+                                    DEK (in memory only, zeroized after use)
+                                          │ XChaCha20-Poly1305  (AAD = key name)
+                                          ▼
+                        store/  EVM_KEY   SOLANA_TRADER   …   (encrypted keystores)
+```
 
-2. **Secure HTTPS**  
-   - The server uses a pinned SSL certificate (e.g., `ssl-cert.pem`).  
-   - **Diffie-Hellman** ephemeral exchange ensures only the requesting client can decrypt the key.
-
-3. **Customizable Setup**  
-   - Configuration is read from a JSON file (e.g., `cheese_config.json`):
-     ```json
-     {
-       "service": "com.example.myapp",
-       "account": "myusername",
-       "store": "/Users/myusername/hot_cheese_keys"
-     }
-     ```
-   - You can edit `cheese_config.json` to fit your environment (service name, account name, storage path).
-
-4. **Client Integration**  
-   - A corresponding client (e.g., `HotCheeseAgent`) can securely retrieve and decrypt keys over HTTPS.
+1. **At rest.** Each keystore file under `store/` is an XChaCha20-Poly1305
+   envelope keyed by the DEK, with the **key name as AEAD additional data (AAD)**
+   so a copied or renamed file refuses to decrypt. The DEK only ever exists on
+   disk in wrapped form, inside `keyring.json`.
+2. **Unlocking.** Every operation that needs the DEK builds an *unlocker* and
+   unwraps the DEK for that single operation, then drops (zeroizes) it. The DEK is
+   never cached.
+   - **Secure Enclave KEK** = `HKDF(ECDH(SE_priv, eph_pub))`. The SE private key
+     never leaves the enclave and each ECDH requires a live Touch ID.
+   - **Passphrase KEK** = `Argon2id(passphrase, salt)`.
+3. **Serving.** `hot_cheese serve` binds HTTPS on loopback, presents the pinned
+   self-signed certificate, and answers the endpoints below. Secrets are returned
+   through a df-share Diffie-Hellman exchange so only the requesting client can
+   read them.
+4. **Replication.** After any mutation the store is best-effort `rsync`-pushed to
+   the configured remotes; ciphertext only.
 
 ---
 
-## Installation & Setup
+## Requirements
 
-Follow these steps to get **Hot Cheese** up and running on your macOS system.
+- **macOS with a Secure Enclave** (Apple Silicon, or a T2 Intel Mac) for the
+  Touch ID path.
+- **Rust toolchain** to build the `hot_cheese` binary.
+- **`rsync`** and **`ssh`** on the host (for backups and the bootstrap ritual).
+- For the Secure Enclave KEK: an **Apple Developer signing identity** and a
+  **code-signed binary** (see below). The **passphrase unlocker works on an
+  unsigned binary**, so the daemon is fully usable before you ever set up signing
+  — you can add the Secure Enclave later.
 
-### 1. Create a Cheese Config
+---
 
-Create a JSON file called `cheese_config.json` (the default name expected by the examples below). Customize its values according to your environment:
+## Code Signing (Secure Enclave path)
 
-```jsonc
-{
-  "service": "com.example.myapp",        // Keychain service name
-  "account": "myusername",               // Keychain account name
-  "store": "/Users/myusername/hot_keys"  // Directory for storing encrypted keys
-}
-```
+The Secure Enclave KEK only works on a **code-signed** binary. Creating a
+Touch-ID-bound SE P-256 key and reading its data-protection keychain items
+requires the `keychain-access-groups` entitlement, which is meaningless on an
+unsigned / ad-hoc build. On an unsigned binary, `enroll se` refuses with a clear
+message — use a recovery passphrase in the meantime.
 
-Place `cheese_config.json` in the same folder as your code or adjust the examples accordingly.
+Two identity tiers (see [`scripts/sign.sh`](./scripts/sign.sh) and
+[`hotcheese.entitlements`](./hotcheese.entitlements)):
 
-### 2. Add a Master Password
+- A **free Apple-ID "personal team" Apple Development** identity is enough to
+  validate the Secure Enclave path **locally** — the OS honors the entitlements
+  for a locally-signed dev build. These signatures are not distributable and
+  expire.
+- A **Developer ID Application** certificate (paid Apple Developer Program) gives
+  a stable, notarizable, **distributable** signature.
 
-You can manually add a master password (a generic password entry) to your macOS Keychain in two ways:
+**Steps:**
 
-**Option A: Using Keychain Access**  
-1. Open **Keychain Access** (located in `/Applications/Utilities`).  
-2. Go to **File > New Password Item**.  
-3. Under **Keychain Item Name**, enter the value of `service` from `cheese_config.json`.  
-4. Under **Account Name**, enter the value of `account` from `cheese_config.json`.  
-5. Under **Password**, supply a strong alphanumeric password.  
-6. Click **Add**.
+1. List your signing identities:
+   ```bash
+   security find-identity -v -p codesigning
+   ```
+2. Edit `hotcheese.entitlements` and replace every `__TEAM_ID__` token with your
+   10-character Apple Team ID.
+3. Build, then sign:
+   ```bash
+   cargo build --release
+   IDENTITY="Apple Development: you@example.com (TEAMID1234)" scripts/sign.sh
+   # or for distribution:
+   scripts/sign.sh "Developer ID Application: Your Org (TEAMID1234)"
+   ```
+   The script signs with the entitlements + Hardened Runtime and then verifies the
+   signature and prints the embedded entitlements.
 
-**Option B: Using the Provided Example Script**  
-If you have `cheese_config.json` set up, run the `add_master` example to automate the process in your shell:
+The full Touch ID round-trip is exercised by the `#[ignore]`d
+`se_key_lifecycle_and_deterministic_ecdh` test in `src/mac/secure_enclave.rs`;
+run it once on a signed binary to confirm SE/Touch ID end to end (see
+[Security Model & Residual Risks](#security-model--residual-risks)).
 
-```bash
-cargo run --example add_master
-```
+---
 
-You will be prompted for the master password (twice to confirm). This script uses the `security add-generic-password` command under the hood.
+## Try It Without Signing (demo)
 
-### 3. (Optional) Add an Existing Private Key
-
-If you already have a private key you want to store securely, use the `add_existing` example:
-
-```bash
-cargo run --example add_existing <key_name>
-```
-
-1. You will be prompted to enter the **hex-encoded** private key (with or without `0x`).  
-2. You will also be prompted for Touch ID authorization (to verify device ownership).  
-3. The private key is encrypted using the master key from Keychain and stored in the `store` directory.
-
-**Note**: If the `<key_name>` file already exists, the process will abort to avoid overwriting.
-
-### 4. Generate SSL Certificates
-
-Use the provided script to generate a self-signed SSL certificate (and a private key) for development/testing:
-
-```bash
-sh script/generate_certs.sh
-```
-
-This will create `ssl-cert.pem` and `ssl-key.pem`.
-
-### 5. Build & Run Hot Cheese
-
-You can build and install the **Hot Cheese** binary with:
+Want to feel the Secure Enclave flow before paying for the Apple Developer Program? Set
+`HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE=1` and the SE entry points use a **software P-256 key in
+a file** instead of the enclave, still gated by a real Touch ID prompt (LAContext works on an
+unsigned binary). You run the **identical** commands — `enroll se`, `serve`, `se-selftest` —
+and get the same envelope / ECDH / per-request-unlock experience.
 
 ```bash
-#!/bin/bash
+./scripts/demo.sh        # init → enroll se → generate → address → se-selftest, in /tmp
+```
+
+…or by hand:
+
+```bash
+export HOT_CHEESE_HOME=/tmp/hot_cheese_demo
+export HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE=1
+hot_cheese init                 # set a recovery passphrase; prints the cert fingerprint
+hot_cheese enroll se            # creates a SOFTWARE "enclave" key (a file)
+hot_cheese generate evm DEMO
+hot_cheese address evm DEMO     # ← Touch ID prompt: this is the per-request DEK unlock
+hot_cheese se-selftest          # validates ECDH determinism + SE/host equivalence
+xxd /tmp/hot_cheese_demo/software_enclave.key   # the key is readable — that's the whole point
+```
+
+> ⚠️ **Preview only.** The demo key sits on disk and is **extractable**, and Touch ID here is a
+> gate, not hardware-enforced — exactly the weaknesses the real Secure Enclave removes. The env
+> var must be set explicitly (it never engages by accident) and every unlock logs that it is a
+> demo. Don't put real keys in a demo store. When convinced, fill `__TEAM_ID__` in
+> `hotcheese.entitlements`, run `scripts/sign.sh`, and the same commands run against the
+> hardware enclave with the key sealed in the chip.
+
+---
+
+## Quickstart
+
+Build / install the binary first:
+
+```bash
 cargo install --force --locked --profile release --bin hot_cheese --path .
+# or run in place:  cargo run --release -- <subcommand>
 ```
 
-Alternatively, just run it in place:
+### 1. Initialize
 
 ```bash
-cargo run --release
+hot_cheese init
 ```
 
-The main entry point (in `main.rs`) looks like:
+`init`:
 
-```rust
-use hot_cheese::{run_server, Config, MacBackend};
+- creates the home dir + store,
+- generates a self-signed **`localhost`** TLS cert (CN=`localhost`, SAN
+  `DNS:localhost` + `IP:127.0.0.1`) and writes `ssl-cert.pem` / `ssl-key.pem`,
+- mints a fresh random **DEK**,
+- **requires a recovery passphrase** (entered twice) as the first, survivable
+  enrollment,
+- prints the certificate **SHA-256 fingerprint** — record it for client pinning.
 
-fn main() {
-    // so everybody can customize the storage and name of service and account
-    // and embed it in the binary
-    let bytes = include_bytes!("./conf/cheese_config.json");
-    let conf: Config = serde_json::from_slice(bytes.as_slice()).unwrap();
-    run_server(Box::new(MacBackend::new(
-        &conf.service,
-        &conf.account,
-        &conf.store,
-    )))
-    .unwrap()
+Record the recovery passphrase **offline** (treat it like a seed phrase): it is
+the only cross-machine restore path for the DEK.
+
+To **reuse an existing certificate** (so clients pinning the old fingerprint
+don't have to re-pin):
+
+```bash
+hot_cheese init --import-cert <cert.pem> --import-key <key.pem>
+```
+
+`init` refuses to overwrite an existing config; pass `--force` to deliberately
+reinitialize (this re-mints the DEK and invalidates any keystores already written
+under the previous DEK).
+
+### 2. (Optional) Enroll the Secure Enclave
+
+On a **code-signed** binary with SE entitlements, add a Touch-ID-bound unlock
+method for the **same** DEK:
+
+```bash
+hot_cheese enroll se
+```
+
+You can also enroll additional recovery passphrases:
+
+```bash
+hot_cheese enroll passphrase --label backup-phrase
+```
+
+### 3. Add or generate keys
+
+```bash
+# Import an existing secret (prompted, hidden input):
+hot_cheese add MY_EVM_KEY ethereum     # hex, 0x optional
+hot_cheese add MY_SOL_KEY solana       # base58 keypair bytes
+hot_cheese add MY_RAW     bytes        # raw UTF-8
+
+# Generate a fresh key:
+hot_cheese generate evm    TRADING_BOT
+hot_cheese generate solana SOLANA_TRADER
+
+# Inspect:
+hot_cheese list
+hot_cheese address evm    TRADING_BOT
+hot_cheese address solana SOLANA_TRADER
+```
+
+Key names must match `[A-Za-z0-9_]+`.
+
+### 4. Serve
+
+```bash
+hot_cheese serve
+```
+
+Binds HTTPS on `127.0.0.1:<port>` (default **5555**). If the local store is empty
+and a backup remote is configured, `serve` auto-pulls the store first.
+
+---
+
+## CLI Reference
+
+| Command | What it does |
+| --- | --- |
+| `init [--import-cert <pem> --import-key <pem>] [--force]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase, print the cert fingerprint. |
+| `enroll se [--label <s>]` | Enroll this machine's Secure Enclave (Touch ID) as a KEK for the same DEK. Requires a signed binary. |
+| `enroll passphrase [--label <s>]` | Enroll an additional recovery passphrase. |
+| `add <name> <ethereum\|solana\|bytes>` | Import an existing secret under `name` (read from a hidden prompt). |
+| `generate <evm\|solana> <name>` | Generate a fresh key under `name`. |
+| `address <evm\|solana> <name>` | Print the public address / pubkey of a stored key. |
+| `list` | List stored keystores and keyring enrollments. |
+| `serve` | Run the HTTPS daemon (auto-pulls the store from the first backup remote if absent). |
+| `backup push` | Push the store to every configured remote. |
+| `backup pull` | Pull the store from the first configured remote. |
+| `migrate --old-store <dir> --new-store <dir>` | Migrate legacy Keychain-master keystores into the envelope format (see [MIGRATION.md](./MIGRATION.md)). |
+| `bootstrap-from <user@host>` | Bootstrap this machine's DEK + store from an authority machine over SSH. |
+
+Logging defaults to `INFO`; override with `RUST_LOG=debug` (or `trace`/`warn`/`error`).
+
+---
+
+## Configuration
+
+Config lives at **`$HOT_CHEESE_HOME/config.json`**, defaulting to
+**`~/.config/hot_cheese/config.json`**. The TLS cert/key (`ssl-cert.pem` /
+`ssl-key.pem`) live in that same home dir. `init` writes a sane default; you only
+need to edit it to change the port or add backup remotes.
+
+```json
+{
+  "service": "com.cc.hot_cheese",
+  "account": "hot_cheese_master",
+  "store": "~/.config/hot_cheese/store",
+  "port": 5555,
+  "backup_remotes": [
+    { "host": "user@1.2.3.4", "folder": "hot_cheese_store" }
+  ]
 }
 ```
 
-This will:  
-1. Read your config from `cheese_config.json`.  
-2. Initialize the macOS Keychain backend.  
-3. Start the HTTPS server with the pinned certificates.
+| Field | Meaning |
+| --- | --- |
+| `service`, `account` | **Legacy** Keychain identifiers, used **only** by `migrate` to read the old master. Ignored by the envelope path. |
+| `store` | Directory holding the encrypted keystores + `keyring.json` (`~/` is expanded). |
+| `port` | HTTPS listen port (optional; defaults to `5555`). |
+| `backup_remotes` | List of `{ host, folder }` rsync targets. `folder` is relative to the remote home dir. |
+
+There is **no compile-time config** anymore — nothing is `include_bytes!`'d into
+the binary, so the store path, port, certs, and remotes can change without a
+rebuild.
 
 ---
 
 ## Server Endpoints
 
-The core server logic (an example excerpt from `service_impl`) maps incoming paths to **Hot Cheese** actions:
+All endpoints are served over pinned HTTPS on loopback. Every key access prompts
+for **Touch ID** (when a Secure Enclave enrollment is in use). Names must match
+`[A-Za-z0-9_]+`. On failure the server returns `500 INTERNAL_SERVER_ERROR`.
 
-- **`/health`**  
-  - Returns `"ok"` if the server is running.
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/health` | GET | Returns `ok` if the server is running. |
+| `/read/<name>` | GET (with body) | df-share Diffie-Hellman read: the body carries the client's ephemeral public key; the response is the secret encrypted so only that client can decrypt it. Works for both EVM and Solana keys. |
+| `/evm_generate/<name>` | GET | Generate a new secp256k1 key, then best-effort backup push. |
+| `/evm_address/<name>` | GET | Return the Ethereum address derived from `<name>`. |
+| `/solana_generate/<name>` | GET | Generate a new ed25519 keypair, then best-effort backup push. |
+| `/solana_address/<name>` | GET | Return the Solana pubkey of `<name>`. |
 
-- **`/read/<key_name>`**  
-  - Reads the request body (for Diffie-Hellman parameters) and decrypts the requested `<key_name>` file.  
-  - Returns the encrypted result (decryptable only by the client that initiated the DH exchange).
-
-- **`/evm_generate/<key_name>`**  
-  - Generates a new Ethereum-compatible key (private key in the store).
-
-- **`/evm_address/<key_name>`**  
-  - Returns the Ethereum address derived from the `<key_name>` private key.
-
-**Note**:  
-- All private key decryption operations will prompt for **Touch ID**.  
-- The example code captures any errors and returns `INTERNAL_SERVER_ERROR` if something fails.
+> The endpoints, TLS cert-pinning, and df-share Diffie-Hellman transfer are
+> **unchanged** from the previous version — existing clients keep working as long
+> as the pinned certificate is the same.
 
 ---
 
-## Client Integration Example
+## Client Integration
 
-Suppose you have a Rust client that uses **df-share** or a similar library to handle the Diffie-Hellman exchange. You might write something like:
+Clients **pin the certificate** that `init` printed and verify its SHA-256
+fingerprint out-of-band the first time. The reference client is
+[`examples/pin_cert.rs`](./examples/pin_cert.rs) — copy `HotCheeseAgent` into your
+own key consumers. It reads the pinned cert from
+`~/.config/hot_cheese/ssl-cert.pem` at runtime (it is per-machine now, not
+compiled in):
 
 ```rust
-/// You probably should copy HotCheeseAgent from `pin_cert` example and make it your own in your private key consumers
-fn main() {
-    // Create a HotCheeseAgent to talk to the local server
-    let client = HotCheeseAgent::new("https://localhost:5555");
+// from examples/pin_cert.rs — pins ~/.config/hot_cheese/ssl-cert.pem
+let agent = HotCheeseAgent::new("https://localhost:5555");
 
-    // Health check
-    let health = client.health().expect("Server health request failed");
-    println!("Health: {}", health); // "ok"
-
-    // Generate a new key if you need one
-    client.generate("my_service_key").expect("Key generation failed");
-
-    // Retrieve (decrypt) the key
-    let key = client.read("my_service_key").expect("Key read failed");
-    println!("Decrypted Key: {:?}", key);
-}
+let health = agent.health()?;                 // "ok"
+let addr   = agent.address("TRADING_BOT")?;   // EVM address
+let sol    = agent.solana_address("SOLANA_TRADER")?;
+let secret = agent.read("TRADING_BOT")?;      // df-share DH read
 ```
 
-The **Diffie-Hellman** handshake and **SSL certificate pinning** happen internally, ensuring end-to-end encryption of the private key.
+The Diffie-Hellman handshake and certificate pinning happen inside the agent, so
+the private key is encrypted end-to-end for the calling process.
 
 ---
 
-## Backup Strategy
+## Backups
 
-### 1. Master Encryption Key
-- Stored in the macOS Keychain.  
-- Backup is **critical**; losing this key means you cannot decrypt any stored keys.  
-- You can re-add or export it using Keychain Access or re-run the [Add a Master Password](#2-add-a-master-password) step.
+Because the store is an envelope (the DEK never appears on disk in plaintext), the
+entire store directory is **safe to replicate to untrusted remotes** — the remote
+only ever sees ciphertext and `keyring.json` (which holds the DEK only in wrapped
+form). Only the **store dir** is synced; the certs/keys under the home dir are
+deliberately never replicated.
 
-### 2. Encrypted Keys
-- Located in the directory specified by `cheese_config.json` (`"store"`).  
-- Periodically back up this folder (e.g., to an external drive or secure backup system).
+Backups are automated:
 
-### 3. Automated Backup Script
-- We provide a simple backup script `simple_backup` (an example in `examples/simple_backup.rs`) to help automate backups.  
-- It uses `rsync` to copy:  
-  - The **entire store folder** (the contents of `"store"`).  
-  - The **configuration files** (`ssl-cert.pem`, `ssl-key.pem`, `cheese_config.json`) in `src/conf`.  
-- **Usage**:
-  ```bash
-  cargo run --example simple_backup <remote_host>
-  ```
-- This command will:
-  - Read your `cheese_config.json` (to find the store path).
-  - Copy that folder and your config/certs to the `~/<folder_name>/` directory on `<remote_host>` (assuming SSH access is set up).
-- Adjust the remote paths as needed in the script if you prefer a different location.
+- **After every mutation** — `add`, `generate`, `migrate`, and the HTTP
+  `/evm_generate` / `/solana_generate` endpoints trigger a best-effort `rsync`
+  push to every configured remote. Failures are logged, not fatal.
+- **On `serve`** — if the local store is absent, it is auto-pulled from the first
+  configured remote before the daemon starts.
+- **Manually** — `hot_cheese backup push` (all remotes) and
+  `hot_cheese backup pull` (first remote).
 
-### 4. Restoring from Backup
-You can restore your Hot Cheese environment from a backup using the provided **`regenerate_from_backup.sh`** script. This script:
-
-1. **Pulls** your backed-up store folder from the remote server to your local `store` directory.  
-2. Retrieves the **`conf`** folder (containing `ssl-cert.pem`, `ssl-key.pem`, `cheese_config.json`, etc.) into the local `src/conf`.
-
-**Example Script Usage**:
-```bash
-sh ./regenerate_from_backup.sh <remote_host> <remote_folder_name> <local_store_path>
-```
-- **`<remote_host>`**: The SSH-based remote host, e.g., `myuser@1.2.3.4`.  
-- **`<remote_folder_name>`**: The name of the folder on the remote machine where your backup is stored (e.g., `hot_cheese_keys`).  
-- **`<local_store_path>`**: The local folder where you want the keys stored (e.g., `/Users/myusername/hot_cheese_keys`).
-
-**Script Steps**:
-1. **Creates** your local store directory if it doesn’t exist.  
-2. **Uses `rsync`** to copy everything **except** the `conf` folder into `<local_store_path>`.  
-3. **Copies** the `conf/` folder into your local `src/conf/`.  
-4. **Completion** message shows where keys and config files landed.
-
-**Example**:
-```bash
-./regenerate_from_backup.sh vmname HOT_CHEESE_test ~/HOT_CHEESE_test
-```
-- This pulls from `vmname:~/HOT_CHEESE_test/` into `~/HOT_CHEESE_test` locally and copies `conf/` into `src/conf/`.
+Configure targets in `backup_remotes` (see [Configuration](#configuration)). Each
+remote is `rsync -az` to/from `<host>:~/<folder>/`.
 
 ---
 
-## Security Highlights
+## SSH Bootstrap
 
-- **Customizable Master Encryption Key**  
-  - Users define how the master key is generated and stored in the Keychain.
+Provision a brand-new machine **B** from an authority machine **A** over SSH:
 
-- **Touch ID Authorization**  
-  - Physically ensures that only authorized users can decrypt keys.
+```bash
+# on the new machine B (which has its own Secure Enclave key):
+hot_cheese bootstrap-from user@authority-host
+```
 
-- **SSL Certificate Pinning**  
-  - Prevents MITM attacks by verifying the server’s identity.
+`bootstrap-from` runs `hot_cheese bootstrap-serve` on the authority over SSH and
+speaks a framed protocol over that pipe — no new network listener is opened. The
+DEK is transferred with **ephemeral-static ECIES sealed to B's Secure Enclave
+key**, so it **never crosses the wire in plaintext**:
 
-- **Diffie-Hellman Key Exchange**  
-  - Secures key retrieval by ensuring only the requesting client can decrypt the data.
+1. **B** sends its SE public key.
+2. **A** (which holds the DEK, and authorizes the transfer with a **live Touch
+   ID on A**) generates an ephemeral P-256 keypair, derives a wrap key via
+   `HKDF(ECDH(ephemeral, B_se_pub))`, and seals the DEK (AAD binds both
+   endpoints).
+3. **B** recomputes the shared secret inside its enclave (Touch ID on B), opens
+   the sealed DEK, and **re-wraps it under B's own KEKs** — a fresh `keyring.json`
+   enrolling B's Secure Enclave (and a recovery passphrase if
+   `HOT_CHEESE_BOOTSTRAP_PASSPHRASE` is set). A's keyring is never copied.
+
+Channel authentication comes from SSH (known_hosts / TOFU) — verify A's SSH host
+key fingerprint out-of-band before the first connect. A MITM that fully
+impersonates A could serve a DEK of its choosing, but cannot **learn** B's DEK,
+because confidentiality rests on B's enclave key, not on the channel.
+
+---
+
+## Migration
+
+Coming from the legacy Keychain-master daemon? The migrator decrypts each legacy
+keystore with the old master, re-encrypts it under the new DEK into a staging
+directory, and **verifies a decrypt round-trip + re-derived address before
+committing anything** — the old store is never written, and any single failure
+aborts the whole run.
+
+```bash
+hot_cheese migrate --old-store ~/HOT_CHEESE_MASTER --new-store ~/.config/hot_cheese/store
+```
+
+This is a non-destructive, verify-before-finalize cutover with a dual-run and
+rollback plan. **Do not** improvise it — follow the full runbook in
+**[MIGRATION.md](./MIGRATION.md)**.
+
+---
+
+## Security Model & Residual Risks
+
+This section is deliberately blunt. These are real properties and real limits.
+
+**What this protects against.** At-rest / stolen-disk / stolen-backup /
+keychain-dump scenarios. There is no extractable master password: a stolen disk or
+backup yields only ciphertext and a wrapped DEK that cannot be opened without a
+Secure Enclave key (device-bound) or the recovery passphrase (offline).
+
+**What it does *not* protect against.** A live attacker who already has **code
+execution on the unlocked host**. Such an attacker can solicit reads at the Touch
+ID bar exactly like a legitimate client — this is unchanged from the previous
+version and is inherent to a local signing service.
+
+Specific residual risks:
+
+- **The recovery passphrase is as powerful as the Secure Enclave.** Anyone with
+  it can unwrap the DEK on any machine. Store it **offline, like a seed phrase**.
+  It is also the **only cross-machine restore path**: Secure Enclave keys are
+  device-bound and are **invalidated if you re-enroll Touch ID**, so without a
+  passphrase enrollment (or a still-enrolled second machine) a lost SE key means a
+  lost store. `hot_cheese list` warns when no passphrase is enrolled.
+- **`/read` authorization rests on TLS cert pinning + loopback binding + the
+  per-request Touch ID.** There is **no mutual-TLS / client auth** — any local
+  process that pins the cert, combined with a present human approving Touch ID,
+  can solicit a key. Touch ID gives human-presence, not caller identity.
+- **No anti-rollback.** Keystore files bind AEAD AAD = key name (a wrong-DEK or
+  renamed file won't decrypt), but **version/epoch anti-rollback is not
+  implemented**. An attacker who can write **old ciphertexts (under the same DEK)**
+  back into your store could roll a key back to a previous value. Mitigate by
+  protecting store/backup integrity.
+- **SE/ECDH equivalence is validated in software.** The host-side half of the
+  Secure Enclave ECDH (that `ECDH(eph_priv, se_pub)` equals the enclave's
+  `ECDH(se_priv, eph_pub)`) is covered by a non-ignored software test. The **full
+  Touch ID round-trip must be confirmed once on a code-signed binary** via the
+  `#[ignore]`d `se_key_lifecycle_and_deterministic_ecdh` test in
+  `src/mac/secure_enclave.rs`.
 
 ---
 
 ## FAQ
 
-1. **Why use Touch ID?**  
-   - Touch ID ensures only a physically present, authorized user can decrypt sensitive keys.
+**Why Touch ID?**
+It is no longer just a UI gate — the Secure Enclave key is a cryptographic KEK.
+A read physically requires a present, authorized human to complete the
+Touch-ID-gated ECDH that unwraps the DEK. No biometric, no decryption.
 
-2. **Can I use this on non-macOS systems?**  
-   - Not out of the box. **Hot Cheese** is built around macOS Keychain and Touch ID. However, you can implement custom backends by providing your own `BackendImpl` if your target platform has a different secure store.
+**What if I lose the master key?**
+There is no master key. The DEK is wrapped under multiple independent KEKs: your
+recovery passphrase and any Secure Enclave enrollments. As long as you have the
+recovery passphrase (or a machine whose Secure Enclave you enrolled), you can
+restore. Keep the passphrase offline and enroll more than one unlock method.
 
-3. **What if I lose access to the master key?**  
-   - Without the master key in the Keychain, there is no way to decrypt the on-disk keys. **Always** back up your master key (or keep a secure export of the Keychain item).
+**What if I re-enroll Touch ID, or get a new Mac?**
+Secure Enclave keys are device-bound and are invalidated when Touch ID is
+re-enrolled — that SE enrollment stops working. Recover with the **recovery
+passphrase**, then `enroll se` again on the machine. To move to a new Mac, use
+[`bootstrap-from`](#ssh-bootstrap) or restore a backup and unlock with the
+passphrase.
 
-4. **How do I customize the storage folder or Keychain entry name?**  
-   - Update your `cheese_config.json`:
-     ```jsonc
-     {
-       "service": "com.example.myapp",
-       "account": "myusername",
-       "store": "/Users/myusername/hot_cheese_keys"
-     }
-     ```
-   - Rebuild or re-run the server to pick up changes.
+**Is it safe to back up the store to a remote / cloud?**
+Yes. The store is envelope-encrypted and `keyring.json` holds the DEK only in
+wrapped form, so a remote sees ciphertext only. That is the whole point of the
+redesign — see [Backups](#backups).
 
-5. **How do I manage or update the master encryption key?**  
-   - Use **Keychain Access** or the [Add a Master Password](#2-add-a-master-password) script to set a new password.  
-   - If you change it, the old encrypted files will still require the old key. Be consistent if you rotate keys.
+**Can I use this on non-macOS systems?**
+No. The Secure Enclave + Touch ID path is macOS-specific. The envelope/passphrase
+crypto is portable in principle, but the daemon targets macOS.
 
-6. **Can I import an existing key?**  
-   - Yes, use the `add_existing` script to encrypt and store a hex-encoded private key under the Hot Cheese backend.
+**Do I need to set up signing before I can use it?**
+No. The recovery-passphrase unlocker works on an **unsigned** binary, so you can
+`init`, `add`/`generate`, and `serve` immediately. Code signing is only required
+to enroll and use the Secure Enclave KEK.
+
+**How do I change the store directory, port, or cert?**
+Edit `~/.config/hot_cheese/config.json` (`store`, `port`, `backup_remotes`); no
+rebuild needed. For the cert, re-run `init --import-cert/--import-key`, or
+regenerate and re-pin clients to the new fingerprint.
+
+**Can I import an existing key?**
+Yes — `hot_cheese add <name> <ethereum|solana|bytes>` reads the secret from a
+hidden prompt and stores it under the envelope.
 
 ---
 
-**Hot Cheese** 🔥🧀 — Securely distributing keys with the perfect blend of encryption, macOS security, and seamless integration. Enjoy your cryptographic fondue!
+**Hot Cheese** 🔥🧀 — handing out hot keys with the perfect blend of envelope
+encryption, the Secure Enclave, and seamless local integration. Enjoy your
+cryptographic fondue!

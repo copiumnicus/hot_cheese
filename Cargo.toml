@@ -48,11 +48,31 @@ solana-keypair = "2.2.1"
 solana-signer = "2.2.1"
 bs58 = "0.5.1"
 
+# --- v1: Secure Enclave envelope (DEK/KEK), KDFs, AEAD, CLI, certs ---
+chacha20poly1305 = "0.10" # XChaCha20-Poly1305 AEAD for keystores + DEK wrapping
+hkdf = "0.12"             # derive wrap key from SE ECDH shared secret (0.12 = hmac 0.12/digest 0.10, aligned with k256 stack)
+sha2 = "0.10"             # MUST stay 0.10 to share `digest` with k256/keccak stack
+argon2 = "0.5"                                       # recovery-passphrase KEK (Argon2id)
+p256 = { version = "0.13", features = ["ecdh"] }     # ephemeral keys + ECIES for bootstrap
+hex = { version = "0.4", features = ["serde"] }
+rcgen = "0.14"            # generate self-signed localhost cert on `init`
+clap = { version = "4", features = ["derive"] }
+rpassword = "7.3.1"       # passphrase prompts (was dev-only)
+tracing = "0.1"
+tracing-subscriber = "0.3"
+security-framework = "3.7" # Secure Enclave key + ECDH (Touch ID bound)
+core-foundation = "0.10"
+
 [dev-dependencies]
 ureq = "2.12.1"
-rpassword = "7.3.1"
 
 
 [[bin]]
 name = "hot_cheese"
 path = "src/main.rs"
+
+# The Tauri menu-bar app lives in its own crate so the core dev loop stays fast.
+# `cargo build`/`cargo test` at the root build only this package (the lib+bin);
+# build the app explicitly with `cargo build -p hot_cheese_app`.
+[workspace]
+members = ["app/src-tauri"]

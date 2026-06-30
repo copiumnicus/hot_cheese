@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hot Cheese</title>
+    <style>
+      :root {
+        --bg: #1b1a17; --card: #26241f; --line: #3a372f; --fg: #f3efe6;
+        --muted: #9a948a; --cheese: #f2c14e; --ok: #7bbf6a; --bad: #e06b5e;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; font: 14px/1.5 -apple-system, system-ui, sans-serif;
+        background: var(--bg); color: var(--fg); padding: 18px 20px 40px;
+      }
+      header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+      h1 { font-size: 20px; margin: 0; }
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+      .badge { margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--line); color: var(--cheese); }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+      .banner { background: #4a2f1c; border: 1px solid #7a4e2a; color: #ffd9a8; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+      .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+      .kv span:first-child { color: var(--muted); }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+      ul { list-style: none; margin: 6px 0 12px; padding: 0; }
+      li { padding: 4px 0; border-bottom: 1px solid var(--line); }
+      li:last-child { border-bottom: 0; }
+      .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+      input, select { background: #1f1d19; border: 1px solid var(--line); color: var(--fg); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+      input { flex: 1; min-width: 120px; }
+      button { background: var(--cheese); color: #2a2207; border: 0; border-radius: 8px; padding: 7px 14px; font-weight: 600; font-size: 13px; cursor: pointer; }
+      button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+      button:active { transform: translateY(1px); }
+      .muted { color: var(--muted); }
+      .hidden { display: none; }
+      #log { background: #141310; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; margin-top: 12px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>🧀 Hot Cheese</h1>
+      <span id="mode" class="badge">…</span>
+    </header>
+
+    <div id="demo-banner" class="banner hidden">
+      ⚠️ <b>DEMO software enclave</b> — the unlock key is a file on disk (extractable) and Touch ID is a
+      gate, not hardware-enforced. Preview only; do not store real keys.
+    </div>
+
+    <div id="uninit" class="card hidden">
+      <h2>Not initialized</h2>
+      <p>Run <code>hot_cheese init</code> (or <code>./scripts/demo.sh</code> to preview), then reopen this window.</p>
+    </div>
+
+    <main id="app" class="hidden">
+      <section class="card">
+        <h2>Status</h2>
+        <div class="kv"><span>Store</span><code id="store"></code></div>
+        <div class="kv"><span>Keys</span><span id="keycount"></span></div>
+        <div class="kv"><span>Unlock</span><span id="unlock"></span></div>
+        <div class="kv"><span>Backup remotes</span><span id="remotes"></span></div>
+      </section>
+
+      <section class="card" id="passcard">
+        <h2>Recovery passphrase</h2>
+        <p class="muted">Only needed when the Secure Enclave isn't enrolled — held here for the actions below.</p>
+        <input id="pass" type="password" placeholder="recovery passphrase" />
+      </section>
+
+      <section class="card">
+        <h2>Keys</h2>
+        <ul id="keys"></ul>
+        <div class="row">
+          <input id="gen-name" placeholder="new key name (a–z, 0–9, _)" />
+          <select id="gen-chain"><option value="evm">EVM</option><option value="solana">Solana</option></select>
+          <button onclick="generateKey()">Generate</button>
+        </div>
+        <div class="row">
+          <input id="addr-name" placeholder="key name" />
+          <select id="addr-chain"><option value="evm">EVM</option><option value="solana">Solana</option></select>
+          <button class="ghost" onclick="revealAddress()">Reveal address</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Enrollments &amp; backup</h2>
+        <ul id="enrollments"></ul>
+        <div class="row">
+          <input id="new-pass" type="password" placeholder="new recovery passphrase" />
+          <button class="ghost" onclick="enrollPass()">Add passphrase</button>
+          <button class="ghost" onclick="enrollSE()">Enroll Secure Enclave</button>
+        </div>
+        <div class="row">
+          <button class="ghost" onclick="backup('push')">Backup push</button>
+          <button class="ghost" onclick="backup('pull')">Backup pull</button>
+        </div>
+      </section>
+    </main>
+
+    <pre id="log"></pre>
+
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const $ = (id) => document.getElementById(id);
+      function log(msg, err = false) {
+        const l = $("log");
+        const t = new Date().toLocaleTimeString();
+        l.textContent = `[${t}] ${err ? "✗" : "✓"} ${msg}\n` + l.textContent;
+      }
+      function passOpt() {
+        const p = $("pass").value;
+        return p.length ? p : null;
+      }
+      const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+      async function refresh() {
+        let s;
+        try { s = await invoke("status"); } catch (e) { log(e, true); return; }
+        $("demo-banner").classList.toggle("hidden", !s.demo_software_enclave);
+        $("mode").textContent = s.demo_software_enclave ? "DEMO enclave" : s.has_secure_enclave ? "Secure Enclave" : s.has_passphrase ? "Passphrase" : "—";
+        if (!s.initialized) { $("uninit").classList.remove("hidden"); $("app").classList.add("hidden"); return; }
+        $("uninit").classList.add("hidden"); $("app").classList.remove("hidden");
+        $("store").textContent = s.store_path;
+        $("keycount").textContent = s.key_count;
+        const unlock = [s.has_secure_enclave && "Secure Enclave (Touch ID)", s.has_passphrase && "recovery passphrase"].filter(Boolean).join(" + ") || "none";
+        $("unlock").textContent = unlock;
+        $("remotes").textContent = s.backup_remotes;
+        $("keys").innerHTML = s.keys.length ? s.keys.map((k) => `<li><code>${esc(k)}</code></li>`).join("") : '<li class="muted">no keys yet</li>';
+        $("enrollments").innerHTML = s.enrollments.length
+          ? s.enrollments.map((e) => `<li>${e.kind === "secure_enclave" ? "🔐" : "🔑"} <code>${esc(e.label)}</code> <span class="muted">${esc(e.id)}</span></li>`).join("")
+          : '<li class="muted">none</li>';
+        $("passcard").classList.toggle("hidden", s.has_secure_enclave);
+      }
+
+      async function generateKey() {
+        const name = $("gen-name").value.trim(), chain = $("gen-chain").value;
+        if (!name) return log("enter a key name", true);
+        try { await invoke("generate_key", { chain, name, passphrase: passOpt() }); log(`generated ${chain} key '${name}'`); $("gen-name").value = ""; refresh(); }
+        catch (e) { log(e, true); }
+      }
+      async function revealAddress() {
+        const name = $("addr-name").value.trim(), chain = $("addr-chain").value;
+        if (!name) return log("enter a key name", true);
+        try { const a = await invoke("key_address", { chain, name, passphrase: passOpt() }); log(`${name} (${chain}) → ${a}`); }
+        catch (e) { log(e, true); }
+      }
+      async function enrollPass() {
+        const np = $("new-pass").value;
+        if (!np) return log("enter a new passphrase", true);
+        try { await invoke("enroll_passphrase", { newPassphrase: np, existingPassphrase: passOpt() }); log("added recovery passphrase"); $("new-pass").value = ""; refresh(); }
+        catch (e) { log(e, true); }
+      }
+      async function enrollSE() {
+        try { await invoke("enroll_secure_enclave", { existingPassphrase: passOpt() }); log("enrolled Secure Enclave"); refresh(); }
+        catch (e) { log(e, true); }
+      }
+      async function backup(dir) {
+        try { await invoke(dir === "push" ? "backup_push" : "backup_pull"); log(`backup ${dir} ok`); }
+        catch (e) { log(e, true); }
+      }
+
+      refresh();
+      setInterval(refresh, 5000);
+    </script>
+  </body>
+</html>

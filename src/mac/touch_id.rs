@@ -52,6 +52,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[ignore = "interactive: triggers a real Touch ID prompt; run manually with `cargo test -- --ignored`"]
     fn test_touch_id() {
         println!("{}", authorize_with_touch_id("test"));
     }

@@ -18,6 +18,7 @@ use std::{
 };
 use tiny_keccak::{Hasher, Keccak};
 mod bytes_hex;
+pub mod envelope;
 mod keystore;
 pub use keystore::{CipherparamsJson, CryptoJson, EthKeystore, KdfparamsType};
 
@@ -25,21 +26,19 @@ pub fn random_pk<R: Rng + CryptoRng>(rng: &mut R) -> SigningKey {
     SigningKey::random(rng)
 }
 
-
-/// convert hex str to a vec of bytes
+/// convert hex str to a vec of bytes; returns None on odd length or any non-hex digit
+/// (never panics — reachable from deserializing untrusted legacy keystore JSON in migration)
 pub fn to_vec(mut s: &str) -> Option<Vec<u8>> {
     if s.starts_with("0x") {
         s = &s[2..]
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
-    Some(
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect(),
-    )
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 pub fn keccak256(slice: Vec<u8>) -> [u8; 32] {
