@@ -116,6 +116,25 @@ pub fn decrypt_file(path: &Path, name: &str, dek: &Dek) -> Result<Vec<u8>, EnvEr
     open(dek.expose(), name.as_bytes(), &f)
 }
 
+/// Write `bytes` to `path` as an owner-only (0600) file, creating the parent dir if needed
+/// and forcing the mode on a pre-existing file too. For key material: the Secure Enclave
+/// blob, the demo software key, and the TLS private key.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
+}
+
 /// Write `bytes` to `path` via temp-file + rename so a crash can't leave a partial file.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EnvErr> {
     let tmp = path.with_extension("hctmp");

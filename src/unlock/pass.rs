@@ -1,8 +1,8 @@
 //! Recovery-passphrase KEK (Argon2id).
 //!
-//! This is the survivable backstop: it needs no hardware and no code signing, so
-//! it works on an unsigned binary today and is the only way to restore an
-//! envelope onto a fresh machine (Secure Enclave keys are device-bound).
+//! This is the survivable backstop: it needs no Secure Enclave hardware, so it works on
+//! any machine and is the only way to restore an envelope onto a fresh machine (Secure
+//! Enclave keys are device-bound).
 use super::{UnlockErr, Unlocker};
 use crate::crypto::envelope::{open, seal, Dek};
 use crate::keyring::{new_id, now_secs, EnrollParams, Enrollment, Keyring};
@@ -44,7 +44,12 @@ fn derive_kek(
 }
 
 impl Unlocker for PassphraseUnlocker {
-    fn unlock(&self, _reason: &str, keyring: &Keyring) -> Result<Dek, UnlockErr> {
+    fn unlock(
+        &self,
+        _reason: &str,
+        keyring: &Keyring,
+        _auth: Option<&crate::mac::local_auth::LaContext>,
+    ) -> Result<Dek, UnlockErr> {
         let mut saw_passphrase = false;
         for e in &keyring.enrollments {
             if let EnrollParams::Passphrase {
@@ -107,7 +112,7 @@ mod tests {
         let u = PassphraseUnlocker::new("correct horse battery staple".to_string());
         let mut kr = Keyring::new();
         kr.add(u.enroll("recovery", &dek).unwrap());
-        let got = u.unlock("test", &kr).unwrap();
+        let got = u.unlock("test", &kr, None).unwrap();
         assert_eq!(got.expose(), dek.expose());
     }
 
@@ -119,7 +124,7 @@ mod tests {
         kr.add(good.enroll("recovery", &dek).unwrap());
         let bad = PassphraseUnlocker::new("wrong".to_string());
         assert!(matches!(
-            bad.unlock("test", &kr),
+            bad.unlock("test", &kr, None),
             Err(UnlockErr::WrongPassphrase)
         ));
     }
@@ -132,7 +137,7 @@ mod tests {
         let mut kr = Keyring::new();
         kr.add(a.enroll("a", &dek).unwrap());
         kr.add(b.enroll("b", &dek).unwrap());
-        assert_eq!(a.unlock("t", &kr).unwrap().expose(), dek.expose());
-        assert_eq!(b.unlock("t", &kr).unwrap().expose(), dek.expose());
+        assert_eq!(a.unlock("t", &kr, None).unwrap().expose(), dek.expose());
+        assert_eq!(b.unlock("t", &kr, None).unwrap().expose(), dek.expose());
     }
 }

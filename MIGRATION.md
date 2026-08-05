@@ -1,170 +1,155 @@
-# hot_cheese — Migration & Cutover Runbook
+# hot_cheese — Production Cutover Runbook (OLD → NEW, Secure-Enclave mode)
 
-Moving from the **legacy** key daemon (Web3 keystores unlocked by a single
-Keychain *master* password behind Touch ID) to **v1** (per-file envelope
-encryption under a Data Encryption Key — DEK — that is itself wrapped in a
-keyring and unlocked per request by the Secure Enclave or a recovery
-passphrase).
+The authoritative, ordered, copy-pasteable sequence to move a **production** install
+from the legacy daemon (Web3 keystores under a single Keychain master) to **v1**
+(per-file envelope under a DEK, unlocked per request by the Secure Enclave or a
+recovery passphrase), in **Secure-Enclave mode**.
 
-The migration is **non-destructive and verify-before-finalize**: every legacy
-key is decrypted with the old master, re-encrypted under the new DEK into a
-staging directory, and *both* a decrypt round-trip and a re-derived public
-address are checked before anything is committed. The old store is never
-written. If a single key fails to verify, the whole run aborts and the staging
-directory is removed. See `src/migrate.rs`.
+`migrate` is **non-destructive**: each legacy key is decrypted with the old master,
+re-encrypted under the new DEK into `<new-store>.staging`, and verified (decrypt
+round-trip **and** re-derived address) before anything commits. The old store is never
+written; any failure removes the staging dir and aborts. Plan a **dual-run** and
+decommission the legacy store only after v1 has served real traffic and pushed a good
+backup.
 
-> Plan for a **dual-run** period (run old and new side by side for N days) and
-> only decommission the legacy store after you have served real traffic from v1
-> and pushed at least one good backup.
+## Cutover blockers — read first
 
----
+- **§1 — `serve` (and every SE op) must run in your active GUI login session.** Touch ID
+  cannot fire under pure `ssh` / `sudo` / a background launchd daemon. No code signing,
+  Team ID, entitlements, or Apple Developer Program is required.
+- **§2 — the TLS cert re-pins every client** unless you import the old one (needs the
+  old private key on disk).
+- **§3 — the Keychain identity must match the OLD install** before `migrate`, or it
+  reads the wrong/no master.
+- **§6 — every signing key needs a policy file with `chain_id`** before `sign` will work.
 
-## 0. What changes for clients (read first)
+## Where everything lives: `HOT_CHEESE_HOME`
 
-- **New keys are unreadable with the old master.** v1 keystores are
-  XChaCha20-Poly1305 envelopes keyed by the DEK, not scrypt+AES under the
-  Keychain master. The DEK is recoverable on a new machine **only** via the
-  recovery passphrase (or a machine whose Secure Enclave you enrolled). **Record
-  the recovery passphrase offline.**
-- **The TLS certificate may change, which re-pins every client.** `hot_cheese
-  init` mints a fresh self-signed `localhost` cert by default and prints its
-  **SHA-256 fingerprint**. Clients that pin the old fingerprint will reject the
-  new server until you update them.
-  - To **avoid re-pinning**, keep your existing cert:
-    `hot_cheese init --import-cert <old.pem> --import-key <old-key.pem>`.
-  - Otherwise, **distribute the new fingerprint** to every client out-of-band
-    before cutover.
-
----
-
-## 1. Prerequisites
-
-- **Binary distribution**
-  - **Secure Enclave path (recommended for production):** you need a
-    **code-signed** `hot_cheese` binary with Secure Enclave entitlements.
-    Touch ID-bound SE keys cannot be created from an unsigned build —
-    `enroll se` will refuse with a clear message on an unsigned binary.
-  - **Passphrase-only path (fine to start / for an unsigned build):** skip
-    `enroll se`. The recovery passphrase minted at `init` is a fully functional
-    unlock method; you can add SE later once you have a signed binary.
-- **The legacy master is reachable.** The old master still lives in the login
-  Keychain under the service/account in your config (defaults:
-  `com.cc.hot_cheese` / `hot_cheese_master`). Migration will prompt **one Touch
-  ID** to read it. Do **not** delete the Keychain item yet.
-- **You can authenticate at the console.** `init`, `enroll`, and `migrate` all
-  prompt interactively (passphrase entry and/or Touch ID); run them in a real
-  terminal on the host, not over a pipe.
-- **Know where the old store is.** The legacy keystores live in a directory
-  (commonly `~/HOT_CHEESE_MASTER`). The migrator reads every regular file there
-  whose name is `[A-Za-z0-9_]+`; it ignores `keyring.json`, dotfiles, and
-  subdirectories.
-- **Same filesystem for the new store.** Staging happens in
-  `<new-store>.staging` next to the destination so the finalizing move is a
-  same-filesystem atomic rename. The default new store is
-  `~/.config/hot_cheese/store`.
-- **Have your own address manifest.** Before cutover, write down the expected
-  EVM address / Solana pubkey for each key (from your existing records). You
-  will diff this against what `migrate` prints.
-
----
-
-## 2. Cutover (step by step)
-
-Run these on the host that owns the keys. Set logging with
-`RUST_LOG=info` (the default) so the informational output below is shown.
-
-### 2.1 Update the binary
-
-Install the new `hot_cheese` binary (signed, if you intend to use the Secure
-Enclave). Stop the legacy daemon. Confirm:
+Every path below is under the **home dir**: `$HOT_CHEESE_HOME` if that variable is set,
+otherwise `~/.config/hot_cheese`. It holds `config.toml`, `ssl-cert.pem`, `ssl-key.pem`,
+the Secure Enclave key blob, and (by default) `store/`. Setting `HOT_CHEESE_HOME` fully
+isolates an install — which is how you rehearse this runbook without touching production:
 
 ```
-hot_cheese --version
+export HOT_CHEESE_HOME=/tmp/hot_cheese_dryrun
 ```
 
-### 2.2 Initialize v1
+Export it in **every** shell that runs a `hot_cheese` command for that install, including
+the one running `serve`. Where this document writes `~/.config/hot_cheese/…`, read
+`$HOT_CHEESE_HOME/…` if you set it.
+
+---
+
+## 1. Build and validate the Secure Enclave
+
+The Secure Enclave KEK uses Apple CryptoKit (`SecureEnclave.P256`), which needs **no**
+code signing, Team ID, entitlements, provisioning profile, `.app` wrapper, Developer ID,
+or notarization — a plain release build carries the automatic ad-hoc signature that the
+enclave accepts. Those are only needed later to **distribute** the binary to other Macs.
+
+```
+cargo build --release
+./target/release/hot_cheese se-selftest
+```
+
+Run this in your **GUI login session** (a Terminal window on the Mac itself), not over
+`ssh`. Expect a couple of Touch ID prompts. `se-selftest` asserts Touch ID gating,
+deterministic ECDH, and SE/host ECDH equivalence. **If it fails, stop and fix before
+touching real keys.** If `se-selftest` reports the enclave is unavailable, the machine has
+no Secure Enclave — use the recovery passphrase path only.
+
+## 2. Preserve your TLS cert (avoid re-pinning live clients)
+
+`init` mints the home dir + store, the DEK, and the TLS cert, and **requires a recovery
+passphrase** (entered twice). To keep the existing cert so pinned clients keep working,
+import the OLD cert **and** its private key (both are required):
+
+```
+hot_cheese init \
+  --import-cert /path/to/old/src/conf/ssl-cert.pem \
+  --import-key  /path/to/old/src/conf/ssl-key.pem
+```
+
+If you do **not** have the old private key, or you control every client, skip the
+import and re-pin:
 
 ```
 hot_cheese init
 ```
 
-This creates the home dir + store, writes the TLS cert/key, mints the DEK, and
-**requires a recovery passphrase** (entered twice). On success it logs:
+`init` prints the certificate **SHA-256 fingerprint** — distribute it to every client
+out-of-band before cutover. **Record the recovery passphrase offline**: it is the only
+cross-machine restore path for the DEK. Both `ssl-key.pem` and the SE key blob are written
+**0600**; keep it that way.
 
-- `initialized hot_cheese` with the home and store paths,
-- `TLS certificate written` with the cert path,
-- `certificate fingerprint (pin this on the client)` with the **SHA-256**.
-
-**Do now, offline:**
-- Record the **recovery passphrase** in your secrets manager / on paper. It is
-  the only cross-machine restore path for the DEK.
-- Record the printed **cert SHA-256 fingerprint** for client pinning.
-
-To keep the existing certificate (no client re-pin), instead run:
+`init` refuses to run when it finds a prior install — `config.toml`, a `store/keyring.json`,
+or any keystore file — and names what it found:
 
 ```
-hot_cheese init --import-cert <old-cert.pem> --import-key <old-key.pem>
+ExistingStore { store: "…/store", keyring: true, keystores: 3 }
 ```
 
-> `init` refuses to overwrite an existing config; pass `--force` only if you
-> deliberately want to reinitialize (this re-mints the DEK and invalidates any
-> keystores already written under the previous DEK).
+That guard exists because a second `init` mints a **new DEK**, which permanently orphans
+every keystore encrypted under the old one. `--force` overrides it; pass it only when you
+intend exactly that.
 
-### 2.3 (Optional) Enroll the Secure Enclave
+## 3. Match the legacy Keychain identity BEFORE migrating
 
-Only on a **code-signed** binary with SE entitlements:
+`migrate` reads the old master from the login Keychain using `service`/`account` from
+`~/.config/hot_cheese/config.toml`. `init` wrote the defaults
+`com.cc.hot_cheese` / `hot_cheese_master`. If the OLD install used different values
+(from its `cheese_config.json`), edit them to match **now** — otherwise `migrate` reads
+the wrong or no master:
+
+```
+service = "com.cc.hot_cheese"
+account = "hot_cheese_master"
+```
+
+## 4. Enroll this machine's Secure Enclave
 
 ```
 hot_cheese enroll se
 ```
 
-This adds a Touch ID-bound unlock method for the **same** DEK (the recovery
-passphrase still works as the survivable backstop). On an unsigned binary this
-command fails with guidance to use the passphrase instead — that is expected;
-skip it.
+**Expect exactly one prompt: the recovery passphrase. There is NO Touch ID here.** The
+enclave key is *created* without a biometric, and the enrollment wraps the DEK with a
+host-side ECDH against the enclave's **public** key — neither step needs the private key,
+so neither prompts. (If you are waiting for a Touch ID sheet, the command already finished.)
 
-### 2.4 Migrate the legacy keys
+Adds an SE unlock for the **same** DEK; the recovery passphrase remains the survivable
+backstop. The first Touch ID sheet comes later, on the first command that actually unlocks
+through the enclave (§5, §7).
+
+## 5. Migrate the keys (non-destructive)
 
 ```
 hot_cheese migrate \
-  --old-store ~/HOT_CHEESE_MASTER \
+  --old-store /path/to/legacy/store \
   --new-store ~/.config/hot_cheese/store
 ```
 
-What happens:
-- **One Touch ID** prompt authorizes reading the legacy master from the
-  Keychain.
-- The new DEK is unlocked (Secure Enclave if enrolled, else a recovery
-  passphrase prompt).
-- Each legacy key is decrypted, re-encrypted under the DEK into
-  `~/.config/hot_cheese/store.staging`, and **verified** (decrypt round-trip +
-  re-derived address). Identity is derived by secret length:
-  **32 bytes → EVM address**, **64 bytes → Solana pubkey**, **otherwise →
-  `sha256:<hex>` of the bytes**.
-- Only after *all* keys verify is the destination store populated (atomic
-  renames out of staging). On any failure the run aborts, removes the staging
-  dir, and **leaves the old store byte-for-byte unchanged**.
+`--new-store` must be empty. Expect **three** prompts, in this order:
 
-On success it logs `migration complete` and one line per key:
-`migrated  name=<NAME>  identity=<address-or-hash>`.
+1. **Touch ID** — authorizes reading the legacy Keychain master.
+2. **A login-Keychain access dialog** — *“hot_cheese wants to use your confidential
+   information stored in "hot_cheese_master" in your keychain”*, with **Deny / Allow /
+   Always Allow** and your **login password**. This is expected and is not a failure: the
+   legacy master item's ACL lists the OLD binary, and the new `hot_cheese` binary is a
+   different code identity, so macOS asks you to extend the ACL. **Allow** is enough for a
+   one-shot migration; **Always Allow** avoids re-prompting if you re-run it.
+3. **Touch ID** — unlocks the new DEK via the enrolled Secure Enclave. The sheet names the
+   operation (`Unlock the hot_cheese DEK for migrate`).
 
-> Note: `migrate` requires that `init` has already run (it loads the v1 config +
-> keyring). The destination store must not already contain a key file, or the
-> command fails with `NewStoreNotEmpty`.
->
-> If you have already configured a backup remote, `migrate` will additionally do
-> a best-effort backup push at the end. If you would rather verify locally
-> first, configure the remote **after** this step (see 2.7).
+Each key is decrypted, re-encrypted under the DEK into `store.staging`, and verified before
+the atomic move. Identity is derived by secret length: **32 bytes → EVM address**,
+**64 bytes → Solana pubkey**, otherwise **`sha256:<hex>`**. On success it logs one line per
+key: `migrated  name=<NAME>  identity=<address-or-hash>`.
 
-### 2.5 Verify the address manifest
-
-Diff the printed `identity` for every `name` against the records you prepared in
-§1. **They must match exactly.** If any address differs, **stop** — do not serve
-or delete anything; investigate the source key. (A mismatch cannot be caused by
-the re-encryption itself: the migrator re-derives and checks each address before
-committing, so a discrepancy means the *input* secret was not what you expected.)
-
-Spot-check independently if you like:
+**Eyeball the printed manifest against your known addresses.** If any differs, **stop** —
+the old store is untouched; investigate the source key. Optional independent spot-check
+(each `address` prompts Touch ID, and the sheet names the key — `Unlock "<NAME>" for get
+address`):
 
 ```
 hot_cheese list
@@ -172,85 +157,169 @@ hot_cheese address evm    <NAME>
 hot_cheese address solana <NAME>
 ```
 
-### 2.6 End-to-end read test
+## 6. Write a signing policy for every key you will `sign` with
 
-Start the daemon and exercise a real client read:
+`sign` is fail-closed: it loads `<store>/policies/<NAME>.toml` and **denies every signature**
+if that file is missing or does not parse. `chain_id` is **required** — a policy without it
+fails to load, which reads as "every signature denied", not as a warning.
+
+```
+mkdir -p ~/.config/hot_cheese/store/policies
+cat > ~/.config/hot_cheese/store/policies/<NAME>.toml <<'POLICY'
+safe = "0xYourSafeAddress"
+chain_id = 1
+
+[[allow]]
+to = "0xContractYouCall"
+selectors = ["0xa9059cbb"]
+max_value = "0"
+operation = "call"
+POLICY
+```
+
+- `safe` and `chain_id` pin the Safe and the chain; an intent for any other Safe or chain
+  is denied (this is the cross-chain replay guard).
+- Each `[[allow]]` rule permits one destination: only the listed 4-byte `selectors`, up to
+  `max_value`, and only with the listed `operation` (`call` unless you write `delegatecall`).
+  A destination with no rule is denied.
+- Gas-refund fields are **opt-in**: with no `[refunds]` table, an intent carrying any
+  non-zero `gasPrice` / `gasToken` / `refundReceiver` is denied outright. Add the table only
+  if you genuinely use refunds, and cap it:
+
+```
+[refunds]
+gas_tokens = ["0x0000000000000000000000000000000000000000"]
+refund_receivers = ["0xYourRelayer"]
+max_gas_price = "1000000000"
+max_base_gas = "100000"
+max_safe_tx_gas = "0"
+```
+
+- Owner/threshold rotations (a call from the Safe to itself) are denied unless
+  `[owner_management]` sets `allow = true` and lists the selectors.
+
+Policies live inside the store, so they travel with the rsync backup.
+
+## 7. Run and verify
 
 ```
 hot_cheese serve
 ```
 
-Point a client at `https://localhost:<port>` (pinning the fingerprint from
-§2.2) and perform **one `read`** of a migrated key end-to-end. Confirm the
-returned secret is correct on the client side. A successful authenticated read
-proves the DEK unlock path, the envelope, and TLS pinning all work together.
-
-### 2.7 Push a backup
-
-Configure at least one backup remote (in `config.json`), then:
+Runs in the foreground on `127.0.0.1:5555` (override with `port` in `config.toml`).
+Liveness check — this proves the daemon is up and serving TLS, and prompts no biometric:
 
 ```
-hot_cheese backup push
+curl --cacert ~/.config/hot_cheese/ssl-cert.pem https://127.0.0.1:5555/health   # -> ok
 ```
 
-This stores the **encrypted** store (keystores remain envelope-encrypted at
-rest; the remote never sees plaintext or the DEK). Confirm the push succeeds.
-From here on, a fresh machine can `serve` and auto-pull, then unlock with the
-recovery passphrase.
+**That `curl` is a liveness check, not a pinning test.** macOS ships curl with the
+SecureTransport backend (`curl --version` says so), where `--cacert` *adds* an anchor to the
+system trust store instead of replacing it — a certificate signed by any system-trusted CA
+would also pass. Real pinning is what the reference client does: it builds a
+`RootCertStore` containing **only** `ssl-cert.pem`, so nothing else validates. Test it with:
 
-### 2.8 Dual-run for N days
+```
+cargo run --release --example pin_cert -- https://127.0.0.1:5555 <NAME>
+```
 
-Keep the legacy store **intact and untouched** and the new daemon serving real
-traffic for a soak period (suggest **N = 7–14 days**, per your risk tolerance).
-During this window:
-- Serve production reads from v1.
-- Keep at least one good backup current.
-- Do **not** modify or delete the legacy store or its Keychain master.
+It resolves the pinned cert from the same home dir the daemon uses (honouring
+`HOT_CHEESE_HOME`), prints `health=ok`, then does **one** df-share read of `<NAME>` and
+prints only `len=`, `digest=` (salted per read and truncated, so it is not a usable offline
+commitment to the secret), and `evm_address=` — never the key bytes.
 
----
+Then do **one** real read from your actual client (pinning the fingerprint from §2) to
+confirm the end-to-end path. Every `/read` now prompts a **fresh Touch ID per request**, and
+the sheet names the key (`Unlock "<NAME>" for read key`) — do not script or spam it;
+`/health` is the only non-prompting endpoint.
 
-## 3. Decommission (only after a successful dual-run)
+## 8. Back up what the store backup does NOT cover
 
-When you are confident v1 is serving correctly and you have verified backups:
+The rsync backup replicates **only the store dir** — which includes `keyring.json` (the
+**wrapped DEK**) — so the remote never sees plaintext or the DEK. It does **not** include
+the TLS cert/key or `config.toml` (those live under the home dir). Separately back up
 
-1. **Final backup:** `hot_cheese backup push`.
-2. **Delete the old store directory** (e.g. `rm -rf ~/HOT_CHEESE_MASTER`).
-3. **Remove the legacy Keychain master item** — delete the password entry for
-   the configured service/account (defaults `com.cc.hot_cheese` /
-   `hot_cheese_master`) via Keychain Access or `security delete-generic-password`.
+```
+~/.config/hot_cheese/{ssl-cert.pem,ssl-key.pem,config.toml}
+```
 
-After this, the legacy master is gone and all key access flows exclusively
-through the v1 DEK (Secure Enclave and/or recovery passphrase).
-
----
-
-## 4. Rollback
-
-Because migration never touches the old store, rollback before decommission is
-trivial:
-
-- **During §2 (pre-decommission):** stop `hot_cheese serve`, restart the legacy
-  daemon against the still-intact old store, and revert clients to the old cert
-  fingerprint. Optionally `rm -rf ~/.config/hot_cheese/store.staging` if an
-  aborted run left a stale staging dir (a clean run removes it automatically;
-  the next `migrate` also clears a stale one first).
-- **After §3 (post-decommission):** the legacy store and Keychain master are
-  gone — recovery is via the v1 backups and the **recovery passphrase** only.
-  This is why §2.7 (a verified backup) and an offline copy of the passphrase are
-  mandatory before you ever reach §3.
+to a **secure** location. Do **not** rsync the TLS private key to untrusted backup
+hosts. To provision a fresh machine from an authority host over SSH instead, use
+`hot_cheese bootstrap-from user@host` (transfers the DEK + store).
 
 ---
 
-## 5. Failure reference (`migrate`)
+## After cutover
 
-| Symptom (logged error) | Meaning | Action |
+- **Dual-run (N = 7–14 days).** Keep the legacy store and its Keychain master **intact
+  and untouched** while v1 serves production. Keep at least one good backup current
+  (`hot_cheese backup push`, after configuring `backup_remotes` in `config.toml`).
+- **Decommission (only after a clean dual-run + verified backup):** final
+  `hot_cheese backup push`; delete the legacy store dir; remove the legacy Keychain
+  master (`security delete-generic-password` for the configured service/account). After
+  this, all access flows through the v1 DEK (SE and/or recovery passphrase) only.
+- **Rollback before decommission is trivial** (migrate never touched the old store):
+  stop `hot_cheese serve`, restart the legacy daemon against the intact old store, and
+  revert clients to the old cert fingerprint. Remove a stale `store.staging` if an
+  aborted run left one (a clean run removes it; the next `migrate` also clears it first).
+
+## Recovery: the Secure Enclave key is gone
+
+The enclave key is device-bound and dies with the machine, with the blob file, or with a
+**Touch ID re-enrollment** (the key's ACL is `.biometryCurrentSet`, so adding or removing a
+fingerprint invalidates it). The store is **not** lost: the same DEK is also wrapped under
+your recovery passphrase. Commands fail with an error naming the remedy — e.g.
+
+```
+command failed error=ApiBackend(Unlock(SeKeyUnavailableTryUnlockPassphrase))
+```
+
+The escape hatch is the global `--unlock <se|passphrase>` flag, accepted by every command
+that unlocks the DEK (`address`, `add`, `generate`, `sign`, `enroll`, `migrate`), either
+before or after the subcommand:
+
+```
+hot_cheese --unlock passphrase address evm <NAME>
+hot_cheese address evm <NAME> --unlock se          # force the enclave instead of the default
+```
+
+Omitting `--unlock` keeps the existing behaviour exactly: the Secure Enclave when any SE
+enrollment exists, otherwise a passphrase prompt. There is no silent fallback — a broken
+enclave stays loud.
+
+To get back to normal Touch ID operation:
+
+```
+rm $HOT_CHEESE_HOME/se_kek_hotcheese_se_kek_v1.blob   # or ~/.config/hot_cheese/…
+hot_cheese --unlock passphrase enroll se
+```
+
+Deleting the blob is required when the key still exists but was invalidated: `enroll se`
+reuses an existing blob and would otherwise re-enroll the dead key. The stale enrollment
+record left in `keyring.json` is harmless — unlock skips any record whose `se_pub` is not
+this machine's current enclave key.
+
+`serve` deliberately **refuses** `--unlock passphrase` (`ServeRefusesPassphraseUnlock`): the
+daemon holds its unlocker for its whole lifetime, so one startup passphrase would answer
+every later request and silently delete the per-request human approval that is the point of
+the daemon. Recover with the management commands above, re-enroll the enclave, then serve.
+
+Losing the passphrase **and** the enclave key means the store is unrecoverable — that is the
+design. `hot_cheese list` warns when no passphrase is enrolled.
+
+## `migrate` failure reference
+
+| Logged error | Meaning | Action |
 | --- | --- | --- |
-| `NewStoreNotEmpty` | The destination store already holds a key file. | Point `--new-store` at an empty dir, or clear the intended one if it was a false start. |
-| `VerifyMismatch(<name>)` | A key's round-trip or re-derived address didn't match. | Aborted safely; old store intact, no staging left. Investigate that source key; do not retry blindly. |
-| `Crypto(MacMismatch)` / `Crypto(SerdeJson..)` | A legacy file failed its MAC or isn't valid keystore JSON (wrong master, or a corrupt/foreign file in the old store). | Confirm you authorized the correct Keychain master and that `--old-store` contains only real legacy keystores. |
-| `SolanaKeypair` | A 64-byte secret didn't parse as a valid Solana keypair. | Inspect that source key; it isn't a well-formed ed25519 keypair. |
+| `NewStoreNotEmpty` | `--new-store` already holds a key file. | Point at an empty dir. |
+| `VerifyMismatch(<name>)` | Round-trip or re-derived identity didn't match. | Aborted safely; old store intact. Investigate that source key; don't retry blindly. |
+| `Crypto(..)` / `Envelope(..)` | A legacy file failed its MAC or isn't valid keystore JSON (wrong master, or a foreign file in `--old-store`). | Confirm the §3 service/account and that `--old-store` holds only real legacy keystores. |
+| `SolanaKeypair` | A 64-byte secret didn't parse as a Solana keypair. | Inspect that source key. |
 | `Address(..)` | A 32-byte secret didn't yield a valid EVM key. | Inspect that source key. |
-| Touch ID denied | The biometric prompt for the legacy master was rejected. | Re-run `migrate` and approve the prompt. |
+| Touch ID denied | The biometric prompt for the legacy master was rejected. | Re-run and approve. |
+| `GetPassword(NonzeroStatus(-25300))` | No legacy master under the configured `service`/`account`. | Fix §3 and re-run. |
+| `GetPassword(NonzeroStatus(-128))` | The login-Keychain ACL dialog was cancelled. | Re-run and choose **Allow**. |
+| `Unlock(SeKeyUnavailableTryUnlockPassphrase)` | This machine's Secure Enclave key is missing or unloadable. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
 
-In every failure case above, the old store is left **byte-for-byte unchanged**
-and no partial new store is produced.
+In every case the old store is left **byte-for-byte unchanged** and no partial new store
+is produced.

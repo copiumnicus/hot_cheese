@@ -1,0 +1,66 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+exclude = ["err_mac@0.1.0"]
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+ignore = [
+    { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.2.0 via ed25519-dalek 1.0.1 <- solana-keypair/solana-signer; needs curve25519-dalek>=4.1.3 (ed25519-dalek v2), a solana major bump; out of scope" },
+    { id = "RUSTSEC-2022-0093", reason = "ed25519-dalek 1.0.1 via solana-keypair/solana-signer; double-pubkey oracle fixed in ed25519-dalek>=2, a solana major bump; out of scope" },
+    { id = "RUSTSEC-2025-0009", reason = "ring 0.16.20 via df-share 0.1.1; AES panic only fires with overflow-checks, which release (mandated here) disables; fix needs df-share to adopt ring>=0.17.12" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 via rustls 0.23.20 (pins webpki ^0.102); CRL parse panic; fix needs a rustls bump to webpki>=0.103.13, a direct-pin change deferred from this pin pass" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 via rustls 0.23.20 (pins webpki ^0.102); name-constraint bug; fix needs a rustls bump to webpki>=0.103.12, a direct-pin change deferred from this pin pass" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 via rustls 0.23.20 (pins webpki ^0.102); wildcard name-constraint bug; fix needs a rustls bump to webpki>=0.103.12, a direct-pin change deferred from this pin pass" },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 via rustls 0.23.20 (pins webpki ^0.102); CRL distribution-point bug; fix needs a rustls bump to webpki>=0.103.10, a direct-pin change deferred from this pin pass" },
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 (direct) + 0.7.3 (solana); unsound only via rand::rng() under a custom global logger; hot_cheese key/salt/nonce entropy uses OsRng; 0.7.3 is solana-owned with no 0.7.x fix" },
+    { id = "RUSTSEC-2025-0023", reason = "tokio 1.42.0; unsound only for sync::broadcast clone; hot_cheese uses no broadcast channels; fixed in tokio>=1.42.1, a direct-pin bump deferred" },
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained proc-macro via alloy-primitives/alloy-sol-types; compile-time only; pending upstream alloy migration" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 2.0.1 unmaintained via alloy-sol-macro; compile-time only; pending upstream alloy migration" },
+    { id = "RUSTSEC-2025-0010", reason = "ring 0.16.20 via df-share 0.1.1; pre-0.17 ring unmaintained; fix needs df-share to adopt ring 0.17" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 (direct) unmaintained; API folded into rustls-pki-types; migration is a code change, a separate effort" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    { crate = "ring@0.16.20", allow = ["OpenSSL"] },
+]
+
+[licenses.private]
+ignore = true
+
+[[licenses.clarify]]
+crate = "ring@0.16.20"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+skip = [
+    { crate = "hashbrown@0.15.5", reason = "alloy-primitives 0.8.26 pins hashbrown 0.15; indexmap 2.14 uses 0.17; removing needs an alloy bump" },
+    { crate = "password-hash@0.4.2", reason = "scrypt 0.10 uses password-hash 0.4, argon2 0.5 uses 0.5; scrypt 0.11 changes Params::new arity and pulls pbkdf2 0.12, a new dup vs solana-seed-phrase's 0.11" },
+]
+skip-tree = [
+    { crate = "ed25519-dalek@1.0.1", reason = "solana-keypair/solana-signer pull ed25519-dalek 1.0.1's old dalek stack (curve25519-dalek 3.2, sha2 0.9, digest 0.9, block-buffer 0.9, signature 1.6, rand 0.7/rand_core 0.5/rand_chacha 0.2, getrandom 0.1); modern versions used elsewhere; removing needs a solana major bump" },
+    { crate = "ring@0.16.20", reason = "df-share 0.1.1 pulls ring 0.16.20 and untrusted 0.7; rest of the tree on ring 0.17/untrusted 0.9; removing needs a df-share release" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/copiumnicus/err_mac.git"]

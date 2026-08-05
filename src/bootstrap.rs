@@ -78,6 +78,8 @@ const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// Env var: if set, B also enrolls a recovery passphrase from this value so the
 /// restored envelope survives loss of B's Secure Enclave key.
 const PASSPHRASE_ENV: &str = "HOT_CHEESE_BOOTSTRAP_PASSPHRASE";
+/// Touch ID sheet text for B's enclave ECDH that opens the DEK sealed by the authority.
+const ECDH_REASON: &str = "Unlock this machine's hot_cheese enclave key for bootstrap";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -145,7 +147,12 @@ impl EcdhKey {
     /// Zeroized on drop. For the SE variant this requires a live Touch ID.
     fn ecdh(&self, peer_sec1: &[u8]) -> Result<Zeroizing<[u8; 32]>, BootstrapErr> {
         match self {
-            EcdhKey::SecureEnclave(label) => Ok(secure_enclave::se_ecdh(label, peer_sec1)?),
+            EcdhKey::SecureEnclave(label) => Ok(secure_enclave::se_ecdh(
+                label,
+                peer_sec1,
+                None,
+                ECDH_REASON,
+            )?),
             EcdhKey::Software(sk) => {
                 let peer = PublicKey::from_sec1_bytes(peer_sec1)?;
                 let shared = diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
@@ -464,7 +471,11 @@ pub fn bootstrap_serve() -> Result<(), BootstrapErr> {
 
     let unlocker = select_authority_unlocker(&keyring)?;
     // Touch ID on A authorizes the transfer here.
-    let dek = unlocker.unlock("authorize hot_cheese bootstrap to a new machine", &keyring)?;
+    let dek = unlocker.unlock(
+        "authorize hot_cheese bootstrap to a new machine",
+        &keyring,
+        None,
+    )?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

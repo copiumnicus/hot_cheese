@@ -56,6 +56,18 @@ impl SecureEnclaveUnlocker {
     }
 }
 
+/// Classify a Secure Enclave failure: a missing or unloadable key means this KEK source is
+/// gone for good on this machine, which the operator recovers from with `--unlock passphrase`.
+/// Every other SE failure (denied biometric, bad peer point, shim error) keeps its own type.
+fn se_failure(e: secure_enclave::SeErr) -> UnlockErr {
+    match e {
+        secure_enclave::SeErr::KeyNotFound | secure_enclave::SeErr::BadBlob => {
+            UnlockErr::SeKeyUnavailableTryUnlockPassphrase
+        }
+        other => UnlockErr::Se(other),
+    }
+}
+
 /// HKDF-SHA256 the 32-byte ECDH shared secret into a 32-byte wrap key, salted by the
 /// enrollment id. The output is zeroized on drop; the caller must not log it.
 fn derive_kek(shared: &[u8; 32], enrollment_id: &str) -> Result<Zeroizing<[u8; 32]>, UnlockErr> {
@@ -69,13 +81,18 @@ fn derive_kek(shared: &[u8; 32], enrollment_id: &str) -> Result<Zeroizing<[u8; 3
 
 impl Unlocker for SecureEnclaveUnlocker {
     /// Unwrap the DEK via the Secure Enclave. Triggers Touch ID (the per-request gate).
-    fn unlock(&self, reason: &str, keyring: &Keyring) -> Result<Dek, UnlockErr> {
+    fn unlock(
+        &self,
+        reason: &str,
+        keyring: &Keyring,
+        auth: Option<&crate::mac::local_auth::LaContext>,
+    ) -> Result<Dek, UnlockErr> {
         use zeroize::Zeroize;
 
         // Use the first Secure Enclave enrollment whose `se_pub` matches this machine's
         // SE key. Other machines' enrollments (or stale ones after key rotation) are
         // skipped so we never prompt for a key we can't satisfy.
-        let our_pub = secure_enclave::se_public_key(&self.label)?;
+        let our_pub = secure_enclave::se_public_key(&self.label).map_err(se_failure)?;
         for e in &keyring.enrollments {
             let EnrollParams::SecureEnclave { se_pub, eph_pub } = &e.params else {
                 continue;
@@ -84,8 +101,9 @@ impl Unlocker for SecureEnclaveUnlocker {
                 continue;
             }
             tracing::debug!(reason = %reason, enrollment = %e.id, "Secure Enclave unlock");
-            // ECDH(se_priv, eph_pub) inside the enclave — prompts Touch ID.
-            let shared = secure_enclave::se_ecdh(&self.label, eph_pub)?;
+            // ECDH(se_priv, eph_pub) inside the enclave — prompts Touch ID (or reuses `auth`).
+            let shared =
+                secure_enclave::se_ecdh(&self.label, eph_pub, auth, reason).map_err(se_failure)?;
             let kek = derive_kek(&shared, &e.id)?;
             let mut pt = envelope::open(&kek, e.id.as_bytes(), &e.wrapped_dek)?;
             if pt.len() != 32 {

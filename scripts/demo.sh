@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Preview the FULL Secure-Enclave flow with NO $99 Apple Developer Program and NO code
-# signing. It runs the real commands (init / enroll se / generate / address / se-selftest)
-# against a SOFTWARE "enclave" — a P-256 key in a file — gated by a real Touch ID prompt
-# (LAContext works on an unsigned binary). The ONLY thing the real Secure Enclave changes is
-# moving that one key into hardware so it can never be read off disk.
-#
-# This is a DEMO. Do not put real keys in it. It uses a throwaway HOT_CHEESE_HOME so it never
-# touches a real install.
 set -euo pipefail
 
 export HOT_CHEESE_HOME="${HOT_CHEESE_HOME:-/tmp/hot_cheese_demo}"
@@ -43,15 +35,46 @@ echo "==> 5) self-test the (software) enclave path  (Touch ID, twice)"
 "$BIN" se-selftest
 
 echo
+echo "==> 6) write a fail-closed signing policy for DEMO_KEY"
+mkdir -p "$HOT_CHEESE_HOME/store/policies"
+cat > "$HOT_CHEESE_HOME/store/policies/DEMO_KEY.toml" <<'POLICY'
+safe = "0x1111111111111111111111111111111111111111"
+chain_id = 1
+
+[[allow]]
+to = "0x2222222222222222222222222222222222222222"
+selectors = ["0xa9059cbb"]
+max_value = "0"
+operation = "call"
+POLICY
+
+echo
+echo "==> 7) sign a scoped Safe transfer intent"
+echo "    ONE Touch ID prompt: the approval biometric is reused for the key unlock."
+echo "    Only {r,s,v} comes back — never the private key."
+cat > "$HOT_CHEESE_HOME/demo_intent.json" <<'INTENT'
+{
+  "kind": "safe_tx",
+  "key": "DEMO_KEY",
+  "safe": "0x1111111111111111111111111111111111111111",
+  "chain_id": "1",
+  "to": "0x2222222222222222222222222222222222222222",
+  "value": "0",
+  "data": "0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a",
+  "operation": "call",
+  "nonce": "0"
+}
+INTENT
+"$BIN" sign --file "$HOT_CHEESE_HOME/demo_intent.json"
+
+echo
 echo "============================================================================"
 echo "The demo 'enclave' private key is just a file you can read — THIS is exactly"
-echo "what the real Secure Enclave (\$99 + signing) fixes; in hardware it can never"
-echo "leave the chip:"
-echo "  $HOT_CHEESE_HOME/software_enclave.key"
-ls -l "$HOT_CHEESE_HOME/software_enclave.key" || true
+echo "what the real Secure Enclave fixes; in hardware it can never leave the chip:"
+ls -l "$HOT_CHEESE_HOME"/software_enclave_*.key || true
 echo
 echo "Everything else — the envelope, the Touch ID UX, per-request unlock, serve,"
 echo "backups, bootstrap — is IDENTICAL to the production Secure Enclave path."
-echo "To go live: fill __TEAM_ID__ in hotcheese.entitlements, run scripts/sign.sh,"
-echo "then 'hot_cheese se-selftest' (real enclave) and 'hot_cheese enroll se'."
+echo "To go live (no code signing needed): unset HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE,"
+echo "'cargo build --release', then 'hot_cheese se-selftest' and 'hot_cheese enroll se'."
 echo "============================================================================"

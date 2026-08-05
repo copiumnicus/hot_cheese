@@ -8,11 +8,14 @@
 //! (Secure Enclave in production, recovery passphrase as the survivable backstop)
 //! and unwraps the DEK for that single operation.
 use crate::config::{cert_paths, config_path, home_dir, Config};
-use crate::crypto::envelope::{encrypt_file, Dek};
+use crate::console::{self, UnlockGate};
+use crate::crypto::envelope::{encrypt_file, write_private_file, Dek};
 use crate::keyring::{EnrollParams, Keyring};
 use crate::mac::secure_enclave;
 use crate::mac::{authorize_with_touch_id, get_password_from_keychain, MacBackend};
-use crate::server::{is_valid_string_name, run_server, BackendImpl, HotApi};
+use crate::server::{
+    is_valid_string_name, run_server, BackendImpl, HotApi, OpContext, Operation, Peer,
+};
 use crate::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
 use crate::{backup, bootstrap, migrate};
 use clap::{Parser, Subcommand};
@@ -25,15 +28,17 @@ use zeroize::{Zeroize, Zeroizing};
 /// under this label, so the SE unlocker always knows where to look.
 const SE_LABEL: &str = crate::mac::secure_enclave::SE_KEY_LABEL;
 
-// Defaults baked into a fresh `config.json` on `init`.
+// Defaults baked into a fresh `config.toml` on `init`.
 const DEFAULT_SERVICE: &str = "com.cc.hot_cheese";
 const DEFAULT_ACCOUNT: &str = "hot_cheese_master";
-const DEFAULT_STORE: &str = "~/.config/hot_cheese/store";
 
 // Variants in source order: PassphraseMismatch (prompt confirmation differed),
 // AlreadyInitialized (`init` without `--force`), CertKeyPairRequired (one of
 // --import-cert/--import-key supplied), NoBackupRemote (pull/push with none set),
-// then `#[from]` wrappers for each module error this CLI touches.
+// ServeRefusesPassphraseUnlock (`serve --unlock passphrase` would cache the passphrase for
+// the daemon's lifetime and drop the per-request biometric), then `#[from]` wrappers for
+// each module error this CLI touches, then ExistingStore (`init` found key material) and
+// NotInitialized (no config.toml, so there is nothing for the console to open).
 create_err_with_impls!(
     #[derive(Debug)]
     pub CliErr,
@@ -41,6 +46,7 @@ create_err_with_impls!(
     AlreadyInitialized,
     CertKeyPairRequired,
     NoBackupRemote,
+    ServeRefusesPassphraseUnlock,
     TouchIdDenied,
     Config(crate::config::ConfigErr),
     Keyring(crate::keyring::KeyringErr),
@@ -52,9 +58,14 @@ create_err_with_impls!(
     Bootstrap(crate::bootstrap::BootstrapErr),
     GetPassword(crate::mac::GetPasswordErr),
     Se(crate::mac::secure_enclave::SeErr),
+    Sign(crate::sign::SignErr),
+    Serve(crate::server::ServeErr),
+    Console(crate::console::ConsoleErr),
     Rcgen(rcgen::Error),
     StdIo(std::io::Error)
     ;
+    ExistingStore { store: PathBuf, keyring: bool, keystores: usize },
+    NotInitialized { config: PathBuf }
 );
 
 #[derive(Parser, Debug)]
@@ -64,8 +75,12 @@ create_err_with_impls!(
     version
 )]
 struct Cli {
+    /// Omit every subcommand to open the interactive console.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+    /// Which enrolled KEK unwraps the DEK; defaults to the Secure Enclave when one is enrolled.
+    #[arg(long, global = true, value_name = "METHOD")]
+    unlock: Option<UnlockMethod>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -107,6 +122,12 @@ enum Commands {
         /// Keystore name.
         name: String,
     },
+    /// Sign a Safe transaction from a JSON intent (policy-checked, single Touch ID).
+    Sign {
+        /// Read the JSON intent from this file instead of stdin.
+        #[arg(long, value_name = "JSON")]
+        file: Option<PathBuf>,
+    },
     /// List stored keystores and keyring enrollments.
     List,
     /// Run the HTTPS daemon (auto-pulls the store from the first backup remote if absent).
@@ -131,7 +152,7 @@ enum Commands {
     /// Authority side of the SSH bootstrap (invoked remotely over SSH).
     #[command(hide = true)]
     BootstrapServe,
-    /// Validate the Secure Enclave path on a code-signed binary (prompts Touch ID).
+    /// Validate the Secure Enclave path on real SE hardware (prompts Touch ID).
     #[command(hide = true)]
     SeSelftest,
 }
@@ -176,14 +197,16 @@ enum Chain {
     Solana,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum UnlockMethod {
+    /// This machine's Secure Enclave key (Touch ID per request).
+    Se,
+    /// A recovery passphrase — the escape hatch when the Secure Enclave key is gone.
+    Passphrase,
+}
+
 /// Parse args and dispatch; returns a process exit code.
 pub fn run() -> ExitCode {
-    // Default to INFO; let RUST_LOG override the max level (the `env-filter`
-    // subscriber feature isn't enabled, so map the level by hand).
-    tracing_subscriber::fmt()
-        .with_max_level(env_log_level())
-        .init();
-
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
@@ -198,40 +221,76 @@ pub fn run() -> ExitCode {
         }
     };
 
-    match dispatch(cli.command) {
+    // The console redirects tracing into its own ring buffer + log file, so the stdout
+    // subscriber must never be installed underneath it.
+    let result = match cli.command {
+        Some(command) => {
+            init_stdout_tracing();
+            dispatch(command, cli.unlock)
+        }
+        None => cmd_console(cli.unlock),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            init_stdout_tracing();
             tracing::error!(error = %e, "command failed");
             ExitCode::FAILURE
         }
     }
 }
 
-fn dispatch(command: Commands) -> Result<(), CliErr> {
+/// Log to stdout unless a subscriber (the console's) already owns the global default.
+fn init_stdout_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(env_log_level())
+        .try_init();
+}
+
+fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     match command {
         Commands::Init {
             import_cert,
             import_key,
             force,
         } => cmd_init(import_cert, import_key, force),
-        Commands::Enroll(cmd) => cmd_enroll(cmd),
-        Commands::Add { name, kind } => cmd_add(&name, kind),
-        Commands::Generate { chain, name } => cmd_generate(chain, &name),
-        Commands::Address { chain, name } => cmd_address(chain, &name),
+        Commands::Enroll(cmd) => cmd_enroll(cmd, unlock),
+        Commands::Add { name, kind } => cmd_add(&name, kind, unlock),
+        Commands::Generate { chain, name } => cmd_generate(chain, &name, unlock),
+        Commands::Address { chain, name } => cmd_address(chain, &name, unlock),
+        Commands::Sign { file } => cmd_sign(file, unlock),
         Commands::List => cmd_list(),
-        Commands::Serve => cmd_serve(),
+        Commands::Serve => cmd_serve(unlock),
         Commands::Backup(cmd) => cmd_backup(cmd),
         Commands::Migrate {
             old_store,
             new_store,
-        } => cmd_migrate(&old_store, &new_store),
+        } => cmd_migrate(&old_store, &new_store, unlock),
         Commands::BootstrapFrom { target } => Ok(bootstrap::bootstrap_from(&target)?),
         Commands::BootstrapServe => Ok(bootstrap::bootstrap_serve()?),
         Commands::SeSelftest => cmd_se_selftest(),
     }
 }
 
-/// Validate the Secure Enclave path end-to-end on a code-signed binary (prompts Touch ID).
+/// Open the interactive console. A passphrase session may manage keys locally but may never
+/// expose them: without a live per-request biometric there is nothing to gate a release, so
+/// the console starts no listener and refuses every tunnel.
+fn cmd_console(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    if !config_path().exists() {
+        return Err(CliErr::NotInitialized {
+            config: config_path(),
+        });
+    }
+    let (config, keyring) = load_config_and_keyring()?;
+    let gate = match resolve_unlock_method(&keyring, unlock) {
+        UnlockMethod::Se => UnlockGate::Biometric,
+        UnlockMethod::Passphrase => UnlockGate::Passphrase,
+    };
+    let backend = open_backend(&config, unlock)?;
+    Ok(console::run_console(config, Box::new(backend), gate)?)
+}
+
+/// Validate the Secure Enclave path end-to-end on real SE hardware (prompts Touch ID).
 /// Uses a throwaway key label so the real unlock key is never touched.
 fn cmd_se_selftest() -> Result<(), CliErr> {
     const SELFTEST_LABEL: &str = "hotcheese.se.selftest";
@@ -243,18 +302,36 @@ fn cmd_se_selftest() -> Result<(), CliErr> {
     Ok(())
 }
 
-/// Build the right [`Unlocker`] for this keyring: prefer the Secure Enclave key if any
-/// SE enrollment exists, otherwise fall back to a recovery passphrase prompt.
-fn make_unlocker(keyring: &Keyring) -> Result<Box<dyn Unlocker>, CliErr> {
+/// Build the [`Unlocker`] the operator asked for with `--unlock`. Unspecified keeps the
+/// default: the Secure Enclave key when any SE enrollment exists, else a passphrase prompt.
+/// `--unlock passphrase` is the escape hatch when this machine's SE key is lost or
+/// invalidated — the same DEK is still wrapped under the recovery enrollment.
+fn make_unlocker(
+    keyring: &Keyring,
+    method: Option<UnlockMethod>,
+) -> Result<Box<dyn Unlocker>, CliErr> {
+    match resolve_unlock_method(keyring, method) {
+        UnlockMethod::Se => Ok(Box::new(SecureEnclaveUnlocker::new(SE_LABEL))),
+        UnlockMethod::Passphrase => {
+            let pass = prompt_passphrase("Recovery passphrase: ")?;
+            Ok(Box::new(PassphraseUnlocker::new(pass)))
+        }
+    }
+}
+
+/// The KEK an unspecified `--unlock` lands on: the Secure Enclave whenever one is enrolled.
+fn resolve_unlock_method(keyring: &Keyring, method: Option<UnlockMethod>) -> UnlockMethod {
+    if let Some(m) = method {
+        return m;
+    }
     let has_se = keyring
         .enrollments
         .iter()
         .any(|e| matches!(e.params, EnrollParams::SecureEnclave { .. }));
     if has_se {
-        Ok(Box::new(SecureEnclaveUnlocker::new(SE_LABEL)))
+        UnlockMethod::Se
     } else {
-        let pass = prompt_passphrase("Recovery passphrase: ")?;
-        Ok(Box::new(PassphraseUnlocker::new(pass)))
+        UnlockMethod::Passphrase
     }
 }
 
@@ -273,7 +350,7 @@ fn prompt_new_passphrase() -> Result<String, CliErr> {
     Ok(first)
 }
 
-/// Load `config.json`, then load `<store>/keyring.json`.
+/// Load `config.toml`, then load `<store>/keyring.json`.
 fn load_config_and_keyring() -> Result<(Config, Keyring), CliErr> {
     let config = Config::load()?;
     let keyring = Keyring::load(&keyring_file(&config))?;
@@ -285,42 +362,75 @@ fn keyring_file(config: &Config) -> PathBuf {
     config.store_path().join("keyring.json")
 }
 
+/// Load the keyring, choose the unlocker, and open the Mac backend for `config`.
+fn open_backend(config: &Config, method: Option<UnlockMethod>) -> Result<MacBackend, CliErr> {
+    let keyring = Keyring::load(&keyring_file(config))?;
+    let unlocker = make_unlocker(&keyring, method)?;
+    Ok(MacBackend::new(&config.store, unlocker)?)
+}
+
 fn cmd_init(
     import_cert: Option<PathBuf>,
     import_key: Option<PathBuf>,
     force: bool,
 ) -> Result<(), CliErr> {
-    if config_path().exists() && !force {
-        return Err(CliErr::AlreadyInitialized);
+    // Home dir holds config.toml + the TLS cert/key; the store lives under it so
+    // $HOT_CHEESE_HOME fully isolates an install (the demo's /tmp home stays self-contained).
+    let home = home_dir();
+    let store = home.join("store");
+
+    // A fresh DEK orphans every keystore already wrapped under the old one, so refuse when
+    // ANY prior install is visible — config.toml, a keyring, or keystore files.
+    if !force {
+        if config_path().exists() {
+            return Err(CliErr::AlreadyInitialized);
+        }
+        let keyring = store.join("keyring.json").exists();
+        let mut keystores = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&store) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_file())
+                    && entry.file_name().to_str().is_some_and(is_valid_string_name)
+                {
+                    keystores += 1;
+                }
+            }
+        }
+        if keyring || keystores > 0 {
+            return Err(CliErr::ExistingStore {
+                store,
+                keyring,
+                keystores,
+            });
+        }
     }
 
-    // Home dir holds config.json + the TLS cert/key.
-    let home = home_dir();
     std::fs::create_dir_all(&home)?;
-
-    // Materialize the default config so we know where the store lives.
     let config = Config {
         service: DEFAULT_SERVICE.to_string(),
         account: DEFAULT_ACCOUNT.to_string(),
-        store: DEFAULT_STORE.to_string(),
+        store: store.to_string_lossy().into_owned(),
         port: None,
         backup_remotes: Vec::new(),
     };
-    let store = config.store_path();
     std::fs::create_dir_all(&store)?;
 
-    // TLS cert: import the supplied pair, or mint a self-signed localhost cert.
+    // TLS cert: import the supplied pair, or mint a self-signed localhost cert. The cert is
+    // public; the private key is written 0600 on both paths (std::fs::copy would carry the
+    // source's mode over instead).
     let (cert_path, key_path) = cert_paths();
     let cert_der = match (import_cert, import_key) {
         (Some(c), Some(k)) => {
             std::fs::copy(&c, &cert_path)?;
-            std::fs::copy(&k, &key_path)?;
+            let key_pem = Zeroizing::new(std::fs::read(&k)?);
+            write_private_file(&key_path, &key_pem)?;
             der_from_cert_pem(&cert_path)?
         }
         (None, None) => {
             let (cert_pem, key_pem, der) = generate_localhost_cert()?;
+            let key_pem = Zeroizing::new(key_pem);
             std::fs::write(&cert_path, cert_pem)?;
-            std::fs::write(&key_path, key_pem)?;
+            write_private_file(&key_path, key_pem.as_bytes())?;
             der
         }
         // Importing requires both halves.
@@ -346,33 +456,24 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_enroll(cmd: EnrollCmd) -> Result<(), CliErr> {
+fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     let (config, mut keyring) = load_config_and_keyring()?;
     // Obtain the existing DEK via whatever enrollment already works.
-    let unlocker = make_unlocker(&keyring)?;
-    let dek = unlocker.unlock("enroll a new unlock method", &keyring)?;
+    let unlocker = make_unlocker(&keyring, unlock)?;
+    let dek = unlocker.unlock("Enroll a new hot_cheese unlock method", &keyring, None)?;
 
     let enrollment = match cmd {
         EnrollCmd::Se { label } => {
             if let Err(e) = secure_enclave::ensure_se_key(SE_LABEL) {
                 tracing::warn!(
-                    "Secure Enclave is unavailable (this binary may be unsigned). \
-                     SE enrollment needs a code-signed build with SE entitlements. \
-                     Use a recovery passphrase in the meantime."
+                    "Could not create this machine's Secure Enclave key. Confirm the Mac has a \
+                     Secure Enclave with an enrolled fingerprint and that you are in your GUI \
+                     login session with the screen unlocked (Touch ID cannot prompt over \
+                     ssh/sudo). Use a recovery passphrase in the meantime."
                 );
                 return Err(e.into());
             }
-            match SecureEnclaveUnlocker::new(SE_LABEL).enroll(&label, &dek) {
-                Ok(e) => e,
-                Err(crate::unlock::UnlockErr::Unsupported) => {
-                    tracing::warn!(
-                        "Secure Enclave enrollment is unsupported on this binary \
-                         (unsigned build). Re-run on a code-signed binary, or enroll a passphrase."
-                    );
-                    return Err(crate::unlock::UnlockErr::Unsupported.into());
-                }
-                Err(e) => return Err(e.into()),
-            }
+            SecureEnclaveUnlocker::new(SE_LABEL).enroll(&label, &dek)?
         }
         EnrollCmd::Passphrase { label } => {
             let pass = prompt_new_passphrase()?;
@@ -387,7 +488,7 @@ fn cmd_enroll(cmd: EnrollCmd) -> Result<(), CliErr> {
     Ok(())
 }
 
-fn cmd_add(name: &str, kind: SecretKind) -> Result<(), CliErr> {
+fn cmd_add(name: &str, kind: SecretKind, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     let config = Config::load()?;
     if !is_valid_string_name(name) {
         tracing::error!(%name, "invalid key name: only a-z, A-Z, 0-9, _ are allowed");
@@ -402,10 +503,8 @@ fn cmd_add(name: &str, kind: SecretKind) -> Result<(), CliErr> {
     // Read + decode the secret, then zeroize the decoded bytes after encryption.
     let mut secret = read_secret(kind)?;
 
-    let keyring = Keyring::load(&keyring_file(&config))?;
-    let unlocker = make_unlocker(&keyring)?;
-    let backend = MacBackend::new(&config.store, unlocker)?;
-    let dek = backend.unlock_dek("import key")?;
+    let backend = open_backend(&config, unlock)?;
+    let dek = backend.unlock_dek(&format!("Unlock \"{}\" for import key", name), None)?;
     let result = encrypt_file(&backend.store_path(), name, &dek, &secret);
     secret.zeroize();
     result?;
@@ -415,30 +514,51 @@ fn cmd_add(name: &str, kind: SecretKind) -> Result<(), CliErr> {
     Ok(())
 }
 
-fn cmd_generate(chain: Chain, name: &str) -> Result<(), CliErr> {
-    let (config, keyring) = load_config_and_keyring()?;
-    let unlocker = make_unlocker(&keyring)?;
-    let backend = MacBackend::new(&config.store, unlocker)?;
-    let api = HotApi::new(Box::new(backend));
+fn cmd_generate(chain: Chain, name: &str, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    let config = Config::load()?;
+    let api = HotApi::new(Box::new(open_backend(&config, unlock)?));
     match chain {
-        Chain::Evm => api.generate(name)?,
-        Chain::Solana => api.generate_solana(name)?,
+        Chain::Evm => api.generate(&cli_context(name, Operation::EvmGenerate))?,
+        Chain::Solana => api.generate_solana(&cli_context(name, Operation::SolanaGenerate))?,
     }
     tracing::info!(%name, ?chain, "generated key");
     best_effort_backup_push(&config);
     Ok(())
 }
 
-fn cmd_address(chain: Chain, name: &str) -> Result<(), CliErr> {
-    let (config, keyring) = load_config_and_keyring()?;
-    let unlocker = make_unlocker(&keyring)?;
-    let backend = MacBackend::new(&config.store, unlocker)?;
-    let api = HotApi::new(Box::new(backend));
+fn cmd_address(chain: Chain, name: &str, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    let config = Config::load()?;
+    let api = HotApi::new(Box::new(open_backend(&config, unlock)?));
     let addr = match chain {
-        Chain::Evm => api.address(name)?,
-        Chain::Solana => api.address_solana(name)?,
+        Chain::Evm => api.address(&cli_context(name, Operation::EvmAddress))?,
+        Chain::Solana => api.address_solana(&cli_context(name, Operation::SolanaAddress))?,
     };
     tracing::info!(%name, %addr, "address");
+    Ok(())
+}
+
+/// Read a JSON SafeTx intent (from `--file` or stdin), then run the policy-checked,
+/// single-Touch-ID sign flow and print the JSON response.
+fn cmd_sign(file: Option<PathBuf>, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    let config = Config::load()?;
+    let body = match file {
+        Some(path) => std::fs::read(&path)?,
+        None => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf)?;
+            buf
+        }
+    };
+    let crate::sign::intent::Intent::SafeTx(intent) =
+        serde_json::from_slice(&body).map_err(crate::sign::SignErr::from)?;
+    let api = HotApi::new(Box::new(open_backend(&config, unlock)?));
+    let out = api.sign_intent(
+        &cli_context(&intent.key, Operation::Sign),
+        &body,
+        &crate::sign::approval::ServeApprover,
+    )?;
+    println!("{}", String::from_utf8_lossy(&out));
     Ok(())
 }
 
@@ -479,7 +599,14 @@ fn cmd_list() -> Result<(), CliErr> {
     Ok(())
 }
 
-fn cmd_serve() -> Result<(), CliErr> {
+fn cmd_serve(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    // The daemon holds its unlocker for the whole process lifetime, so a passphrase unlocker
+    // would answer every later request from one startup prompt — no per-request human. The
+    // biometric gate is the point of the daemon; recover an SE key with the management
+    // commands (`--unlock passphrase enroll se`) instead of downgrading `serve`.
+    if unlock == Some(UnlockMethod::Passphrase) {
+        return Err(CliErr::ServeRefusesPassphraseUnlock);
+    }
     let config = Config::load()?;
 
     // Bootstrap-from-backup: if the store is empty and a remote is configured, pull first.
@@ -490,15 +617,8 @@ fn cmd_serve() -> Result<(), CliErr> {
         }
     }
 
-    let keyring = Keyring::load(&keyring_file(&config))?;
-    let unlocker = make_unlocker(&keyring)?;
-    let backend = MacBackend::new(&config.store, unlocker)?;
-    if let Err(e) = run_server(Box::new(backend), config) {
-        // run_server returns a boxed dyn Error; surface it without losing the message.
-        tracing::error!(error = %e, "server exited with error");
-        return Err(CliErr::StdIo(std::io::Error::other(e.to_string())));
-    }
-    Ok(())
+    let backend = open_backend(&config, unlock)?;
+    Ok(run_server(Box::new(backend), config)?)
 }
 
 fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
@@ -520,11 +640,15 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
     Ok(())
 }
 
-fn cmd_migrate(old_store: &Path, new_store: &Path) -> Result<(), CliErr> {
+fn cmd_migrate(
+    old_store: &Path,
+    new_store: &Path,
+    unlock: Option<UnlockMethod>,
+) -> Result<(), CliErr> {
     let (config, keyring) = load_config_and_keyring()?;
 
     // The legacy master lives in the login Keychain behind Touch ID.
-    if !authorize_with_touch_id("migrate keys") {
+    if !authorize_with_touch_id("read the legacy hot_cheese Keychain master for migrate") {
         tracing::error!("Touch ID authorization was denied; migration aborted");
         return Err(CliErr::TouchIdDenied);
     }
@@ -535,8 +659,8 @@ fn cmd_migrate(old_store: &Path, new_store: &Path) -> Result<(), CliErr> {
     )?);
 
     // Unlock the new DEK that the migrated keys will be re-encrypted under.
-    let unlocker = make_unlocker(&keyring)?;
-    let dek = unlocker.unlock("migrate keys", &keyring)?;
+    let unlocker = make_unlocker(&keyring, unlock)?;
+    let dek = unlocker.unlock("Unlock the hot_cheese DEK for migrate", &keyring, None)?;
 
     let migrated = migrate::run(old_store, &old_master, new_store, &dek)?;
 
@@ -546,6 +670,15 @@ fn cmd_migrate(old_store: &Path, new_store: &Path) -> Result<(), CliErr> {
     }
     best_effort_backup_push(&config);
     Ok(())
+}
+
+/// Name a locally-invoked operation for the biometric prompt.
+fn cli_context(name: &str, op: Operation) -> OpContext {
+    OpContext {
+        key: name.to_string(),
+        op,
+        peer: Peer::Cli,
+    }
 }
 
 /// Push to backups if any remote is configured, logging but not failing on error.
@@ -658,7 +791,7 @@ fn generate_localhost_cert() -> Result<(String, String, Vec<u8>), CliErr> {
 }
 
 /// Max tracing level from `RUST_LOG` (case-insensitive level word), defaulting to INFO.
-fn env_log_level() -> tracing::Level {
+pub(crate) fn env_log_level() -> tracing::Level {
     match std::env::var("RUST_LOG").ok().as_deref() {
         Some(v) if v.eq_ignore_ascii_case("trace") => tracing::Level::TRACE,
         Some(v) if v.eq_ignore_ascii_case("debug") => tracing::Level::DEBUG,
@@ -685,7 +818,7 @@ mod tests {
         let cli = Cli::try_parse_from(["hot_cheese", "add", "MY_KEY", "ethereum"])
             .expect("add should parse");
         match cli.command {
-            Commands::Add { name, kind } => {
+            Some(Commands::Add { name, kind }) => {
                 assert_eq!(name, "MY_KEY");
                 assert_eq!(kind, SecretKind::Ethereum);
             }
@@ -698,7 +831,7 @@ mod tests {
         let cli = Cli::try_parse_from(["hot_cheese", "generate", "solana", "trader"])
             .expect("generate should parse");
         match cli.command {
-            Commands::Generate { chain, name } => {
+            Some(Commands::Generate { chain, name }) => {
                 assert_eq!(chain, Chain::Solana);
                 assert_eq!(name, "trader");
             }
@@ -711,7 +844,7 @@ mod tests {
         let cli = Cli::try_parse_from(["hot_cheese", "enroll", "se", "--label", "macbook"])
             .expect("enroll se should parse");
         match cli.command {
-            Commands::Enroll(EnrollCmd::Se { label }) => assert_eq!(label, "macbook"),
+            Some(Commands::Enroll(EnrollCmd::Se { label })) => assert_eq!(label, "macbook"),
             other => panic!("expected Enroll Se, got {:?}", other),
         }
     }
@@ -720,12 +853,44 @@ mod tests {
     fn bootstrap_serve_is_hidden_but_parses() {
         let cli = Cli::try_parse_from(["hot_cheese", "bootstrap-serve"])
             .expect("bootstrap-serve should parse");
-        assert!(matches!(cli.command, Commands::BootstrapServe));
+        assert!(matches!(cli.command, Some(Commands::BootstrapServe)));
     }
 
     #[test]
     fn invalid_chain_is_rejected() {
         assert!(Cli::try_parse_from(["hot_cheese", "generate", "dogecoin", "x"]).is_err());
+    }
+
+    /// The SE-loss escape hatch: `--unlock` is declared once on the root but must reach every
+    /// unlocking subcommand (including the nested `enroll se`), be accepted AFTER the
+    /// subcommand's own arguments, and stay `None` when absent so the default (Secure Enclave
+    /// when enrolled) is untouched.
+    #[test]
+    fn unlock_is_global_and_defaults_to_none() {
+        let cli = Cli::try_parse_from(["hot_cheese", "address", "evm", "DRYRUN_EVM"])
+            .expect("address parses");
+        assert_eq!(cli.unlock, None);
+
+        let cli = Cli::try_parse_from([
+            "hot_cheese",
+            "address",
+            "evm",
+            "DRYRUN_EVM",
+            "--unlock",
+            "passphrase",
+        ])
+        .expect("trailing --unlock parses");
+        assert_eq!(cli.unlock, Some(UnlockMethod::Passphrase));
+
+        let cli = Cli::try_parse_from(["hot_cheese", "--unlock", "se", "sign"])
+            .expect("leading --unlock parses");
+        assert_eq!(cli.unlock, Some(UnlockMethod::Se));
+
+        let cli = Cli::try_parse_from(["hot_cheese", "enroll", "se", "--unlock", "passphrase"])
+            .expect("nested subcommand inherits --unlock");
+        assert_eq!(cli.unlock, Some(UnlockMethod::Passphrase));
+
+        assert!(Cli::try_parse_from(["hot_cheese", "list", "--unlock", "yubikey"]).is_err());
     }
 
     #[test]

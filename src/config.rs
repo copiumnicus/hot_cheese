@@ -34,6 +34,8 @@ create_err_with_impls!(
     pub ConfigErr,
     StdIo(std::io::Error),
     SerdeJson(serde_json::Error),
+    Toml(toml::de::Error),
+    TomlSer(toml::ser::Error),
     Envelope(crate::crypto::envelope::EnvErr)
     ;
 );
@@ -50,7 +52,7 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    home_dir().join("config.json")
+    home_dir().join("config.toml")
 }
 
 /// (cert.pem, key.pem) under the home dir.
@@ -67,16 +69,25 @@ impl Config {
         self.port.unwrap_or(5555)
     }
     pub fn load() -> Result<Self, ConfigErr> {
-        let bytes = std::fs::read(config_path())?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let path = config_path();
+        if !path.exists() {
+            let legacy = home_dir().join("config.json");
+            if legacy.exists() {
+                let cfg: Config = serde_json::from_slice(&std::fs::read(&legacy)?)?;
+                cfg.save()?;
+                std::fs::remove_file(&legacy)?;
+                return Ok(cfg);
+            }
+        }
+        Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
     }
     pub fn save(&self) -> Result<(), ConfigErr> {
-        let json = serde_json::to_vec_pretty(self)?;
+        let text = toml::to_string_pretty(self)?;
         let p = config_path();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        crate::crypto::envelope::atomic_write(&p, &json)?;
+        crate::crypto::envelope::atomic_write(&p, text.as_bytes())?;
         Ok(())
     }
 }

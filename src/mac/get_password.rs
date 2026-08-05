@@ -61,19 +61,14 @@ fn create_cf_string(string: &str) -> Result<*const CFString, GetPasswordErr> {
 fn create_query(service: &str, account: &str) -> Result<*const CFDictionary, GetPasswordErr> {
     unsafe {
         // Use Core Foundation constants for keys
-        let keys = [
-            kSecClass as *const c_void,
-            kSecAttrService as *const c_void,
-            kSecAttrAccount as *const c_void,
-            kSecReturnData as *const c_void,
-        ];
+        let keys = [kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnData];
 
         // Use valid values for the keys
         let values = [
-            kSecClassGenericPassword as *const c_void, // Class: Generic Password
-            create_cf_string(service)? as *const c_void, // Service string
-            create_cf_string(account)? as *const c_void, // Account string
-            kCFBooleanTrue as *const c_void,           // Return data as true
+            kSecClassGenericPassword,
+            create_cf_string(service)? as *const c_void,
+            create_cf_string(account)? as *const c_void,
+            kCFBooleanTrue,
         ];
 
         // Create the query dictionary

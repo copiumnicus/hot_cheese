@@ -10,17 +10,16 @@ use err_mac::create_err_with_impls;
 use k256::ecdsa::SigningKey;
 use rand::{CryptoRng, Rng};
 use scrypt::{scrypt, Params as ScryptParams};
-use std::{
-    array::TryFromSliceError,
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{array::TryFromSliceError, fs::File, io::Read, path::Path};
 use tiny_keccak::{Hasher, Keccak};
 mod bytes_hex;
 pub mod envelope;
 mod keystore;
-pub use keystore::{CipherparamsJson, CryptoJson, EthKeystore, KdfparamsType};
+#[cfg(test)]
+use keystore::{CipherparamsJson, CryptoJson};
+pub use keystore::{EthKeystore, KdfparamsType};
+#[cfg(test)]
+use std::io::Write;
 
 pub fn random_pk<R: Rng + CryptoRng>(rng: &mut R) -> SigningKey {
     SigningKey::random(rng)
@@ -62,14 +61,6 @@ create_err_with_impls!(
     InvalidSlice(TryFromSliceError)
     ;
 );
-
-const DEFAULT_CIPHER: &str = "aes-128-ctr";
-const DEFAULT_KEY_SIZE: usize = 32usize;
-const DEFAULT_IV_SIZE: usize = 16usize;
-const DEFAULT_KDF_PARAMS_DKLEN: u8 = 32u8;
-const DEFAULT_KDF_PARAMS_LOG_N: u8 = 13u8;
-const DEFAULT_KDF_PARAMS_R: u32 = 8u32;
-const DEFAULT_KDF_PARAMS_P: u32 = 1u32;
 
 /// Decrypts an encrypted JSON keystore at the provided `path` using the provided `password`.
 /// Decryption supports the [Scrypt](https://tools.ietf.org/html/rfc7914.html) and
@@ -127,6 +118,7 @@ where
 /// Encrypts the given private key using the [Scrypt](https://tools.ietf.org/html/rfc7914.html)
 /// password-based key derivation function, and stores it in the provided directory. On success, it
 /// returns the `id` (Uuid) generated for this keystore.
+#[cfg(test)]
 pub fn encrypt_key<P, R, B, S>(
     dir: P,
     rng: &mut R,
@@ -140,6 +132,14 @@ where
     B: AsRef<[u8]>,
     S: AsRef<[u8]>,
 {
+    const DEFAULT_CIPHER: &str = "aes-128-ctr";
+    const DEFAULT_KEY_SIZE: usize = 32usize;
+    const DEFAULT_IV_SIZE: usize = 16usize;
+    const DEFAULT_KDF_PARAMS_DKLEN: u8 = 32u8;
+    const DEFAULT_KDF_PARAMS_LOG_N: u8 = 13u8;
+    const DEFAULT_KDF_PARAMS_R: u32 = 8u32;
+    const DEFAULT_KDF_PARAMS_P: u32 = 1u32;
+
     // Generate a random salt.
     let mut salt = vec![0u8; DEFAULT_KEY_SIZE];
     rng.fill_bytes(salt.as_mut_slice());
