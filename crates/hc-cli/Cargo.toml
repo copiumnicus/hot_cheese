@@ -1,0 +1,49 @@
+[package]
+name = "hc-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["console"]
+console = ["dep:hc-console"]
+
+[lib]
+name = "hc_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hot_cheese"
+path = "src/main.rs"
+
+[dependencies]
+hc-console = { workspace = true, optional = true }
+hc-core.workspace = true
+hc-daemon.workspace = true
+hc-sign.workspace = true
+
+alloy-primitives.workspace = true
+bs58.workspace = true
+clap.workspace = true
+df-share.workspace = true
+err_mac.workspace = true
+hashbrown.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+p256.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+solana-keypair.workspace = true
+solana-signer.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hc-core = { workspace = true, features = ["test-util"] }
+k256.workspace = true

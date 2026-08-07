@@ -1524,6 +1524,152 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hc-cli"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "bs58",
+ "clap",
+ "df-share",
+ "err_mac",
+ "hashbrown 0.15.5",
+ "hc-console",
+ "hc-core",
+ "hc-daemon",
+ "hc-sign",
+ "hex",
+ "hkdf",
+ "k256",
+ "p256",
+ "rand 0.8.5",
+ "rcgen",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "solana-keypair",
+ "solana-signer",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "hc-console"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "bs58",
+ "crossterm",
+ "df-share",
+ "err_mac",
+ "hashbrown 0.15.5",
+ "hc-core",
+ "hc-daemon",
+ "hc-sign",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "inquire",
+ "parking_lot",
+ "rand 0.8.5",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "sha2 0.10.8",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "hc-core"
+version = "0.1.1"
+dependencies = [
+ "aes",
+ "argon2",
+ "block",
+ "chacha20poly1305",
+ "ctr",
+ "dispatch",
+ "err_mac",
+ "hex",
+ "hkdf",
+ "k256",
+ "objc",
+ "p256",
+ "rand 0.8.5",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "tiny-keccak",
+ "toml",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "hc-daemon"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "df-share",
+ "err_mac",
+ "hashbrown 0.15.5",
+ "hc-core",
+ "hc-sign",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "k256",
+ "libc",
+ "parking_lot",
+ "qrcode",
+ "rand 0.8.5",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "solana-keypair",
+ "solana-signer",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "ureq",
+ "zeroize",
+]
+
+[[package]]
+name = "hc-sign"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "err_mac",
+ "hc-core",
+ "hex",
+ "k256",
+ "p256",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "toml",
+ "zeroize",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1560,57 +1706,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
-]
-
-[[package]]
-name = "hot_cheese"
-version = "0.1.1"
-dependencies = [
- "aes",
- "alloy-primitives",
- "alloy-sol-types",
- "argon2",
- "block",
- "bs58",
- "chacha20poly1305",
- "clap",
- "crossterm",
- "ctr",
- "df-share",
- "dispatch",
- "err_mac",
- "hashbrown 0.15.5",
- "hex",
- "hkdf",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "inquire",
- "k256",
- "objc",
- "p256",
- "parking_lot",
- "rand 0.8.5",
- "rcgen",
- "rpassword",
- "rustls",
- "rustls-pemfile",
- "rustls-pki-types",
- "scrypt",
- "serde",
- "serde_json",
- "sha2 0.10.8",
- "solana-keypair",
- "solana-signer",
- "tiny-keccak",
- "tokio",
- "tokio-rustls",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "zeroize",
 ]
 
 [[package]]
@@ -2489,6 +2584,12 @@ dependencies = [
  "tempfile",
  "unarray",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

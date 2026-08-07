@@ -1,0 +1,33 @@
+[package]
+name = "hc-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+test-util = []
+
+[dependencies]
+err_mac.workspace = true
+scrypt.workspace = true
+aes.workspace = true
+ctr.workspace = true
+k256.workspace = true
+serde.workspace = true
+tiny-keccak.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+zeroize.workspace = true
+
+objc.workspace = true
+block.workspace = true
+dispatch.workspace = true
+
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+p256.workspace = true
+hex.workspace = true
+tracing.workspace = true

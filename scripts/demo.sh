@@ -23,19 +23,23 @@ echo "==> 2) enroll the 'Secure Enclave'  (DEMO: a software key on disk)"
 "$BIN" enroll se
 
 echo
-echo "==> 3) generate an EVM key"
+echo "==> 3) enroll the grant key  (prompts nothing; signing refuses to run without it)"
+"$BIN" enroll grant
+
+echo
+echo "==> 4) generate an EVM key"
 "$BIN" generate evm DEMO_KEY
 
 echo
-echo "==> 4) read its address  (the Touch ID prompt IS the per-request unlock)"
+echo "==> 5) read its address  (the Touch ID prompt IS the per-request unlock)"
 "$BIN" address evm DEMO_KEY
 
 echo
-echo "==> 5) self-test the (software) enclave path  (Touch ID, twice)"
+echo "==> 6) self-test the (software) enclave path  (Touch ID, three times)"
 "$BIN" se-selftest
 
 echo
-echo "==> 6) write a fail-closed signing policy for DEMO_KEY"
+echo "==> 7) write a fail-closed signing policy for DEMO_KEY"
 mkdir -p "$HOT_CHEESE_HOME/store/policies"
 cat > "$HOT_CHEESE_HOME/store/policies/DEMO_KEY.toml" <<'POLICY'
 safe = "0x1111111111111111111111111111111111111111"
@@ -49,8 +53,8 @@ operation = "call"
 POLICY
 
 echo
-echo "==> 7) sign a scoped Safe transfer intent"
-echo "    ONE Touch ID prompt: the approval biometric is reused for the key unlock."
+echo "==> 8) sign a scoped Safe transfer intent"
+echo "    ONE Touch ID prompt: that approval mints the per-payload grant AND unlocks the key."
 echo "    Only {r,s,v} comes back — never the private key."
 cat > "$HOT_CHEESE_HOME/demo_intent.json" <<'INTENT'
 {
@@ -69,9 +73,9 @@ INTENT
 
 echo
 echo "============================================================================"
-echo "The demo 'enclave' private key is just a file you can read — THIS is exactly"
-echo "what the real Secure Enclave fixes; in hardware it can never leave the chip:"
-ls -l "$HOT_CHEESE_HOME"/software_enclave_*.key || true
+echo "The demo 'enclave' private keys are just files you can read — THIS is exactly"
+echo "what the real Secure Enclave fixes; in hardware they can never leave the chip:"
+ls -l "$HOT_CHEESE_HOME"/software_enclave_*.key "$HOT_CHEESE_HOME"/software_grant_*.key || true
 echo
 echo "Everything else — the envelope, the Touch ID UX, per-request unlock, serve,"
 echo "backups, bootstrap — is IDENTICAL to the production Secure Enclave path."
