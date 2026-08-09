@@ -50,7 +50,7 @@ pub struct Grant {
     /// Intent shapes the adapter may submit.
     pub intent_kinds: Vec<IntentKind>,
     /// Chains it may sign for, decimal or `0x` hex; each must be the policy's chain.
-    #[serde(with = "crate::wire::u256_list")]
+    #[serde(with = "hc_core::wire::u256_list")]
     pub chain_ids: Vec<U256>,
     /// Safes it may sign for; each must be the policy's Safe.
     pub safes: Vec<Address>,

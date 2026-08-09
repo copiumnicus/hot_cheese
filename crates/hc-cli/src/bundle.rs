@@ -1,16 +1,16 @@
 //! `hot_cheese bundle`: argument parsing and rendering, and nothing else.
 //!
 //! The store, the union merge, the tailnet discovery and the rsync transport all live in
-//! [`hc_daemon::bundle`], so the interactive console reaches exactly the same code through
+//! [`hc_bundle`], so the interactive console reaches exactly the same code through
 //! exactly the same functions. What is left here is clap types, log lines, and the one place a
 //! bundle needs a signature: this binary owns the unlock plumbing, so it asks the store what to
 //! sign, signs it through [`crate::sign_intent_locally`], and hands the answer back.
 use crate::{read_input, CliErr, UnlockMethod};
 use alloy_primitives::B256;
 use clap::{ArgGroup, Subcommand};
+use hc_bundle::sync::{self, Report, SyncMode};
+use hc_bundle::{Scope, Watch};
 use hc_core::config::Config;
-use hc_daemon::bundle::sync::{self, Report, SyncMode};
-use hc_daemon::bundle::{self, Scope, Watch};
 use hc_sign::intent::Intent;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -116,13 +116,13 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
     match cmd {
         BundleCmd::New { file } => {
             let Intent::SafeTx(intent) = serde_json::from_slice(&read_input(file.as_deref())?)?;
-            bundle::new(mode, intent)?;
+            hc_bundle::new(mode, intent)?;
             Ok(())
         }
         BundleCmd::Sign { hash, key } => {
-            let intent = bundle::intent_to_sign(mode, hash, &key)?;
+            let intent = hc_bundle::intent_to_sign(mode, hash, &key)?;
             let response = crate::sign_intent_locally(&intent, unlock)?;
-            bundle::collect(mode, hash, response)?;
+            hc_bundle::collect(mode, hash, response)?;
             Ok(())
         }
         BundleCmd::Status { hash } => status(mode, hash),
@@ -131,12 +131,12 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
         BundleCmd::Export { hash } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&bundle::export(mode, hash)?)?
+                serde_json::to_string_pretty(&hc_bundle::export(mode, hash)?)?
             );
             Ok(())
         }
         BundleCmd::Rm { hash } => {
-            bundle::rm(hash)?;
+            hc_bundle::rm(hash)?;
             Ok(())
         }
         BundleCmd::Qr { hash } => qr(hash),
@@ -146,7 +146,7 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
             stdin: _,
         } => {
             let response = serde_json::from_slice(&read_input(file.as_deref())?)?;
-            bundle::collect(mode, hash, response)?;
+            hc_bundle::collect(mode, hash, response)?;
             Ok(())
         }
         BundleCmd::Sync { hash } => {
@@ -193,7 +193,7 @@ fn report(direction: &str, report: &Report) {
 }
 
 fn status(mode: SyncMode, hash: B256) -> Result<(), CliErr> {
-    let s = bundle::status(mode, hash)?;
+    let s = hc_bundle::status(mode, hash)?;
     tracing::info!(
         %hash,
         have = s.bundle.signatures.len(),
@@ -226,7 +226,7 @@ fn status(mode: SyncMode, hash: B256) -> Result<(), CliErr> {
 }
 
 fn list(mode: SyncMode) -> Result<(), CliErr> {
-    let grouped = bundle::list(mode)?;
+    let grouped = hc_bundle::list(mode)?;
     let now = hc_sign::grant::now_ms()?;
     tracing::info!(dir = %hc_core::config::bundles_dir().display(), slots = grouped.len(), "bundles");
     for (slot, bundles) in &grouped {
@@ -257,10 +257,10 @@ fn list(mode: SyncMode) -> Result<(), CliErr> {
 
 fn merge(mode: SyncMode, hash: B256, file: Option<PathBuf>) -> Result<(), CliErr> {
     let incoming = match file {
-        Some(path) => bundle::read_bundle(&path, hash)?,
+        Some(path) => hc_bundle::read_bundle(&path, hash)?,
         None => serde_json::from_slice(&read_input(None)?)?,
     };
-    let merged = bundle::merge(mode, hash, incoming)?;
+    let merged = hc_bundle::merge(mode, hash, incoming)?;
     for signer in &merged.added {
         tracing::info!(%hash, %signer, "merged signature");
     }
@@ -275,7 +275,7 @@ fn merge(mode: SyncMode, hash: B256, file: Option<PathBuf>) -> Result<(), CliErr
 }
 
 fn qr(hash: B256) -> Result<(), CliErr> {
-    let set = bundle::qr_frames(hash)?;
+    let set = hc_bundle::qr_frames(hash)?;
     let of = set.len();
     for (i, frame) in set.iter().enumerate() {
         let rendered = hc_daemon::qr_term::render(frame)?;

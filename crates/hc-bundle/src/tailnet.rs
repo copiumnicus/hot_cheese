@@ -7,7 +7,7 @@
 //!
 //! Being on the tailnet grants NO authority here. Nothing in hot_cheese listens on it; the
 //! only thing a name buys is somewhere for `rsync` to push to, and every byte that comes back
-//! is verified locally by [`super::ingest`].
+//! is verified locally by [`crate::ingest`].
 use err_mac::create_err_with_impls;
 use hashbrown::HashMap;
 use serde::Deserialize;

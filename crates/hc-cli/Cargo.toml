@@ -17,6 +17,7 @@ name = "hot_cheese"
 path = "src/main.rs"
 
 [dependencies]
+hc-bundle.workspace = true
 hc-console = { workspace = true, optional = true }
 hc-core.workspace = true
 hc-daemon.workspace = true

@@ -88,8 +88,8 @@ create_err_with_impls!(
     Backup(hc_daemon::backup::BackupErr),
     Migrate(migrate::MigrateErr),
     Bootstrap(bootstrap::BootstrapErr),
-    Bundle(hc_daemon::bundle::BundleErr),
-    BundleSync(hc_daemon::bundle::sync::SyncErr),
+    Bundle(hc_bundle::BundleErr),
+    BundleSync(hc_bundle::sync::SyncErr),
     Render(hc_daemon::qr_term::RenderErr),
     GetPassword(hc_core::mac::GetPasswordErr),
     Se(hc_core::mac::secure_enclave::SeErr),
@@ -530,9 +530,12 @@ fn cmd_init(
         port: None,
         grant_public_key: None,
         bundle_watch_secs: None,
+        mcp: None,
         backup_remotes: Vec::new(),
         adapters: Vec::new(),
         bundle_peers: Vec::new(),
+        token: Vec::new(),
+        label: Vec::new(),
     };
     std::fs::create_dir_all(&store)?;
 

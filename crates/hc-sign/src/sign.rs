@@ -10,6 +10,7 @@ use crate::intent::SafeTxIntent;
 use crate::policy::{self, LoadedPolicy};
 use crate::{adapter, address_of, SafeSignature, SignErr, SignResponse};
 use alloy_primitives::{Bytes, B256};
+use hc_core::config::Config;
 use hc_core::crypto::envelope::decrypt_file;
 use hc_core::mac::local_auth::LaContext;
 use hc_core::mac::BackendImpl;
@@ -32,10 +33,11 @@ pub fn prepare(
     intent: SafeTxIntent,
     policy: &LoadedPolicy,
     manifest_digest: B256,
+    config: &Config,
 ) -> Result<(ApprovedSafeTx, String), SignErr> {
     policy::evaluate(&intent, &policy.policy)?;
     let digest = adapter::safe_tx_hash(&intent);
-    let summary = adapter::summary(&intent);
+    let summary = adapter::summary(&intent, config);
     Ok((
         ApprovedSafeTx {
             key: intent.key,

@@ -112,6 +112,53 @@ fn hc_sign_links_the_key_core_and_nothing_else_local() {
     assert_eq!(found, expected, "hc-sign's local closure is {found:?}");
 }
 
+/// The bundle engine is what a proposer links, and `hc-daemon` being outside its closure is what
+/// makes `HotApi::sign_intent` unnameable rather than merely unused: Rust hands out no path to a
+/// transitive dependency, so proposing and signing are separated by a compile error.
+#[test]
+fn hc_bundle_links_the_key_core_and_neither_the_daemon_nor_a_runtime() {
+    let found = local("hc-bundle");
+    let expected: BTreeSet<String> = ["hc-bundle", "hc-core", "hc-sign"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(found, expected, "hc-bundle's local closure is {found:?}");
+
+    let found = closure("hc-bundle");
+    for banned in FORBIDDEN {
+        assert!(
+            !found.contains(banned),
+            "hc-bundle must not link {banned}, but it is in hc-bundle's dependency closure"
+        );
+    }
+}
+
+/// The MCP proposal server may reach the bundle engine and the policy code, and nothing else.
+/// `hc-daemon` outside its closure is what makes the signing API unnameable there rather than
+/// merely unused, so "an agent proposes and can never sign" is a compile error. No runtime, no
+/// TLS and no argument parser either: this binary owns a pipe, not a socket and not a terminal.
+///
+/// What this does NOT cover: `hc-sign/test-util`, which gates a forgeable grant, adds no
+/// dependency edge at all — `cargo tree` cannot see it at any feature setting, so the only
+/// enforcement is that no manifest anywhere enables it.
+#[test]
+fn hc_mcp_links_the_bundle_engine_and_neither_the_daemon_nor_a_runtime() {
+    let found = local("hc-mcp");
+    let expected: BTreeSet<String> = ["hc-bundle", "hc-core", "hc-mcp", "hc-sign"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(found, expected, "hc-mcp's local closure is {found:?}");
+
+    let found = closure("hc-mcp");
+    for banned in FORBIDDEN {
+        assert!(
+            !found.contains(banned),
+            "hc-mcp must not link {banned}, but it is in hc-mcp's dependency closure"
+        );
+    }
+}
+
 /// The daemon serves; it does not own the terminal and it is not the command line. A dependency
 /// either way would put inquire/crossterm behind `serve` and make the seam unenforceable.
 #[test]

@@ -23,7 +23,6 @@ pub mod manifest;
 pub mod policy;
 pub mod qr;
 pub mod sign;
-pub mod wire;
 
 use alloy_primitives::{Address, Bytes, B256};
 use err_mac::create_err_with_impls;

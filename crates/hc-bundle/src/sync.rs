@@ -14,10 +14,10 @@
 //! name; it grants no authority, because there is nothing to grant authority TO.
 //!
 //! Every reachable peer is therefore an untrusted writer, and every pull is followed by
-//! [`super::ingest::validate`] before anything reads what arrived.
-use super::ingest::{self, Verdict, MAX_FILE_BYTES};
-use super::tailnet::{self, Node, TailnetErr};
-use super::Scope;
+//! [`crate::ingest::validate`] before anything reads what arrived.
+use crate::ingest::{self, Verdict, MAX_FILE_BYTES};
+use crate::tailnet::{self, Node, TailnetErr};
+use crate::Scope;
 use err_mac::create_err_with_impls;
 use hc_core::config::{bundles_dir, BundlePeer, Config};
 use std::path::Path;

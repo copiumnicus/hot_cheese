@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/hc-core",
     "crates/hc-sign",
+    "crates/hc-bundle",
     "crates/hc-daemon",
     "crates/hc-console",
     "crates/hc-cli",
+    "crates/hc-mcp",
 ]
 
 [workspace.package]
@@ -16,6 +18,7 @@ publish = false
 [workspace.dependencies]
 hc-core = { path = "crates/hc-core" }
 hc-sign = { path = "crates/hc-sign" }
+hc-bundle = { path = "crates/hc-bundle" }
 hc-daemon = { path = "crates/hc-daemon" }
 hc-console = { path = "crates/hc-console" }
 

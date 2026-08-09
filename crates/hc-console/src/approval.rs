@@ -117,7 +117,7 @@ impl Approver for ConsoleApprover {
         if self.gate == UnlockGate::Passphrase || ctx.op != Operation::Sign {
             return Ok(None);
         }
-        let head = summary.lines().next().unwrap_or_default();
+        let head = summary.lines().take(3).collect::<Vec<_>>().join("\n");
         let reason = if head.is_empty() {
             ctx.reason()
         } else {

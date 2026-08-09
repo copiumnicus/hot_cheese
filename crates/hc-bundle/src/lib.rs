@@ -22,6 +22,7 @@ pub mod ingest;
 pub mod sync;
 pub mod tailnet;
 
+use crate::sync::SyncMode;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use err_mac::create_err_with_impls;
 use hashbrown::{HashMap, HashSet};
@@ -34,7 +35,6 @@ use hc_sign::qr::{frames, QrKind};
 use hc_sign::SignResponse;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use sync::SyncMode;
 
 /// The bundle a device writes before it holds any signature.
 pub const SEED_FILE: &str = "unsigned.json";
@@ -81,7 +81,7 @@ pub struct SafeEntry {
     /// The Safe contract.
     pub address: Address,
     /// Chain it is deployed on.
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub chain_id: U256,
     /// Owner signatures `execTransaction` requires.
     pub threshold: u8,
@@ -183,24 +183,24 @@ pub struct Execution {
     /// The Safe to call `execTransaction` on.
     pub safe: Address,
     /// Chain the call belongs to.
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub chain_id: U256,
     pub to: Address,
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub value: U256,
     pub data: Bytes,
     /// `Enum.Operation` as the ABI takes it: 0 CALL, 1 DELEGATECALL.
     pub operation: u8,
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub safe_tx_gas: U256,
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub base_gas: U256,
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub gas_price: U256,
     pub gas_token: Address,
     pub refund_receiver: Address,
     /// The Safe's own nonce, which the digest covers but `execTransaction` does not take.
-    #[serde(with = "hc_sign::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub nonce: U256,
     /// The collected `r‖s‖v`, concatenated ascending by signer.
     pub signatures: Bytes,

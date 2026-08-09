@@ -1524,6 +1524,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hc-bundle"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "err_mac",
+ "hashbrown 0.15.5",
+ "hc-core",
+ "hc-sign",
+ "k256",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "hc-cli"
 version = "0.1.1"
 dependencies = [
@@ -1533,6 +1549,7 @@ dependencies = [
  "df-share",
  "err_mac",
  "hashbrown 0.15.5",
+ "hc-bundle",
  "hc-console",
  "hc-core",
  "hc-daemon",
@@ -1565,6 +1582,7 @@ dependencies = [
  "df-share",
  "err_mac",
  "hashbrown 0.15.5",
+ "hc-bundle",
  "hc-core",
  "hc-daemon",
  "hc-sign",
@@ -1592,6 +1610,7 @@ name = "hc-core"
 version = "0.1.1"
 dependencies = [
  "aes",
+ "alloy-primitives",
  "argon2",
  "block",
  "chacha20poly1305",
@@ -1621,7 +1640,6 @@ dependencies = [
  "alloy-primitives",
  "df-share",
  "err_mac",
- "hashbrown 0.15.5",
  "hc-core",
  "hc-sign",
  "hex",
@@ -1637,17 +1655,31 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
- "serde",
  "serde_json",
  "sha2 0.10.8",
  "solana-keypair",
  "solana-signer",
  "tokio",
  "tokio-rustls",
- "toml",
  "tracing",
  "ureq",
  "zeroize",
+]
+
+[[package]]
+name = "hc-mcp"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "err_mac",
+ "hc-bundle",
+ "hc-core",
+ "hc-sign",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

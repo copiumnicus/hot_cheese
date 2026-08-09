@@ -1,6 +1,6 @@
 //! The Bundles section: several devices collecting owner signatures for one Safe transaction.
 //!
-//! Everything here drives [`hc_daemon::bundle`], which reads, merges, syncs and returns data.
+//! Everything here drives [`hc_bundle`], which reads, merges, syncs and returns data.
 //! The one verb that needs a signature does not sign: it asks the engine what to sign, hands
 //! that to the console's OWN [`hc_daemon::HotApi::sign_intent`] — the same call the Sign screen
 //! makes, with the same approver, the same policy check and the same single biometric — and
@@ -9,6 +9,7 @@ use super::approval::{ConsoleApprover, RawScreen};
 use super::menu::{
     ask, keystore_names, menu_enum, nav, service_pending, MenuChoice, MenuErr, Nav, Step,
 };
+use super::pick::{pick, Filter, Pick};
 use super::Console;
 use alloy_primitives::{Address, B256};
 use crossterm::cursor::{Hide, MoveTo};
@@ -17,22 +18,19 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use hashbrown::HashMap;
+use hc_bundle::sync::{self, Report, SyncMode};
+use hc_bundle::tailnet::{Backend, TailnetErr};
+use hc_bundle::{Arrival, Loaded, Scope, Slot, Watch};
 use hc_core::config::{home_dir, Config};
-use hc_daemon::bundle::sync::{self, Report, SyncMode};
-use hc_daemon::bundle::tailnet::{Backend, TailnetErr};
-use hc_daemon::bundle::{self, Arrival, Loaded, Scope, Slot, Watch};
 use hc_daemon::{OpContext, Operation, Peer};
 use hc_sign::bundle::SafeTxBundle;
 use hc_sign::intent::Intent;
 use hc_sign::SignResponse;
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, Text};
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-/// Rows one page of a list shows before it scrolls.
-const PAGE: usize = 12;
 
 /// Bundles the landing screen puts in the list before it counts the rest.
 const MAX_ROWS: usize = 100;
@@ -57,26 +55,51 @@ const MAX_FILES: usize = 40;
 
 menu_enum!(BundleAction {
     Sign => "Sign with a local key",
+        "Asks the engine what this device has to sign and signs it through the console's own \
+         path: the same policy check, the same approval prompt, the same single biometric.",
     Status => "Status: signatures, missing owners, rivals",
+        "The merged bundle judged against safes.toml as it reads right now: who signed, which \
+         owners are missing, and any rival on the same nonce. Reads only.",
     Qr => "Show the transaction as a QR",
+        "Draws the transaction as QR parts for another device's camera, one part per keypress, \
+         so a frame is never replaced before it is scanned.",
     Export => "Export the execTransaction call",
+        "Prints the execTransaction call with every collected signature packed in owner order, \
+         ready for whoever broadcasts it.",
     Import => "Import a signature from another device",
+        "Takes one device's signature or a whole bundle, from a file or a paste. Every signature \
+         is checked against the digest rebuilt from our own fields.",
     Watch => "Watch this bundle for arriving signatures",
+        "Polls the peers until signatures land, and services queued requests while it waits so \
+         nothing is stranded behind the wait. q leaves it.",
     Remove => "Remove this bundle from this machine",
+        "Retires the bundle here after a confirmation, discarding the signatures it holds. A \
+         peer that still has it pushes it back on the next sync.",
     Back => "Back",
+        "Leave this bundle for the list of them.",
 });
 
 menu_enum!(PeerAction {
     Add => "Enroll a machine from the tailnet",
+        "Picks a machine off the tailnet and enrolls it, so every later bundle write exchanges \
+         with it.",
     Remove => "Stop syncing with a machine",
+        "Drops one machine from the enrolled list. The bundles already on this disk stay.",
     Sync => "Exchange every bundle with the enrolled machines now",
+        "Pulls and pushes every bundle once, now. A machine that does not answer is a line on \
+         the frame, not a failure.",
     Refresh => "Refresh",
+        "Reads the tailnet and the enrolled list again, and draws them.",
     Back => "Back",
+        "Leave this screen for the bundle list.",
 });
 
 menu_enum!(QrStep {
     Next => "Next part",
+        "Draw the next part. The far device rebuilds the digest from the parts and shows its own \
+         summary of it.",
     Done => "Done",
+        "Stop drawing parts and go back to the bundle.",
 });
 
 /// One line of the landing screen: a bundle to open, or one of the section's own verbs.
@@ -106,6 +129,27 @@ impl fmt::Display for Landing {
     }
 }
 
+impl Pick for Landing {
+    fn describe(&self) -> &str {
+        match self {
+            Landing::Open { .. } => "",
+            Landing::New => {
+                "Reads a Safe transaction intent from a JSON file and starts a bundle for it, \
+                 which the enrolled peers pick up on the next sync."
+            }
+            Landing::Watch => {
+                "Polls every bundle until signatures land, servicing queued requests while it \
+                 waits. q leaves it."
+            }
+            Landing::Peers => {
+                "The machines this one exchanges bundles with, and the tailnet they are picked \
+                 from."
+            }
+            Landing::Back => "Leave the bundles for the main menu.",
+        }
+    }
+}
+
 /// One tailnet machine the operator can enroll.
 struct PeerChoice {
     /// What [`sync::peer_add`] is given: the MagicDNS name when the tailnet has one.
@@ -120,6 +164,12 @@ impl fmt::Display for PeerChoice {
     }
 }
 
+impl Pick for PeerChoice {
+    fn describe(&self) -> &str {
+        ""
+    }
+}
+
 /// Where an imported JSON body comes from.
 enum Source {
     File(PathBuf),
@@ -131,6 +181,17 @@ impl fmt::Display for Source {
         match self {
             Source::File(path) => write!(f, "{}", path.display()),
             Source::Paste => f.write_str("Paste the JSON instead"),
+        }
+    }
+}
+
+impl Pick for Source {
+    fn describe(&self) -> &str {
+        match self {
+            Source::File(_) => "",
+            Source::Paste => {
+                "Type or paste the JSON on one line, for a body that is not in a file here."
+            }
         }
     }
 }
@@ -225,7 +286,7 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
     let mut header = vec![sync_note(&sync::pull(Scope::All))];
     let mut options = Vec::new();
     let mut pending = 0usize;
-    match bundle::list(SyncMode::Off) {
+    match hc_bundle::list(SyncMode::Off) {
         Ok(grouped) => {
             for (slot, group) in &grouped {
                 for one in group {
@@ -260,10 +321,7 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
     out.flush()?;
 
     let prompt = format!("Bundles ({pending} pending)");
-    let chosen = ask!(nav(Select::new(&prompt, options)
-        .with_help_message("enter opens a bundle, esc goes back")
-        .with_page_size(PAGE)
-        .prompt()));
+    let chosen = ask!(pick(&prompt, options, Filter::On));
     match chosen {
         Landing::Back => Ok(Step {
             choice: MenuChoice::Back,
@@ -283,10 +341,7 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
 fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result<Step, MenuErr> {
     let title = format!("Bundle {hash}");
     let action = ask!(
-        nav(Select::new(&title, BundleAction::ALL.to_vec())
-            .with_help_message("esc goes back to the list")
-            .without_filtering()
-            .prompt()),
+        pick(&title, BundleAction::ALL.to_vec(), Filter::Off),
         MenuChoice::Bundles
     );
     match action {
@@ -302,7 +357,7 @@ fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
         BundleAction::Qr => qr(hash),
         BundleAction::Export => Ok(Step {
             choice: MenuChoice::Bundles,
-            notice: serde_json::to_string_pretty(&bundle::export(SyncMode::On, hash)?)?,
+            notice: serde_json::to_string_pretty(&hc_bundle::export(SyncMode::On, hash)?)?,
         }),
         BundleAction::Import => import(hash),
         BundleAction::Watch => watch(console, approver, Scope::One(hash)),
@@ -315,13 +370,10 @@ fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
 /// is typed, and the address that comes back is remembered for the list's "you" column.
 fn sign(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result<Step, MenuErr> {
     let key = ask!(
-        nav(Select::new("Sign with", keystore_names(console)?)
-            .with_help_message("type to filter, esc goes back to the bundle")
-            .with_page_size(PAGE)
-            .prompt()),
+        pick("Sign with", keystore_names(console)?, Filter::On),
         MenuChoice::Bundles
     );
-    let intent = bundle::intent_to_sign(SyncMode::On, hash, &key)?;
+    let intent = hc_bundle::intent_to_sign(SyncMode::On, hash, &key)?;
     let body = serde_json::to_vec(&Intent::SafeTx(intent))?;
     let ctx = OpContext {
         key: key.clone(),
@@ -331,7 +383,7 @@ fn sign(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
     let signed = console.api.sign_intent(&ctx, &body, approver)?;
     let response: SignResponse = serde_json::from_slice(&signed)?;
     let signer = response.signer;
-    let after = bundle::collect(SyncMode::On, hash, response)?;
+    let after = hc_bundle::collect(SyncMode::On, hash, response)?;
     let notice = format!(
         "signed as {signer} with \"{key}\": {}/{} collected{}",
         after.signatures.len(),
@@ -347,7 +399,7 @@ fn sign(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
 
 /// The merged view of one bundle, judged against `safes.toml` as it reads right now.
 fn status_view(hash: B256) -> Result<String, MenuErr> {
-    let s = bundle::status(SyncMode::On, hash)?;
+    let s = hc_bundle::status(SyncMode::On, hash)?;
     let intent = &s.bundle.intent;
     let mut lines = vec![
         format!("bundle {}", s.hash),
@@ -409,7 +461,7 @@ fn status_view(hash: B256) -> Result<String, MenuErr> {
 /// The transaction on screen for another device's camera. Each part waits for the operator,
 /// because a frame that is replaced before it is scanned was never shown.
 fn qr(hash: B256) -> Result<Step, MenuErr> {
-    let set = bundle::qr_frames(hash)?;
+    let set = hc_bundle::qr_frames(hash)?;
     let of = set.len();
     for (i, frame) in set.iter().enumerate() {
         let rendered = hc_daemon::qr_term::render(frame)?;
@@ -422,10 +474,7 @@ fn qr(hash: B256) -> Result<Step, MenuErr> {
             false => vec![QrStep::Done],
         };
         let step = ask!(
-            nav(Select::new(&format!("part {}/{of}", i + 1), options)
-                .with_help_message("the far device rebuilds the digest and shows its own summary")
-                .without_filtering()
-                .prompt()),
+            pick(&format!("part {}/{of}", i + 1), options, Filter::Off),
             MenuChoice::Bundles
         );
         if step == QrStep::Done {
@@ -445,7 +494,7 @@ fn import(hash: B256) -> Result<Step, MenuErr> {
     let bytes = ask!(pick_json("Signature or bundle JSON"), MenuChoice::Bundles);
     if let Ok(response) = serde_json::from_slice::<SignResponse>(&bytes) {
         let signer = response.signer;
-        let after = bundle::collect(SyncMode::On, hash, response)?;
+        let after = hc_bundle::collect(SyncMode::On, hash, response)?;
         return Ok(Step {
             choice: MenuChoice::Bundles,
             notice: format!(
@@ -456,7 +505,7 @@ fn import(hash: B256) -> Result<Step, MenuErr> {
         });
     }
     let incoming: SafeTxBundle = serde_json::from_slice(&bytes)?;
-    let merged = bundle::merge(SyncMode::On, hash, incoming)?;
+    let merged = hc_bundle::merge(SyncMode::On, hash, incoming)?;
     let mut added = Vec::new();
     for signer in &merged.added {
         added.push(short(signer.as_slice()));
@@ -479,7 +528,7 @@ fn new_bundle() -> Result<Step, MenuErr> {
         MenuChoice::Bundles
     );
     let Intent::SafeTx(intent) = serde_json::from_slice(&bytes)?;
-    let hash = bundle::new(SyncMode::On, intent)?;
+    let hash = hc_bundle::new(SyncMode::On, intent)?;
     Ok(Step {
         choice: MenuChoice::Bundles,
         notice: format!("created bundle {hash}"),
@@ -501,7 +550,7 @@ fn remove(hash: B256) -> Result<Step, MenuErr> {
             notice: "removal declined".to_string(),
         });
     }
-    let held = bundle::rm(hash)?;
+    let held = hc_bundle::rm(hash)?;
     Ok(Step {
         choice: MenuChoice::Bundles,
         notice: format!(
@@ -546,11 +595,7 @@ fn pick_json(prompt: &str) -> Result<Nav<Vec<u8>>, MenuErr> {
         options.push(Source::File(path));
     }
     options.push(Source::Paste);
-    let chosen = match nav(Select::new(prompt, options)
-        .with_help_message("type to filter, esc goes back")
-        .with_page_size(PAGE)
-        .prompt())?
-    {
+    let chosen = match pick(prompt, options, Filter::On)? {
         Nav::Chose(v) => v,
         Nav::Back => return Ok(Nav::Back),
         Nav::Quit => return Ok(Nav::Quit),
@@ -786,10 +831,7 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
     writeln!(out)?;
     out.flush()?;
 
-    let action = ask!(nav(Select::new("Peers", PeerAction::ALL.to_vec())
-        .with_help_message("esc goes back to the bundles")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Peers", PeerAction::ALL.to_vec(), Filter::Off));
     let notice = match action {
         PeerAction::Back => {
             return Ok(Step {
@@ -835,13 +877,7 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
             if options.is_empty() {
                 return Err(MenuErr::NoDiscoveredPeers);
             }
-            let chosen = ask!(
-                nav(Select::new("Enroll", options)
-                    .with_help_message("type to filter, esc goes back")
-                    .with_page_size(PAGE)
-                    .prompt()),
-                MenuChoice::BundlePeers
-            );
+            let chosen = ask!(pick("Enroll", options, Filter::On), MenuChoice::BundlePeers);
             let peer = sync::peer_add(&chosen.name)?;
             format!(
                 "enrolled {} ({}); every bundle write syncs with it from here",
@@ -858,9 +894,7 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
                 return Err(MenuErr::NoEnrolledPeers);
             }
             let chosen = ask!(
-                nav(Select::new("Stop syncing with", options)
-                    .with_page_size(PAGE)
-                    .prompt()),
+                pick("Stop syncing with", options, Filter::On),
                 MenuChoice::BundlePeers
             );
             format!("dropped {}", sync::peer_rm(&chosen)?.host)

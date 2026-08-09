@@ -14,6 +14,7 @@ pub mod approval;
 pub(crate) mod bundles;
 pub mod exposure;
 pub mod menu;
+pub(crate) mod pick;
 pub mod readtest;
 pub mod status;
 

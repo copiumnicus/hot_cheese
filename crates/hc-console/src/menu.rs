@@ -1,6 +1,9 @@
-//! The arrow-key menu tree: one `inquire::Select` per screen, redrawn rather than streamed.
+//! The arrow-key menu tree: one [`super::pick::pick`] list per screen, redrawn rather than
+//! streamed. The prompts that are not a list — a line of text, a number, a masked secret, a
+//! yes/no — stay on inquire, so [`nav`] and [`MenuErr::Inquire`] stay with them.
 use super::approval::{self, ApprovalErr, ConsoleApprover, Drained};
 use super::exposure::{TunnelId, TunnelSpec};
+use super::pick::{pick, Filter, Pick};
 use super::{bundles, readtest, status, Console, Serving, UnlockGate};
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType};
@@ -14,7 +17,7 @@ use hc_core::{is_valid_string_name, resolve_path};
 use hc_daemon::backup;
 use hc_daemon::{OpContext, Operation, Peer};
 use hc_sign::intent::Intent;
-use inquire::{Confirm, CustomType, InquireError, Password, PasswordDisplayMode, Select, Text};
+use inquire::{Confirm, CustomType, InquireError, Password, PasswordDisplayMode, Text};
 use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -47,8 +50,8 @@ create_err_with_impls!(
     Approval(super::approval::ApprovalErr),
     ReadTest(super::readtest::ReadTestErr),
     ApiBackend(hc_daemon::ApiBackendErr),
-    Bundle(hc_daemon::bundle::BundleErr),
-    BundleSync(hc_daemon::bundle::sync::SyncErr),
+    Bundle(hc_bundle::BundleErr),
+    BundleSync(hc_bundle::sync::SyncErr),
     Render(hc_daemon::qr_term::RenderErr),
     Sign(hc_sign::SignErr),
     Unlock(hc_core::unlock::UnlockErr),
@@ -63,7 +66,8 @@ create_err_with_impls!(
     StdIo(std::io::Error)
     ;
     InvalidKeyName { name: String },
-    KeyExists { name: String }
+    KeyExists { name: String },
+    NotATerminal { source: std::io::Error }
 );
 
 /// Which screen the console is showing.
@@ -117,6 +121,69 @@ impl fmt::Display for MenuChoice {
     }
 }
 
+impl Pick for MenuChoice {
+    fn describe(&self) -> &str {
+        match self {
+            MenuChoice::Keys => {
+                "List, generate, import and address the keystores in the store dir. Only the \
+                 address and import verbs unlock anything."
+            }
+            MenuChoice::Sign => {
+                "Signs one JSON intent file from disk with the key it names: the policy is \
+                 checked, you approve the summary, and a biometric session takes one Touch ID."
+            }
+            MenuChoice::Bundles => {
+                "Collect several owners' signatures for one Safe transaction across machines: \
+                 sign, import, export, watch, and sync over the tailnet."
+            }
+            MenuChoice::BundlePeers => {
+                "The machines this one exchanges bundles with. Enrolling or dropping one \
+                 rewrites the config; no key is touched."
+            }
+            MenuChoice::Exposure => {
+                "Reverse ssh tunnels that publish this session's loopback listener, and the read \
+                 test over the pinned TLS route. Every tunnel dies with the session."
+            }
+            MenuChoice::Backup => {
+                "Rsync the encrypted store to the configured remotes, or pull it back over the \
+                 local copy. Ciphertext only: nothing is decrypted here."
+            }
+            MenuChoice::Enroll => {
+                "Add another way to unwrap the DEK — a Secure Enclave key, or a recovery \
+                 passphrase. It unlocks once, with the method that opened this session."
+            }
+            MenuChoice::Status => {
+                "Where the daemon listens, what is exposed, how many keystores and enrollments \
+                 exist, and the tail of the console log. Prompts for nothing."
+            }
+            MenuChoice::ServeAndApprove => {
+                "Waits on the incoming requests and puts each one in front of you as it lands, \
+                 with its own approval prompt. q or esc stops serving."
+            }
+            MenuChoice::Back => "Leave this screen for the one above it.",
+            MenuChoice::Quit => {
+                "Close every ssh tunnel this session opened, stop the listener, and leave the \
+                 console."
+            }
+        }
+    }
+}
+
+impl Pick for KeyUse {
+    fn describe(&self) -> &str {
+        match self {
+            KeyUse::SignOnly => {
+                "The key signs inside the daemon and no path can export it: /read refuses it \
+                 forever, and the choice can never be loosened."
+            }
+            KeyUse::Shareable => {
+                "The key may be handed to a client over /read, which is the only way it ever \
+                 leaves this machine."
+            }
+        }
+    }
+}
+
 /// Where a choice lands. Back climbs exactly one level, so the one screen that sits under
 /// another — the bundle peers — returns to its parent rather than to the root, and backing out
 /// of the root screen leaves the console.
@@ -138,8 +205,10 @@ pub fn next(state: MenuState, choice: MenuChoice) -> MenuState {
     }
 }
 
+/// One screen's choices: each variant carries the line the list shows and the sentence → opens
+/// under it, so a new variant without a description does not compile.
 macro_rules! menu_enum {
-    ($name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
+    ($name:ident { $($variant:ident => $label:literal, $describe:literal),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum $name {
             $($variant,)+
@@ -154,52 +223,93 @@ macro_rules! menu_enum {
                 })
             }
         }
+        impl $crate::pick::Pick for $name {
+            fn describe(&self) -> &str {
+                match self {
+                    $(Self::$variant => $describe,)+
+                }
+            }
+        }
     };
 }
 pub(crate) use menu_enum;
 
 menu_enum!(KeyAction {
     List => "List keystores and enrollments",
+        "Reads the store dir and the keyring header: every keystore with its use, and every \
+         enrolled unlock method. Decrypts nothing and prompts for nothing.",
     Generate => "Generate a new key",
+        "Mints a key, seals it under the DEK — one unlock of the store — and rsyncs the store to \
+         every backup remote. The use you pick is permanent.",
     Address => "Show a public address",
+        "Decrypts one keystore to derive its public address: an unlock of the store, and a Touch \
+         ID where that is the gate, even though nothing leaves this machine.",
     Add => "Import an existing secret",
+        "Takes a secret at a masked prompt, seals it under the DEK, and rsyncs the store to \
+         every backup remote. The use you pick is permanent.",
     Back => "Back",
+        "Leave this screen for the one above it.",
 });
 
 menu_enum!(ExposureAction {
     Open => "Open a reverse ssh tunnel",
+        "Runs ssh -R to the host you name, so a remote port reaches this session's https \
+         listener. The tunnel dies with the session.",
     List => "List open tunnels",
+        "Prints the tunnels this session opened with their remote and local ports. Touches \
+         nothing.",
     Close => "Close a tunnel",
+        "Kills one tunnel's ssh child, and the remote port stops answering at once.",
     ReadTest => "Read test over the pinned TLS route",
+        "Fetches one key the way a remote client would, over the pinned TLS route, to prove the \
+         whole path works. It approves a request and releases that key.",
     Back => "Back",
+        "Leave this screen for the one above it.",
 });
 
 menu_enum!(BackupAction {
     Push => "Push the store to every remote",
+        "Rsyncs this install's vault to every configured remote, ciphertext as it sits on disk. \
+         A remote that does not answer is a warning, not a failure.",
     Pull => "Pull the store from the first remote",
+        "Rsyncs the first remote's vault over the local store after a confirmation, and refuses \
+         outright if the local store belongs to another vault.",
     Back => "Back",
+        "Leave this screen for the one above it.",
 });
 
 menu_enum!(EnrollAction {
     Se => "Secure Enclave (Touch ID)",
+        "Wraps the DEK under a Secure Enclave key that never leaves this Mac, so Touch ID opens \
+         the store. Unlocks once with the method that opened this session.",
     Passphrase => "Recovery passphrase",
+        "Wraps the DEK under a passphrase you type twice. It is the only way back into the \
+         store if the Secure Enclave key is ever lost.",
     Back => "Back",
+        "Leave this screen for the one above it.",
 });
 
 menu_enum!(StatusAction {
     Refresh => "Refresh",
+        "Re-reads the store, the keyring, the tunnels and the log tail, and draws them again.",
     Back => "Back",
+        "Leave this screen for the one above it.",
 });
 
 menu_enum!(Chain {
     Evm => "EVM",
+        "A secp256k1 key and its 0x address: Ethereum and every chain that copies it.",
     Solana => "Solana",
+        "An ed25519 keypair and its base58 address.",
 });
 
 menu_enum!(SecretKind {
     Ethereum => "Ethereum private key (hex)",
+        "A secp256k1 private key as hex, with or without the 0x.",
     Solana => "Solana keypair (base58)",
+        "A Solana keypair in base58, the form solana-keygen writes.",
     Bytes => "Raw UTF-8 bytes",
+        "What you type, stored as its own bytes: for a secret that is not a chain key.",
 });
 
 /// What a prompt produced: a value, or the two keys that mean navigation.
@@ -297,6 +407,7 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
             Err(MenuErr::Inquire(e @ (InquireError::NotTTY | InquireError::IO(_)))) => {
                 return Err(MenuErr::Inquire(e))
             }
+            Err(e @ MenuErr::NotATerminal { .. }) => return Err(e),
             Err(e) => {
                 notice = format!("error: {e}");
                 if matches!(state, MenuState::Exposure | MenuState::ServeAndApprove) {
@@ -405,10 +516,7 @@ fn root_screen() -> Result<Step, MenuErr> {
         MenuChoice::ServeAndApprove,
         MenuChoice::Quit,
     ];
-    let choice = ask!(nav(Select::new("hot_cheese", options)
-        .with_help_message("arrows move, enter selects, esc quits, ctrl-c quits")
-        .without_filtering()
-        .prompt()));
+    let choice = ask!(pick("hot_cheese", options, Filter::Off));
     Ok(Step {
         choice,
         notice: String::new(),
@@ -416,10 +524,7 @@ fn root_screen() -> Result<Step, MenuErr> {
 }
 
 fn keys_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(nav(Select::new("Keys", KeyAction::ALL.to_vec())
-        .with_help_message("esc goes back")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Keys", KeyAction::ALL.to_vec(), Filter::Off));
     match action {
         KeyAction::Back => Ok(Step {
             choice: MenuChoice::Back,
@@ -436,9 +541,7 @@ fn keys_screen(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn generate(console: &Console) -> Result<Step, MenuErr> {
-    let chain = ask!(nav(Select::new("Chain", Chain::ALL.to_vec())
-        .without_filtering()
-        .prompt()));
+    let chain = ask!(pick("Chain", Chain::ALL.to_vec(), Filter::Off));
     let name = ask!(nav(Text::new("New key name (a-z A-Z 0-9 _)").prompt()));
     let name = name.trim().to_string();
     if name.is_empty() || !is_valid_string_name(&name) {
@@ -447,9 +550,7 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
     if console.config.store_path().join(&name).exists() {
         return Err(MenuErr::KeyExists { name });
     }
-    let key_use = ask!(nav(Select::new(USE_PROMPT, KeyUse::ALL.to_vec())
-        .without_filtering()
-        .prompt()));
+    let key_use = ask!(pick(USE_PROMPT, KeyUse::ALL.to_vec(), Filter::Off));
     let ctx = OpContext {
         key: name.clone(),
         op: match chain {
@@ -470,10 +571,8 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn address(console: &Console) -> Result<Step, MenuErr> {
-    let chain = ask!(nav(Select::new("Chain", Chain::ALL.to_vec())
-        .without_filtering()
-        .prompt()));
-    let name = ask!(nav(Select::new("Key", keystore_names(console)?).prompt()));
+    let chain = ask!(pick("Chain", Chain::ALL.to_vec(), Filter::Off));
+    let name = ask!(pick("Key", keystore_names(console)?, Filter::On));
     let ctx = OpContext {
         key: name.clone(),
         op: match chain {
@@ -502,15 +601,12 @@ fn add(console: &Console) -> Result<Step, MenuErr> {
     if store.join(&name).exists() {
         return Err(MenuErr::KeyExists { name });
     }
-    let kind = ask!(nav(Select::new(
+    let kind = ask!(pick(
         "Secret encoding",
-        SecretKind::ALL.to_vec()
-    )
-    .without_filtering()
-    .prompt()));
-    let key_use = ask!(nav(Select::new(USE_PROMPT, KeyUse::ALL.to_vec())
-        .without_filtering()
-        .prompt()));
+        SecretKind::ALL.to_vec(),
+        Filter::Off
+    ));
+    let key_use = ask!(pick(USE_PROMPT, KeyUse::ALL.to_vec(), Filter::Off));
     let entered = Zeroizing::new(ask!(nav(Password::new("Secret")
         .with_display_mode(PasswordDisplayMode::Masked)
         .without_confirmation()
@@ -559,10 +655,7 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
         Serving::Live { addr, .. } => *addr,
         Serving::Refused => return Err(MenuErr::NotServing),
     };
-    let action = ask!(nav(Select::new("Exposure", ExposureAction::ALL.to_vec())
-        .with_help_message("esc goes back")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Exposure", ExposureAction::ALL.to_vec(), Filter::Off));
     let notice = match action {
         ExposureAction::Back => {
             return Ok(Step {
@@ -606,9 +699,7 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
                     label: tunnel_label(id, &spec),
                 });
             }
-            let chosen = ask!(nav(Select::new("Close tunnel", options)
-                .without_filtering()
-                .prompt()));
+            let chosen = ask!(pick("Close tunnel", options, Filter::Off));
             console.tunnels.close(chosen.id)?;
             format!("closed {}", chosen.label)
         }
@@ -633,6 +724,12 @@ impl fmt::Display for TunnelChoice {
     }
 }
 
+impl Pick for TunnelChoice {
+    fn describe(&self) -> &str {
+        ""
+    }
+}
+
 fn tunnel_label(id: TunnelId, spec: &TunnelSpec) -> String {
     format!(
         "tunnel {} {} remote localhost:{} -> 127.0.0.1:{}",
@@ -649,11 +746,11 @@ fn read_test(
     approver: &ConsoleApprover,
     addr: SocketAddr,
 ) -> Result<Step, MenuErr> {
-    let key = ask!(nav(Select::new(
+    let key = ask!(pick(
         "Key to read-test",
-        keystore_names(console)?
-    )
-    .prompt()));
+        keystore_names(console)?,
+        Filter::On
+    ));
     let handle = readtest::spawn(&console.runtime, addr, key);
     let mut idle = Instant::now();
     loop {
@@ -702,10 +799,7 @@ fn read_test(
 }
 
 fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(nav(Select::new("Backup", BackupAction::ALL.to_vec())
-        .with_help_message("esc goes back")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Backup", BackupAction::ALL.to_vec(), Filter::Off));
     let notice = match action {
         BackupAction::Back => {
             return Ok(Step {
@@ -753,10 +847,7 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(nav(Select::new("Enroll", EnrollAction::ALL.to_vec())
-        .with_help_message("esc goes back")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Enroll", EnrollAction::ALL.to_vec(), Filter::Off));
     let (kind, default_label, unlocker): (&str, &str, Box<dyn Unlocker>) = match action {
         EnrollAction::Back => {
             return Ok(Step {
@@ -807,10 +898,7 @@ fn status_screen(console: &Console) -> Result<Step, MenuErr> {
     let mut out = std::io::stderr();
     writeln!(out, "{}\n", status::view(console))?;
     out.flush()?;
-    let action = ask!(nav(Select::new("Status", StatusAction::ALL.to_vec())
-        .with_help_message("esc goes back")
-        .without_filtering()
-        .prompt()));
+    let action = ask!(pick("Status", StatusAction::ALL.to_vec(), Filter::Off));
     match action {
         StatusAction::Refresh => Ok(Step {
             choice: MenuChoice::Status,

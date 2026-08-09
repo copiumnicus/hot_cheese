@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod keyring;
 pub mod mac;
 pub mod unlock;
+pub mod wire;
 
 use std::path::PathBuf;
 

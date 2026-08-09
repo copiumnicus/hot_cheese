@@ -13,7 +13,7 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub safe: Address,
-    #[serde(with = "crate::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub chain_id: U256,
     #[serde(default)]
     pub allow: Vec<AllowRule>,

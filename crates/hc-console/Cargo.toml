@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+hc-bundle.workspace = true
 hc-core.workspace = true
 hc-daemon.workspace = true
 hc-sign.workspace = true

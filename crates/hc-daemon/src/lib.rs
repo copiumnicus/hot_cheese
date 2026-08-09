@@ -5,7 +5,6 @@
 //! the policy and the digest, and a phone has no terminal to draw on.
 pub mod approval;
 pub mod backup;
-pub mod bundle;
 pub mod qr_term;
 pub mod socket;
 
@@ -774,7 +773,8 @@ impl HotApi {
             .as_deref()
             .ok_or(hc_sign::grant::GrantErr::NoPinnedGrantKey)?;
 
-        let (approved, summary) = hc_sign::sign::prepare(intent, &loaded, manifest_digest)?;
+        let (approved, summary) =
+            hc_sign::sign::prepare(intent, &loaded, manifest_digest, &self.config)?;
         let auth = approver.approve(ctx, &summary)?;
         let response = hc_sign::sign::finish(
             approved,

@@ -37,24 +37,24 @@ pub struct SafeTxIntent {
     pub key: String,
     /// The Safe (EIP-712 verifying contract).
     pub safe: Address,
-    #[serde(with = "crate::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub chain_id: U256,
     pub to: Address,
-    #[serde(default, with = "crate::wire::u256")]
+    #[serde(default, with = "hc_core::wire::u256")]
     pub value: U256,
     #[serde(default)]
     pub data: Bytes,
     pub operation: Operation,
-    #[serde(default, with = "crate::wire::u256")]
+    #[serde(default, with = "hc_core::wire::u256")]
     pub safe_tx_gas: U256,
-    #[serde(default, with = "crate::wire::u256")]
+    #[serde(default, with = "hc_core::wire::u256")]
     pub base_gas: U256,
-    #[serde(default, with = "crate::wire::u256")]
+    #[serde(default, with = "hc_core::wire::u256")]
     pub gas_price: U256,
     #[serde(default)]
     pub gas_token: Address,
     #[serde(default)]
     pub refund_receiver: Address,
-    #[serde(with = "crate::wire::u256")]
+    #[serde(with = "hc_core::wire::u256")]
     pub nonce: U256,
 }

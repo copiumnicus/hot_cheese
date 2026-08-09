@@ -38,6 +38,7 @@ without the DEK ever crossing the wire in plaintext.
 8. [Server Endpoints](#server-endpoints)
 9. [Signing Adapters](#signing-adapters)
 10. [Safe Bundles: several devices, one transaction](#safe-bundles-several-devices-one-transaction)
+10. [MCP: an agent proposes, you sign](#mcp-an-agent-proposes-you-sign)
 10. [Client Integration](#client-integration)
 11. [Backups](#backups)
 12. [SSH Bootstrap](#ssh-bootstrap)
@@ -445,6 +446,9 @@ port = 5555
 grant_public_key = "04…"
 bundle_watch_secs = 15
 
+[mcp]
+max_pending = 16
+
 [[backup_remotes]]
 host = "user@1.2.3.4"
 folder = "hot_cheese_store"
@@ -456,6 +460,18 @@ sha256 = "1d13b720834fa111c19f60f53c7951776aab556937f7a8e29cf6cd86ce48110b"
 
 [[bundle_peers]]
 host = "macbook.tail1a2b.ts.net"
+
+[[token]]
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+chain_id = 1
+symbol = "USDC"
+decimals = 6
+standard = "erc20"
+
+[[label]]
+address = "0x2222222222222222222222222222222222222222"
+chain_id = 1
+name = "Vendor payouts"
 ```
 
 | Field | Meaning |
@@ -468,6 +484,9 @@ host = "macbook.tail1a2b.ts.net"
 | `adapters` | List of `{ id, manifest, sha256 }` trusted signing adapters. `manifest` resolves under the home dir when relative; `sha256` is the pin the file's bytes must hash to *before* they are parsed. `serve` refuses to start on a mismatch, or when a manifest claims more than the key's policy grants. See [Signing Adapters](#signing-adapters). |
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
 | `bundle_watch_secs` | Seconds between polls in `bundle watch` (optional; defaults to `15`). |
+| `mcp.max_pending` | Unsigned bundles the MCP proposal server may leave waiting before it refuses to file another (optional; defaults to `16`). The queue is read by a human, so it is bounded by what a human will read. See [MCP](#mcp-an-agent-proposes-you-sign). |
+| `token` | List of `{ address, chain_id, symbol, decimals, standard }` contracts the approval summary may also render **scaled**: `1.000000 USDC (1000000)` — always both forms, so a wrong `decimals` is bounded by the integer beside it. `address = "0x0…0"` annotates the chain's native `value`. `standard` is `erc20`, `erc721` or `erc1155`; a non-fungible standard must carry `decimals = 0`, because scaling a `tokenId` would render token #42 as `0.000042`. **An unlisted contract is not guessed at** — it renders the raw integer, exactly as it did before the table existed. |
+| `label` | List of `{ address, chain_id, name }` names the approval summary may show **beside** an address: `0x2222… (Vendor payouts)`. The full EIP-55 address is always printed — a name never replaces one, and nothing is ever truncated, because two addresses sharing their leading digits are trivial to grind. `name` is refused at load if it is empty, longer than 32 chars, holds anything but printable ASCII and spaces, holds a parenthesis, or starts with `0x`; a second `token` or `label` for one `(address, chain_id)` is refused too, since it could never fire. |
 
 There is **no compile-time config** anymore — nothing is `include_bytes!`'d into
 the binary, so the store path, port, certs, and remotes can change without a
@@ -971,6 +990,194 @@ only what was not there at the previous poll; naming a hash makes it stop as soo
 bundle's threshold is met. Ctrl-C ends it, and takes any `rsync` it happened to be running down
 with it — nothing is backgrounded, nothing is spawned, nothing is left behind. Omit the hash to
 watch the whole tree until you stop it.
+
+---
+
+## MCP: an agent proposes, you sign
+
+`hot_cheese_mcp` is a second binary: a [Model Context Protocol](https://modelcontextprotocol.io)
+server that lets a local coding agent **draft** Safe transactions into the review queue you
+already have. You tell the agent *"pay that invoice in USDC"*; it reads the Safes, the policies
+and the nonces already in flight, drafts the transfer, and files it as an unsigned bundle. Then
+you look at it — with the decoded summary, the policy ceiling and the biometric all exactly where
+they were before.
+
+**It proposes and it cannot sign, and that is structural rather than a promise.** The crate does
+not depend on `hc-daemon`, so the signing API is not merely unused there, it is *unnameable*:
+Rust hands out no path to a crate that is not a dependency, and reaching for one is a compile
+error rather than a code-review comment. `crates/hc-core/tests/boundary.rs` asserts that against
+the real build graph, so it cannot be quietly re-added.
+
+**And the surface is a transaction *shape*, not a transaction encoder.** Today that shape is
+exactly one thing: an ERC-20 transfer out of a Safe. The agent never hands over calldata, a
+destination, an operation, a native value or a gas-refund field — it hands over a token, a
+recipient and an amount, and the server builds the rest.
+
+### Wiring it up
+
+```bash
+./install.sh                       # installs hot_cheese AND hot_cheese_mcp
+```
+
+`.mcp.json`, in your project or your agent's global config:
+
+```json
+{
+  "mcpServers": {
+    "hot_cheese": {
+      "type": "stdio",
+      "command": "/Users/you/.cargo/bin/hot_cheese_mcp",
+      "args": [],
+      "env": { "HOT_CHEESE_HOME": "/Users/you/.config/hot_cheese" }
+    }
+  }
+}
+```
+
+Transport is **stdio**: no port, no socket, no listener, and no HTTP client anywhere in the
+crate. `HOT_CHEESE_HOME` is the only thing it needs from the environment — it points at the same
+home dir the CLI uses, which is where `config.toml`, `bundles/safes.toml` and the policies live.
+Logs go to **stderr**, because stdout is the protocol.
+
+### What the agent can do
+
+| Tool | Writes? | What it does |
+| --- | --- | --- |
+| `list_safes` | no | Every Safe from `bundles/safes.toml`: address, chain, threshold, owners. |
+| `list_signing_keys` | no | Every key's **policy**: pinned Safe and chain, allowed destinations and selectors, value ceilings, owner-rotation flag, whether refunds are opted in. |
+| `list_bundles` | no | Every proposal waiting, grouped by the `(Safe, chain, nonce)` slot it competes for, rival slots flagged. This is how the agent picks a free nonce. |
+| `bundle_status` | no | One proposal in full, plus the decoded summary the approval prompt will show. |
+| `preview_erc20_transfer` | **no** | The verdict without a write: `safeTxHash`, decoded summary, `allowed` or the exact typed refusal with its offending values, whether the Safe is known, whether the nonce is taken. |
+| `propose_erc20_transfer` | yes | The only verb that writes. Files an **unsigned** bundle and pushes it to the co-signers. |
+
+### The narrow schema
+
+Both transaction tools take the same seven fields and **nothing else** — `deny_unknown_fields`
+on the deserializer, `additionalProperties: false` in the published schema, and every field
+required because none of them has a default. A field that is not one of these seven is a hard
+`-32602`, never a term silently dropped on the way to a policy check:
+
+| Field | Type | What it is |
+| --- | --- | --- |
+| `key` | string | Local keystore name, `[A-Za-z0-9_]+`. Its policy decides what may be signed. |
+| `safe` | address | The Safe the tokens leave. Must be one `list_safes` returns. |
+| `chain_id` | u256 | Decimal integer, or a decimal / `0x`-hex string. |
+| `token` | address | The ERC-20 contract — which is also the address the Safe calls, so it is the destination the policy must allow-list. |
+| `recipient` | address | Who receives the tokens. |
+| `amount` | u256 | **Raw integer in the token's own base units.** |
+| `nonce` | u256 | The Safe's own nonce, from `list_bundles`. |
+
+`amount` is a base-unit integer because hot_cheese has no RPC client and so cannot read a token's
+`decimals()` to scale for you: 1 USDC (6 decimals) is `1000000`, 1 DAI (18 decimals) is
+`1000000000000000000`. The tool description says so, and the approval summary shows you the same
+raw integer.
+
+The server builds the calldata itself, encoding `transfer(address,uint256)` with **the same
+alloy `sol!` declaration `adapter::summary` decodes against** — so what is proposed and what you
+read on the approval prompt cannot disagree. Everything else in the Safe transaction is fixed in
+the server, not supplied by the agent:
+
+```text
+to              = token
+data            = transfer(recipient, amount)
+value           = 0
+operation       = CALL
+safe_tx_gas     = 0        base_gas        = 0        gas_price = 0
+gas_token       = 0x0      refund_receiver = 0x0
+```
+
+So these are not "denied", they are **inexpressible** — there is no field to put them in:
+
+- **Arbitrary calldata.** The agent supplies a recipient and an amount, never bytes.
+- **`delegatecall`.** The operation is always a plain `CALL`.
+- **Any owner or threshold change.** `swapOwner`, `addOwnerWithThreshold`, `removeOwner`,
+  `changeThreshold` are calls against the Safe with calldata the agent cannot write.
+- **Any gas refund.** All five refund fields are zero, so the `execTransaction` drain that runs
+  independently of `to`/`value`/`data` has no reachable input.
+- **Any native-value transfer.** `value` is zero; an ERC-20 transfer moves no ETH.
+
+Policy still runs on top of all of that. This is defence in depth *beneath* the policy check, not
+a replacement for it: if a policy ever has a gap, the agent no longer has a way to describe the
+exotic transaction that would walk through it.
+
+**The library stays general.** `SafeTxIntent`, `hc_bundle::new`, `hc_sign::sign::prepare` and the
+whole CLI and console path are unchanged and still carry any Safe transaction — you can still
+sign a delegatecall by hand. Only the *MCP surface* is narrow.
+
+**Extending it:** a new supported transaction shape gets its **own tool** with its own
+constrained arguments — `propose_erc20_approve`, say, or `propose_safe_owner_swap`. Never widen
+one of these tools, and never add a generic "advanced" escape hatch: an escape hatch puts the
+whole general encoder back and makes every line above untrue.
+
+`propose_erc20_transfer` runs, in this order and **all of it before any write**:
+
+1. **Unknown Safe** → refused. `safes.toml` is the only local statement of what a Safe *is*.
+2. **Rival guard** → if a bundle already occupies that `(Safe, chain, nonce)`, refused, naming
+   the digest that holds it. A Safe executes each nonce exactly once, so this is the agent's
+   most likely mistake and the one that would quietly waste your signature.
+3. **Pending cap** → refused once `bundles/` holds `[mcp] max_pending` directories. The queue is
+   read by a human, so it is bounded by what a human will read.
+4. **Dry run** → the signer's own `prepare`: the same policy check, on the same code path,
+   producing the same typed denial. Its approval token is dropped on the spot; this crate has no
+   way to spend one.
+
+Only if all four pass is the bundle written. **A denied proposal is refused, not stored** — a
+stored denial would be a permanently unsignable row filling the very queue the dry run exists to
+protect. A refusal comes back as a *tool result* with `isError: true`, not a JSON-RPC error, so
+the client feeds it back to the model and the agent corrects itself instead of aborting.
+
+Then you sign it, exactly as you would any other bundle:
+
+```bash
+hot_cheese bundle list                      # the agent's proposal is just another row
+hot_cheese bundle status 0x44ae…87b5        # read the decoded summary
+hot_cheese bundle sign 0x44ae…87b5 --key TRADER
+```
+
+### What the agent cannot do
+
+Not "is not supposed to" — **cannot**, because the code is not linked, the type is not
+constructible, the field does not exist on the tool, or the verb does not exist in the crate:
+
+- **Describe any transaction but an ERC-20 transfer.** No calldata field, no `operation` field,
+  no `value` field, no refund fields, no `to` field. See [the narrow schema](#the-narrow-schema).
+- **Sign anything.** No `sign`, no `collect`, no `merge`. The daemon is not a dependency.
+- **Read or derive a key.** No `/read`, no key export, and deliberately **no key addresses in
+  `list_signing_keys`** — deriving one decrypts a keystore and would prompt *you* for Touch ID,
+  so an agent in a loop could spam a human. Owner addresses come from `list_safes`, a plain TOML
+  read.
+- **Change the rules.** No writes to any policy, to `safes.toml`, or to `config.toml`. No
+  `peer add`/`peer rm`, no `enroll`, no `generate`, no `seal`, no `backup`.
+- **Broadcast.** No `bundle export`: that yields the assembled `execTransaction` blob, and
+  hot_cheese has no RPC client by design.
+- **Retire a bundle**, discover tailnet machines, or render QR frames.
+- **Call the chain.** There is no RPC client, which is why the agent must *supply* the nonce and
+  why `list_bundles` exists.
+
+### Threat model, honestly
+
+A hostile or confused agent — prompt-injected, mistaken, or actively adversarial — gets exactly
+one thing: **a row in your review queue, and that row is an ERC-20 transfer.** That is the entire
+blast radius, and it is not zero:
+
+- It can propose a transfer that is *within policy* but not what you wanted — the wrong
+  recipient, or the right recipient and far too many base units. The policy bounds the token and
+  the selector; it does not know your intent, and it does not cap the amount. **The decoded
+  summary on the approval prompt is the only thing that catches this**, which is why it renders
+  the actual arguments — `transfer(to=0x…, amount=…)` — and flags `⚠ UNLIMITED` and `⚠ HUGE`
+  amounts in the first three lines. Read it, every time, and read the amount as base units.
+- It can fill the queue up to `max_pending`, which is noise, not loss.
+- It can claim a nonce, which the rival guard makes visible rather than silent.
+
+What it cannot reach: the DEK, the keystore, the enclave, the grant key, and the biometric. Every
+signature still costs one Touch ID over a payload *you* read. An agent that proposes a hundred
+transactions still produces zero signatures on its own.
+
+The rival guard reads the local queue **without syncing** (a sync shells out to `rsync` over
+`ssh` with a five-second timeout per peer, and an agent may poll). A rival a co-signer started
+and has not pushed yet is therefore invisible to it: it keeps your queue clean, it is not a
+distributed lock. The write itself *does* push, because a proposal a co-signer cannot see is
+half a proposal.
 
 ---
 

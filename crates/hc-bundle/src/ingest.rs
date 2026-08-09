@@ -3,7 +3,7 @@
 //! rsync is a write primitive: an enrolled peer, or anyone who has taken one, can drop
 //! arbitrary bytes into a bundle directory. None of that can forge a signature — every
 //! signature is checked against a digest we rebuild from the fields ourselves — but a single
-//! unparseable or misfiled file makes [`super::load_dir`] refuse the WHOLE directory, which
+//! unparseable or misfiled file makes [`crate::load_dir`] refuse the WHOLE directory, which
 //! turns a write primitive into a denial of service against a transaction that is otherwise
 //! fine. This module is what removes that: after every pull each file is judged on its own,
 //! and anything that would poison the union is moved to `<home>/bundle-quarantine` before the
@@ -14,7 +14,7 @@
 //! with. A flood is answered by [`Verdict::crowded`] — a count, not a deletion — because the
 //! only thing a hostile peer buys with valid-but-unwanted signatures is disk and noise, and
 //! `owners_ok` already refuses them at `export`.
-use super::{Scope, BUNDLE_SUFFIX, SEED_FILE};
+use crate::{Scope, BUNDLE_SUFFIX, SEED_FILE};
 use alloy_primitives::{Address, B256};
 use err_mac::create_err_with_impls;
 use hc_core::config::{bundle_quarantine_dir, bundles_dir};
@@ -213,7 +213,7 @@ pub fn validate(scope: Scope) -> Result<Verdict, IngestErr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::tests::{bundle, intent, signed};
+    use crate::tests::{bundle, intent, signed};
     use hc_sign::bundle::CollectedSignature;
 
     /// The four ways a peer can hand us bytes that break the union, and the one way they
