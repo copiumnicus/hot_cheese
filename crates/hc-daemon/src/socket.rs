@@ -28,11 +28,11 @@ const CLAIM_LOCK: &str = ".claim.lock";
 create_err_with_impls!(
     #[derive(Debug)]
     pub SocketErr,
-    StdIo(io::Error)
+    StdIo(io::Error),
+    Flock(crate::flock::FlockErr)
     ;
     DaemonAlreadyListening { path: PathBuf },
     ProbeFailed { path: PathBuf, kind: io::ErrorKind },
-    ClaimHeld { path: PathBuf },
     NotInADirectory { path: PathBuf }
 );
 
@@ -90,33 +90,16 @@ pub fn probe(path: &Path) -> Probe {
     }
 }
 
-/// Hold the adapters directory against every other daemon for as long as the returned file is
-/// open. The lock lives on the descriptor and not on the name, so the kernel drops it when this
-/// process leaves — `SIGKILL` included — and a leftover lock file never blocks a later start.
-fn claim(dir: &Path) -> Result<std::fs::File, SocketErr> {
-    let path = dir.join(CLAIM_LOCK);
-    let file = std::fs::File::options()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(SocketErr::ClaimHeld { path }),
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
-    }
-}
-
-/// Claim `path` and bind it. The [`claim`] covers the probe, the unlink and the bind together:
-/// once this returns, any other daemon's probe of the path reaches THIS listener and refuses,
-/// so a live socket can never be unlinked by a second start reading it as stale.
+/// Claim `path` and bind it. The [`crate::flock::Claim`] covers the probe, the unlink and the
+/// bind together: once this returns, any other daemon's probe of the path reaches THIS listener
+/// and refuses, so a live socket can never be unlinked by a second start reading it as stale.
 fn bind_socket(path: &Path) -> Result<UnixListener, SocketErr> {
     let dir = path.parent().ok_or_else(|| SocketErr::NotInADirectory {
         path: path.to_path_buf(),
     })?;
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, Permissions::from_mode(DIR_MODE))?;
-    let _claim = claim(dir)?;
+    let _claim = crate::flock::Claim::take(&dir.join(CLAIM_LOCK))?;
     if decide(path, probe(path))? == Bind::Unlink {
         tracing::warn!(path = %path.display(), "unlinking an adapter socket left by a dead daemon");
         std::fs::remove_file(path)?;
@@ -126,27 +109,58 @@ fn bind_socket(path: &Path) -> Result<UnixListener, SocketErr> {
     Ok(listener)
 }
 
+/// The socket files one session created. Shared with the signal task, which cannot rely on a
+/// `Drop` the process never reaches.
+pub struct SocketPaths {
+    /// Bound socket paths, in bind order.
+    paths: Vec<PathBuf>,
+}
+
+impl SocketPaths {
+    /// Remove every socket file this session created. Idempotent: a path already gone is the
+    /// normal case when both the signal task and the drop run.
+    pub fn unlink(&self) {
+        for path in &self.paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not unlink the adapter socket")
+                }
+            }
+        }
+    }
+}
+
 /// Every adapter socket this daemon bound. Dropping it unlinks them all, and every ending
-/// `serve` can act on — a normal return, an error, SIGINT, SIGTERM, SIGHUP — reaches that drop.
-/// `SIGKILL` cannot be caught by anything, so it is the one ending that strands a socket, and
-/// the stale-socket protocol above is what covers it.
+/// `serve` can act on — a normal return, an error, SIGINT, SIGTERM, SIGHUP — reaches either that
+/// drop or the signal task's own [`SocketPaths::unlink`]. `SIGKILL` cannot be caught by
+/// anything, so it is the one ending that strands a socket, and the stale-socket protocol above
+/// is what covers it.
 pub struct AdapterSockets {
     /// Bound listeners, drained into their accept loops at startup.
     pub bound: Vec<(Arc<LoadedManifest>, UnixListener)>,
-    paths: Vec<PathBuf>,
+    /// The paths behind those listeners, also held by the signal task.
+    pub paths: Arc<SocketPaths>,
 }
 
 impl AdapterSockets {
     /// Bind one socket per adapter. A failure part-way unlinks whatever was already bound,
     /// because the daemon is not starting.
     pub fn bind(adapters: Vec<LoadedManifest>) -> Result<Self, SocketErr> {
-        let mut sockets = AdapterSockets {
-            bound: Vec::with_capacity(adapters.len()),
+        let mut bound = Vec::with_capacity(adapters.len());
+        let mut paths = SocketPaths {
             paths: Vec::with_capacity(adapters.len()),
         };
         for adapter in adapters {
             let path = adapter.socket();
-            let listener = bind_socket(&path)?;
+            let listener = match bind_socket(&path) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    paths.unlink();
+                    return Err(e);
+                }
+            };
             tracing::info!(
                 adapter = %adapter.manifest.id,
                 manifest = %adapter.path.display(),
@@ -154,20 +168,19 @@ impl AdapterSockets {
                 path = %path.display(),
                 "adapter socket listening"
             );
-            sockets.paths.push(path);
-            sockets.bound.push((Arc::new(adapter), listener));
+            paths.paths.push(path);
+            bound.push((Arc::new(adapter), listener));
         }
-        Ok(sockets)
+        Ok(AdapterSockets {
+            bound,
+            paths: Arc::new(paths),
+        })
     }
 }
 
 impl Drop for AdapterSockets {
     fn drop(&mut self) {
-        for path in &self.paths {
-            if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!(path = %path.display(), error = %e, "could not unlink the adapter socket");
-            }
-        }
+        self.paths.unlink();
     }
 }
 

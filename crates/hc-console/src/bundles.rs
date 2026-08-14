@@ -2,35 +2,32 @@
 //!
 //! Everything here drives [`hc_bundle`], which reads, merges, syncs and returns data.
 //! The one verb that needs a signature does not sign: it asks the engine what to sign, hands
-//! that to the console's OWN [`hc_daemon::HotApi::sign_intent`] — the same call the Sign screen
-//! makes, with the same approver, the same policy check and the same single biometric — and
-//! hands the answer back to the engine. There is no second route to a key in this file.
-use super::approval::{ConsoleApprover, RawScreen};
-use super::menu::{
-    ask, keystore_names, menu_enum, nav, service_pending, MenuChoice, MenuErr, Nav, Step,
-};
+//! that to the console's OWN [`hc_daemon::HotApi::sign_typed`], with the same approver, the same
+//! policy check and the same single biometric the loopback route pays, and hands the answer back
+//! to the engine. There is no second route to a key in this file.
+use super::menu::{ask, keystore_names, menu_enum, nav, MenuChoice, MenuErr, Nav, Step};
 use super::pick::{pick, Filter, Pick};
 use super::Console;
 use alloy_primitives::{Address, B256};
-use crossterm::cursor::{Hide, MoveTo};
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::cursor::MoveTo;
 use crossterm::execute;
-use crossterm::style::Print;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType};
 use hashbrown::HashMap;
-use hc_bundle::sync::{self, Report, SyncMode};
+use hc_bundle::sync::{self, SyncMode};
 use hc_bundle::tailnet::{Backend, TailnetErr};
-use hc_bundle::{Arrival, Loaded, Scope, Slot, Watch};
+use hc_bundle::{Loaded, Slot};
 use hc_core::config::{home_dir, Config};
-use hc_daemon::{OpContext, Operation, Peer};
+use hc_daemon::bundle_poll::Poke;
+use hc_daemon::live::Live;
+use hc_daemon::{OpContext, Operation};
 use hc_sign::bundle::SafeTxBundle;
+use hc_sign::grant::now_secs;
 use hc_sign::intent::Intent;
 use hc_sign::SignResponse;
 use inquire::{Confirm, Text};
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 /// Bundles the landing screen puts in the list before it counts the rest.
 const MAX_ROWS: usize = 100;
@@ -43,12 +40,6 @@ const MAX_LINES: usize = 8;
 
 /// Milliseconds in an hour, the unit a bundle's age is read in.
 const HOUR_MS: u64 = 3_600_000;
-
-/// How long the watch screen waits on the keyboard between drains.
-const TICK: Duration = Duration::from_millis(120);
-
-/// Arrivals the watch screen keeps on the frame.
-const MAX_ARRIVALS: usize = 8;
 
 /// Files one directory contributes to a JSON picker.
 const MAX_FILES: usize = 40;
@@ -69,9 +60,6 @@ menu_enum!(BundleAction {
     Import => "Import a signature from another device",
         "Takes one device's signature or a whole bundle, from a file or a paste. Every signature \
          is checked against the digest rebuilt from our own fields.",
-    Watch => "Watch this bundle for arriving signatures",
-        "Polls the peers until signatures land, and services queued requests while it waits so \
-         nothing is stranded behind the wait. q leaves it.",
     Remove => "Remove this bundle from this machine",
         "Retires the bundle here after a confirmation, discarding the signatures it holds. A \
          peer that still has it pushes it back on the next sync.",
@@ -112,7 +100,6 @@ enum Landing {
         label: String,
     },
     New,
-    Watch,
     Peers,
     Back,
 }
@@ -122,7 +109,6 @@ impl fmt::Display for Landing {
         match self {
             Landing::Open { label, .. } => f.write_str(label),
             Landing::New => f.write_str("New bundle from an intent file"),
-            Landing::Watch => f.write_str("Watch every bundle for arriving signatures"),
             Landing::Peers => f.write_str("Peers"),
             Landing::Back => f.write_str("Back"),
         }
@@ -136,10 +122,6 @@ impl Pick for Landing {
             Landing::New => {
                 "Reads a Safe transaction intent from a JSON file and starts a bundle for it, \
                  which the enrolled peers pick up on the next sync."
-            }
-            Landing::Watch => {
-                "Polls every bundle until signatures land, servicing queued requests while it \
-                 waits. q leaves it."
             }
             Landing::Peers => {
                 "The machines this one exchanges bundles with, and the tailnet they are picked \
@@ -212,45 +194,6 @@ fn capped(lines: &mut Vec<String>, rows: Vec<String>) {
     }
 }
 
-/// What one sync run did, as one line for the frame. An unreachable peer is a note and never an
-/// error: the engine carries on past it, and the operator stays where they are.
-fn sync_note(report: &Report) -> String {
-    if report.peers.is_empty() {
-        return String::new();
-    }
-    let failed = report.failed();
-    let mut line = format!(
-        "peers: {} of {} reached",
-        report.peers.len() - failed,
-        report.peers.len()
-    );
-    if failed > 0 {
-        let mut hosts = Vec::new();
-        for peer in &report.peers {
-            if peer.result.is_err() {
-                hosts.push(peer.host.as_str());
-            }
-        }
-        line.push_str(&format!("; no answer from {}", hosts.join(", ")));
-    }
-    if !report.verdict.rejected.is_empty() {
-        line.push_str(&format!(
-            "; quarantined {} file(s) a peer pushed",
-            report.verdict.rejected.len()
-        ));
-    }
-    if !report.verdict.crowded.is_empty() {
-        line.push_str(&format!(
-            "; {} bundle(s) hold more files than the cap",
-            report.verdict.crowded.len()
-        ));
-    }
-    if report.verdict.capped {
-        line.push_str("; too many files to validate in one pass");
-    }
-    line
-}
-
 /// One bundle as the list shows it: what it competes for, how far it has got, which of this
 /// session's own keys are already in it, and — first on the line — whether another transaction
 /// is contesting its nonce.
@@ -280,10 +223,36 @@ fn row(one: &Loaded, slot: &Slot, rival: bool, signers: &HashMap<Address, String
 }
 
 /// The section's landing screen: every pending bundle, then the verbs that are not about one
-/// bundle. The peers are pulled first rather than through `list`, so an unreachable machine is
-/// a line on this frame instead of a silence.
-pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Result<Step, MenuErr> {
-    let mut header = vec![sync_note(&sync::pull(Scope::All))];
+/// bundle. Nothing here syncs: the background poller does that on its own timer, and its last
+/// tick is the first line on the frame.
+pub(crate) fn screen(console: &mut Console) -> Result<Step, MenuErr> {
+    let now = now_secs()?;
+    let enrolled = console.rt.config.bundle_peers.len();
+    let mut header = Vec::new();
+    {
+        let poll = console.rt.bundles.status();
+        let mut reached = 0usize;
+        for peer in &poll.peers {
+            if peer.pull.is_ok() && peer.last_ok_at.is_some() {
+                reached += 1;
+            }
+        }
+        header.push(format!(
+            "{} bundle(s), {} with the threshold met; peers {reached}/{enrolled} reached; \
+             polled {}; {} signature(s) in, {} file(s) quarantined",
+            poll.bundles,
+            poll.ready,
+            match poll.last_finished_at {
+                Some(at) => format!("{}s ago", now.saturating_sub(at)),
+                None => "not yet".to_string(),
+            },
+            poll.arrived,
+            poll.quarantined,
+        ));
+        if let Some(failure) = &poll.failure {
+            header.push(format!("the last bundle poll failed: {failure}"));
+        }
+    }
     let mut options = Vec::new();
     let mut pending = 0usize;
     match hc_bundle::list(SyncMode::Off) {
@@ -304,7 +273,6 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
     }
     let listed = options.len();
     options.push(Landing::New);
-    options.push(Landing::Watch);
     options.push(Landing::Peers);
     options.push(Landing::Back);
 
@@ -321,7 +289,7 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
     out.flush()?;
 
     let prompt = format!("Bundles ({pending} pending)");
-    let chosen = ask!(pick(&prompt, options, Filter::On));
+    let chosen = ask!(pick(&console.rt.live, &prompt, options, Filter::On));
     match chosen {
         Landing::Back => Ok(Step {
             choice: MenuChoice::Back,
@@ -331,17 +299,21 @@ pub(crate) fn screen(console: &mut Console, approver: &ConsoleApprover) -> Resul
             choice: MenuChoice::BundlePeers,
             notice: String::new(),
         }),
-        Landing::New => new_bundle(),
-        Landing::Watch => watch(console, approver, Scope::All),
-        Landing::Open { hash, .. } => open(console, approver, hash),
+        Landing::New => new_bundle(console),
+        Landing::Open { hash, .. } => open(console, hash),
     }
 }
 
 /// What one bundle can be asked to do. Esc here returns to the list, one level up.
-fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result<Step, MenuErr> {
+fn open(console: &mut Console, hash: B256) -> Result<Step, MenuErr> {
     let title = format!("Bundle {hash}");
     let action = ask!(
-        pick(&title, BundleAction::ALL.to_vec(), Filter::Off),
+        pick(
+            &console.rt.live,
+            &title,
+            BundleAction::ALL.to_vec(),
+            Filter::Off
+        ),
         MenuChoice::Bundles
     );
     match action {
@@ -349,18 +321,20 @@ fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
             choice: MenuChoice::Bundles,
             notice: String::new(),
         }),
-        BundleAction::Sign => sign(console, approver, hash),
+        BundleAction::Sign => sign(console, hash),
         BundleAction::Status => Ok(Step {
             choice: MenuChoice::Bundles,
             notice: status_view(hash)?,
         }),
-        BundleAction::Qr => qr(hash),
-        BundleAction::Export => Ok(Step {
-            choice: MenuChoice::Bundles,
-            notice: serde_json::to_string_pretty(&hc_bundle::export(SyncMode::On, hash)?)?,
-        }),
-        BundleAction::Import => import(hash),
-        BundleAction::Watch => watch(console, approver, Scope::One(hash)),
+        BundleAction::Qr => qr(&console.rt.live, hash),
+        BundleAction::Export => {
+            console.rt.bundles.poke(Poke::AwaitTick)?;
+            Ok(Step {
+                choice: MenuChoice::Bundles,
+                notice: serde_json::to_string_pretty(&hc_bundle::export(SyncMode::Off, hash)?)?,
+            })
+        }
+        BundleAction::Import => import(console, hash),
         BundleAction::Remove => remove(hash),
     }
 }
@@ -368,22 +342,25 @@ fn open(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
 /// Ask the engine what this device has to sign, sign it through the console's existing path,
 /// and hand the answer back. The keystore is picked from the store's own names, so no key name
 /// is typed, and the address that comes back is remembered for the list's "you" column.
-fn sign(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result<Step, MenuErr> {
+fn sign(console: &mut Console, hash: B256) -> Result<Step, MenuErr> {
     let key = ask!(
-        pick("Sign with", keystore_names(console)?, Filter::On),
+        pick(
+            &console.rt.live,
+            "Sign with",
+            keystore_names(console)?,
+            Filter::On
+        ),
         MenuChoice::Bundles
     );
-    let intent = hc_bundle::intent_to_sign(SyncMode::On, hash, &key)?;
-    let body = serde_json::to_vec(&Intent::SafeTx(intent))?;
-    let ctx = OpContext {
-        key: key.clone(),
-        op: Operation::Sign,
-        peer: Peer::Cli,
-    };
-    let signed = console.api.sign_intent(&ctx, &body, approver)?;
-    let response: SignResponse = serde_json::from_slice(&signed)?;
+    let intent = hc_bundle::intent_to_sign(SyncMode::Off, hash, &key)?;
+    let ctx = OpContext::local(key.clone(), Operation::Sign);
+    let response = console
+        .rt
+        .api
+        .sign_typed(&ctx, intent, &console.rt.approver)?;
     let signer = response.signer;
-    let after = hc_bundle::collect(SyncMode::On, hash, response)?;
+    let after = hc_bundle::collect(SyncMode::Off, hash, response)?;
+    console.rt.bundles.poke(Poke::Push { hash })?;
     let notice = format!(
         "signed as {signer} with \"{key}\": {}/{} collected{}",
         after.signatures.len(),
@@ -399,7 +376,7 @@ fn sign(console: &mut Console, approver: &ConsoleApprover, hash: B256) -> Result
 
 /// The merged view of one bundle, judged against `safes.toml` as it reads right now.
 fn status_view(hash: B256) -> Result<String, MenuErr> {
-    let s = hc_bundle::status(SyncMode::On, hash)?;
+    let s = hc_bundle::status(SyncMode::Off, hash)?;
     let intent = &s.bundle.intent;
     let mut lines = vec![
         format!("bundle {}", s.hash),
@@ -460,7 +437,7 @@ fn status_view(hash: B256) -> Result<String, MenuErr> {
 
 /// The transaction on screen for another device's camera. Each part waits for the operator,
 /// because a frame that is replaced before it is scanned was never shown.
-fn qr(hash: B256) -> Result<Step, MenuErr> {
+fn qr(live: &Live, hash: B256) -> Result<Step, MenuErr> {
     let set = hc_bundle::qr_frames(hash)?;
     let of = set.len();
     for (i, frame) in set.iter().enumerate() {
@@ -474,7 +451,7 @@ fn qr(hash: B256) -> Result<Step, MenuErr> {
             false => vec![QrStep::Done],
         };
         let step = ask!(
-            pick(&format!("part {}/{of}", i + 1), options, Filter::Off),
+            pick(live, &format!("part {}/{of}", i + 1), options, Filter::Off),
             MenuChoice::Bundles
         );
         if step == QrStep::Done {
@@ -490,11 +467,15 @@ fn qr(hash: B256) -> Result<Step, MenuErr> {
 /// Take in what another device produced: one device's signature, or a whole bundle carrying
 /// several. Both land through the engine, which checks every signature against the digest it
 /// rebuilds from our own fields.
-fn import(hash: B256) -> Result<Step, MenuErr> {
-    let bytes = ask!(pick_json("Signature or bundle JSON"), MenuChoice::Bundles);
+fn import(console: &Console, hash: B256) -> Result<Step, MenuErr> {
+    let bytes = ask!(
+        pick_json(&console.rt.live, "Signature or bundle JSON"),
+        MenuChoice::Bundles
+    );
     if let Ok(response) = serde_json::from_slice::<SignResponse>(&bytes) {
         let signer = response.signer;
-        let after = hc_bundle::collect(SyncMode::On, hash, response)?;
+        let after = hc_bundle::collect(SyncMode::Off, hash, response)?;
+        console.rt.bundles.poke(Poke::Push { hash })?;
         return Ok(Step {
             choice: MenuChoice::Bundles,
             notice: format!(
@@ -505,7 +486,8 @@ fn import(hash: B256) -> Result<Step, MenuErr> {
         });
     }
     let incoming: SafeTxBundle = serde_json::from_slice(&bytes)?;
-    let merged = hc_bundle::merge(SyncMode::On, hash, incoming)?;
+    let merged = hc_bundle::merge(SyncMode::Off, hash, incoming)?;
+    console.rt.bundles.poke(Poke::Push { hash })?;
     let mut added = Vec::new();
     for signer in &merged.added {
         added.push(short(signer.as_slice()));
@@ -522,13 +504,21 @@ fn import(hash: B256) -> Result<Step, MenuErr> {
     })
 }
 
-fn new_bundle() -> Result<Step, MenuErr> {
+fn new_bundle(console: &Console) -> Result<Step, MenuErr> {
     let bytes = ask!(
-        pick_json("Intent JSON for the new bundle"),
+        pick_json(&console.rt.live, "Intent JSON for the new bundle"),
         MenuChoice::Bundles
     );
-    let Intent::SafeTx(intent) = serde_json::from_slice(&bytes)?;
-    let hash = hc_bundle::new(SyncMode::On, intent)?;
+    let intent = match serde_json::from_slice(&bytes)? {
+        Intent::SafeTx(intent) => intent,
+        Intent::TypedData(_) => {
+            return Err(MenuErr::NotBundleable {
+                kind: hc_sign::grant::IntentKind::TypedData,
+            })
+        }
+    };
+    let hash = hc_bundle::new(SyncMode::Off, intent)?;
+    console.rt.bundles.poke(Poke::Push { hash })?;
     Ok(Step {
         choice: MenuChoice::Bundles,
         notice: format!("created bundle {hash}"),
@@ -589,13 +579,13 @@ fn json_files() -> Vec<PathBuf> {
 
 /// A JSON body from a file the operator picks, or from a paste. Both are bytes; nothing here
 /// decides what they mean.
-fn pick_json(prompt: &str) -> Result<Nav<Vec<u8>>, MenuErr> {
+fn pick_json(live: &Live, prompt: &str) -> Result<Nav<Vec<u8>>, MenuErr> {
     let mut options = Vec::new();
     for path in json_files() {
         options.push(Source::File(path));
     }
     options.push(Source::Paste);
-    let chosen = match pick(prompt, options, Filter::On)? {
+    let chosen = match pick(live, prompt, options, Filter::On)? {
         Nav::Chose(v) => v,
         Nav::Back => return Ok(Nav::Back),
         Nav::Quit => return Ok(Nav::Quit),
@@ -610,153 +600,6 @@ fn pick_json(prompt: &str) -> Result<Nav<Vec<u8>>, MenuErr> {
             Nav::Back => Ok(Nav::Back),
             Nav::Quit => Ok(Nav::Quit),
         },
-    }
-}
-
-/// What the watch screen is showing right now.
-struct WatchView {
-    /// Bundles being watched.
-    watching: usize,
-    /// The last pull's peer note.
-    peers: String,
-    /// The most recent arrivals, newest last.
-    arrivals: Vec<String>,
-    /// Signatures that have arrived since this screen opened.
-    seen: usize,
-    /// Requests serviced at a prompt while watching.
-    serviced: usize,
-    /// Whether a pull is in flight right now.
-    syncing: bool,
-}
-
-impl WatchView {
-    fn push(&mut self, arrival: Arrival) {
-        self.seen += 1;
-        if self.arrivals.len() == MAX_ARRIVALS {
-            self.arrivals.remove(0);
-        }
-        self.arrivals.push(format!(
-            "{}  {}  {}/{}{}",
-            short(arrival.hash.as_slice()),
-            arrival.signer,
-            arrival.have,
-            arrival.threshold,
-            if arrival.met { "  MET" } else { "" }
-        ));
-    }
-}
-
-fn draw_watch(view: &WatchView, interval: Duration) -> Result<(), MenuErr> {
-    let mut panel = format!(
-        "hot_cheese - watching for signatures\r\n\r\n  \
-         watching {} bundle(s)   polling every {}s{}\r\n  \
-         {}\r\n  \
-         serviced {} request(s) while watching\r\n\r\n",
-        view.watching,
-        interval.as_secs(),
-        if view.syncing { "   syncing…" } else { "" },
-        match view.peers.is_empty() {
-            true => "no bundle peers enrolled",
-            false => view.peers.as_str(),
-        },
-        view.serviced
-    );
-    if view.arrivals.is_empty() {
-        panel.push_str("  nothing has arrived yet\r\n");
-    }
-    if view.seen > view.arrivals.len() {
-        panel.push_str(&format!(
-            "  {} earlier arrival(s) not shown\r\n",
-            view.seen - view.arrivals.len()
-        ));
-    }
-    for line in &view.arrivals {
-        panel.push_str(&format!("  {line}\r\n"));
-    }
-    panel.push_str("\r\n  [q] back to the bundles   [ctrl-c] quit\r\n");
-    execute!(
-        std::io::stderr(),
-        Hide,
-        MoveTo(0, 0),
-        Clear(ClearType::FromCursorDown),
-        Print(panel)
-    )?;
-    Ok(())
-}
-
-/// The screen the operator sits on while a co-signer signs. It has the serve screen's shape —
-/// raw mode, one redraw in place per pass, `q` between any two of them — and it runs the
-/// approval drain on every pass, so a request that queues while the operator waits is answered
-/// here instead of being stranded behind the wait.
-fn watch(console: &mut Console, approver: &ConsoleApprover, scope: Scope) -> Result<Step, MenuErr> {
-    let interval = Duration::from_secs(console.config.bundle_watch_secs());
-    let mut watch = Watch::start(scope)?;
-    let mut view = WatchView {
-        watching: watch.watching(),
-        peers: String::new(),
-        arrivals: Vec::new(),
-        seen: 0,
-        serviced: 0,
-        syncing: false,
-    };
-    enable_raw_mode()?;
-    let _screen = RawScreen;
-    let mut due = Instant::now();
-    let mut dirty = true;
-    loop {
-        if Instant::now() >= due {
-            view.syncing = true;
-            draw_watch(&view, interval)?;
-            view.peers = sync_note(&sync::pull(scope));
-            for arrival in watch.poll(SyncMode::Off)? {
-                view.push(arrival);
-            }
-            view.watching = watch.watching();
-            view.syncing = false;
-            due = Instant::now() + interval;
-            dirty = true;
-        }
-        let cooked = disable_raw_mode();
-        let drained = service_pending(console, approver);
-        cooked?;
-        enable_raw_mode()?;
-        let drained = drained?;
-        if drained.quit {
-            return Ok(Step {
-                choice: MenuChoice::Quit,
-                notice: String::new(),
-            });
-        }
-        if drained.answered > 0 || drained.refused > 0 {
-            view.serviced += drained.answered + drained.refused;
-            dirty = true;
-        }
-        if dirty {
-            draw_watch(&view, interval)?;
-            dirty = false;
-        }
-        if !crossterm::event::poll(TICK)? {
-            continue;
-        }
-        match crossterm::event::read()? {
-            Event::Key(key) => match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(Step {
-                        choice: MenuChoice::Quit,
-                        notice: String::new(),
-                    })
-                }
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(Step {
-                        choice: MenuChoice::Bundles,
-                        notice: format!("stopped watching after {} arrival(s)", view.seen),
-                    })
-                }
-                _ => {}
-            },
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
-        }
     }
 }
 
@@ -823,7 +666,7 @@ fn tailnet_line(e: &TailnetErr) -> String {
 
 /// The peers screen: who is on the tailnet, who this machine already syncs with, and the three
 /// verbs that change either answer. Esc climbs back to the bundle list.
-pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
+pub(crate) fn peers_screen(console: &Console) -> Result<Step, MenuErr> {
     let mut out = std::io::stderr();
     for line in peer_view() {
         writeln!(out, "{line}")?;
@@ -831,7 +674,12 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
     writeln!(out)?;
     out.flush()?;
 
-    let action = ask!(pick("Peers", PeerAction::ALL.to_vec(), Filter::Off));
+    let action = ask!(pick(
+        &console.rt.live,
+        "Peers",
+        PeerAction::ALL.to_vec(),
+        Filter::Off
+    ));
     let notice = match action {
         PeerAction::Back => {
             return Ok(Step {
@@ -877,7 +725,10 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
             if options.is_empty() {
                 return Err(MenuErr::NoDiscoveredPeers);
             }
-            let chosen = ask!(pick("Enroll", options, Filter::On), MenuChoice::BundlePeers);
+            let chosen = ask!(
+                pick(&console.rt.live, "Enroll", options, Filter::On),
+                MenuChoice::BundlePeers
+            );
             let peer = sync::peer_add(&chosen.name)?;
             format!(
                 "enrolled {} ({}); every bundle write syncs with it from here",
@@ -894,18 +745,32 @@ pub(crate) fn peers_screen() -> Result<Step, MenuErr> {
                 return Err(MenuErr::NoEnrolledPeers);
             }
             let chosen = ask!(
-                pick("Stop syncing with", options, Filter::On),
+                pick(&console.rt.live, "Stop syncing with", options, Filter::On),
                 MenuChoice::BundlePeers
             );
             format!("dropped {}", sync::peer_rm(&chosen)?.host)
         }
         PeerAction::Sync => {
-            let synced = sync::sync_now(Scope::All);
-            let pulled = sync_note(&synced.pulled);
-            let pushed = sync_note(&synced.pushed);
-            match pulled.is_empty() && pushed.is_empty() {
+            console.rt.bundles.poke(Poke::AwaitTick)?;
+            let poll = console.rt.bundles.status();
+            let mut lines = Vec::new();
+            for row in &poll.peers {
+                lines.push(format!(
+                    "  {:<34}{}{}",
+                    row.host,
+                    match &row.pull {
+                        Ok(()) => format!("pulled {} signature(s)", row.arrivals),
+                        Err(e) => format!("pull failed: {e}"),
+                    },
+                    match &row.push {
+                        Ok(()) => String::new(),
+                        Err(e) => format!("; push failed: {e}"),
+                    }
+                ));
+            }
+            match lines.is_empty() {
                 true => "no bundle peers enrolled".to_string(),
-                false => format!("pulled — {pulled}\npushed — {pushed}"),
+                false => lines.join("\n"),
             }
         }
     };

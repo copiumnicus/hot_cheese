@@ -1,13 +1,13 @@
 //! The one capability in this crate that writes.
 //!
-//! [`Proposal`] mirrors `ApprovedSafeTx`: private fields, no constructor but [`Proposal::check`],
-//! and [`Proposal::file`] takes it by value. So a bundle that was not policy-checked cannot be
-//! filed, because there is no other way to reach the write — the same trick the signer uses to
-//! make "the policy ran before the prompt" a fact of the type system.
+//! [`Proposal`] mirrors the signer's `Approved`: private fields, no constructor but
+//! [`Proposal::check`], and [`Proposal::file`] takes it by value. So a bundle that was not
+//! policy-checked cannot be filed, because there is no other way to reach the write — the same
+//! trick the signer uses to make "the policy ran before the prompt" a fact of the type system.
 //!
 //! The dry run is the signer's own `prepare`, not a second implementation of it, so what this
-//! server accepts cannot drift from what the signer will actually do. Its `ApprovedSafeTx` is
-//! dropped on the spot: this crate has no way to spend one.
+//! server accepts cannot drift from what the signer will actually do. The `Approved` it hands
+//! back is dropped on the spot: this crate has no way to spend one.
 use crate::McpErr;
 use alloy_primitives::B256;
 use hc_bundle::sync::SyncMode;
@@ -77,7 +77,7 @@ impl Proposal {
 
         let policy = Policy::load(&config.store_path(), &intent.key)?;
         let (_approved, summary) =
-            hc_sign::sign::prepare(intent.clone(), &policy, B256::ZERO, &config)?;
+            hc_sign::sign::prepare(intent.clone(), &policy, None, B256::ZERO, &config)?;
         Ok(Proposal { intent, summary })
     }
 

@@ -32,7 +32,8 @@ echo "==> 4) generate an EVM key"
 
 echo
 echo "==> 5) read its address  (the Touch ID prompt IS the per-request unlock)"
-"$BIN" address evm DEMO_KEY
+DEMO_ADDR="$("$BIN" address evm DEMO_KEY 2>&1 | tee /dev/stderr | grep -o '0x[0-9a-fA-F]\{40\}' | head -1 || true)"
+[[ -n "$DEMO_ADDR" ]] || { echo "could not read DEMO_KEY's address" >&2; exit 1; }
 
 echo
 echo "==> 6) self-test the (software) enclave path  (Touch ID, three times)"
@@ -47,15 +48,36 @@ chain_id = 1
 
 [[allow]]
 to = "0x2222222222222222222222222222222222222222"
-selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
+
+  [[allow.call]]
+  signature = "transfer(address,uint256)"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["0x3333333333333333333333333333333333333333"] } }
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "1000", amount_of = "0x2222222222222222222222222222222222222222" } }
 POLICY
 
 echo
-echo "==> 8) sign a scoped Safe transfer intent"
-echo "    ONE Touch ID prompt: that approval mints the per-payload grant AND unlocks the key."
-echo "    Only {r,s,v} comes back — never the private key."
+echo "==> 8) describe the Safe this machine collects signatures for"
+mkdir -p "$HOT_CHEESE_HOME/bundles"
+cat > "$HOT_CHEESE_HOME/bundles/safes.toml" <<SAFES
+[[safe]]
+address = "0x1111111111111111111111111111111111111111"
+chain_id = 1
+threshold = 1
+owners = ["$DEMO_ADDR"]
+SAFES
+
+echo
+echo "==> 9) file the transaction as a bundle  (prompts nothing, unlocks nothing)"
 cat > "$HOT_CHEESE_HOME/demo_intent.json" <<'INTENT'
 {
   "kind": "safe_tx",
@@ -69,7 +91,22 @@ cat > "$HOT_CHEESE_HOME/demo_intent.json" <<'INTENT'
   "nonce": "0"
 }
 INTENT
-"$BIN" sign --file "$HOT_CHEESE_HOME/demo_intent.json"
+HASH="$("$BIN" bundle new --no-sync --file "$HOT_CHEESE_HOME/demo_intent.json" 2>&1 | tee /dev/stderr | grep -o '0x[0-9a-f]\{64\}' | head -1 || true)"
+[[ -n "$HASH" ]] || { echo "bundle new did not report a safeTxHash" >&2; exit 1; }
+
+echo
+echo "==> 10) read the filed bundle: who signed, who is still missing, the threshold"
+"$BIN" bundle status "$HASH" --no-sync
+
+echo
+echo "==> 11) sign the bundle with DEMO_KEY"
+echo "    ONE Touch ID prompt: that approval mints the per-payload grant AND unlocks the key."
+echo "    Only {r,s,v} is filed — never the private key."
+"$BIN" bundle sign "$HASH" --key DEMO_KEY --no-sync
+
+echo
+echo "==> 12) the assembled execTransaction call, threshold met"
+"$BIN" bundle export "$HASH" --no-sync
 
 echo
 echo "============================================================================"

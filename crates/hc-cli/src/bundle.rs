@@ -9,11 +9,10 @@ use crate::{read_input, CliErr, UnlockMethod};
 use alloy_primitives::B256;
 use clap::{ArgGroup, Subcommand};
 use hc_bundle::sync::{self, Report, SyncMode};
-use hc_bundle::{Scope, Watch};
-use hc_core::config::Config;
+use hc_bundle::Scope;
+use hc_sign::grant::IntentKind;
 use hc_sign::intent::Intent;
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Milliseconds in an hour, the unit a retirement decision is made in.
 const HOUR_MS: u64 = 3_600_000;
@@ -82,11 +81,6 @@ pub enum BundleCmd {
         /// Sync only this bundle; omit for the whole tree.
         hash: Option<B256>,
     },
-    /// Poll the peers in the foreground and report signatures as they arrive. Ctrl-C ends it.
-    Watch {
-        /// Watch only this bundle, and stop once its threshold is met.
-        hash: Option<B256>,
-    },
     /// Discover, enroll and drop the tailnet machines this one syncs bundles with.
     #[command(subcommand)]
     Peer(PeerCmd),
@@ -115,13 +109,20 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
     };
     match cmd {
         BundleCmd::New { file } => {
-            let Intent::SafeTx(intent) = serde_json::from_slice(&read_input(file.as_deref())?)?;
+            let intent = match serde_json::from_slice(&read_input(file.as_deref())?)? {
+                Intent::SafeTx(intent) => intent,
+                Intent::TypedData(_) => {
+                    return Err(CliErr::NotBundleable {
+                        kind: IntentKind::TypedData,
+                    })
+                }
+            };
             hc_bundle::new(mode, intent)?;
             Ok(())
         }
         BundleCmd::Sign { hash, key } => {
             let intent = hc_bundle::intent_to_sign(mode, hash, &key)?;
-            let response = crate::sign_intent_locally(&intent, unlock)?;
+            let response = crate::sign_intent_locally(intent, unlock)?;
             hc_bundle::collect(mode, hash, response)?;
             Ok(())
         }
@@ -155,7 +156,6 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
             report("pushed", &synced.pushed);
             Ok(())
         }
-        BundleCmd::Watch { hash } => watch(mode, hash),
         BundleCmd::Peer(cmd) => peer(cmd),
     }
 }
@@ -174,6 +174,8 @@ fn report(direction: &str, report: &Report) {
         peers = report.peers.len(),
         failed = report.failed(),
         quarantined = report.verdict.rejected.len(),
+        judged = report.verdict.judged,
+        bundles = report.verdict.dirs,
         "bundle sync"
     );
     for peer in &report.peers {
@@ -182,12 +184,24 @@ fn report(direction: &str, report: &Report) {
             Err(e) => tracing::warn!(host = %peer.host, error = %e, "  FAILED"),
         }
     }
+    for rejected in &report.verdict.rejected {
+        tracing::warn!(file = %rejected.from.display(), reject = ?rejected.reject, disposal = ?rejected.disposal, "  REFUSED");
+    }
     for hash in &report.verdict.crowded {
-        tracing::warn!(%hash, "  CROWDED: more files than the per-bundle cap; export will refuse a signer that is not an owner");
+        tracing::warn!(%hash, "  CROWDED: more files than the per-bundle cap; the overflow was quarantined");
+    }
+    for hash in &report.verdict.refused_dirs {
+        tracing::warn!(%hash, "  REFUSED: a bundle directory arrived past the cap and was removed");
+    }
+    if report.verdict.refused_files > 0 {
+        tracing::warn!(
+            files = report.verdict.refused_files,
+            "  REFUSED: files past the per-bundle cap"
+        );
     }
     if report.verdict.capped {
         tracing::warn!(
-            "  CAPPED: too many files to validate in one pass; the rest were not judged"
+            "  CAPPED: too many files to judge in one pass; the rest are left to the next one"
         );
     }
 }
@@ -284,36 +298,6 @@ fn qr(hash: B256) -> Result<(), CliErr> {
     }
     tracing::info!(%hash, parts = of, "scan every part; the set is verified against its own sha256");
     Ok(())
-}
-
-/// Poll in the FOREGROUND. Nothing is spawned, nothing is backgrounded, and Ctrl-C takes the
-/// process and any rsync it is running down together, so no child is ever stranded.
-fn watch(mode: SyncMode, hash: Option<B256>) -> Result<(), CliErr> {
-    let scope = scope(hash);
-    let interval = Duration::from_secs(Config::load()?.bundle_watch_secs());
-    let mut watch = Watch::start(scope)?;
-    tracing::info!(
-        watching = watch.watching(),
-        interval_secs = interval.as_secs(),
-        "watching for signatures; Ctrl-C to stop"
-    );
-    loop {
-        for arrival in watch.poll(mode)? {
-            tracing::info!(
-                hash = %arrival.hash,
-                signer = %arrival.signer,
-                have = arrival.have,
-                threshold = arrival.threshold,
-                met = arrival.met,
-                "signature arrived"
-            );
-            if arrival.met && hash.is_some() {
-                tracing::info!(hash = %arrival.hash, "threshold met");
-                return Ok(());
-            }
-        }
-        std::thread::sleep(interval);
-    }
 }
 
 fn peer(cmd: PeerCmd) -> Result<(), CliErr> {

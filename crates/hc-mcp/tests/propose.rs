@@ -13,7 +13,7 @@ const SAFE: &str = "0x1111111111111111111111111111111111111111";
 const TOKEN: &str = "0x2222222222222222222222222222222222222222";
 const RECIPIENT: &str = "0x3333333333333333333333333333333333333333";
 const ELSEWHERE: &str = "0x9999999999999999999999999999999999999999";
-const TRANSFER: &str = "0xa9059cbb";
+const TRANSFER: &str = "transfer(address,uint256)";
 
 /// A home holding exactly what the proposal server reads: a config, a `safes.toml`, a policy.
 fn home() -> PathBuf {
@@ -43,8 +43,27 @@ fn home() -> PathBuf {
     std::fs::write(
         store.join("policies").join("AGENT.toml"),
         format!(
-            "safe = \"{SAFE}\"\nchain_id = 1\n\n[[allow]]\nto = \"{TOKEN}\"\nselectors = \
-             [\"{TRANSFER}\"]\nmax_value = \"0\"\noperation = \"call\"\n"
+            r#"safe = "{SAFE}"
+chain_id = 1
+
+[[allow]]
+to = "{TOKEN}"
+max_value = "0"
+operation = "call"
+
+  [[allow.call]]
+  signature = "{TRANSFER}"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = {{ one_of = {{ addresses = ["{RECIPIENT}"] }} }}
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = {{ max = {{ max = "1000", amount_of = "{TOKEN}" }} }}
+"#
         ),
     )
     .expect("write the policy");

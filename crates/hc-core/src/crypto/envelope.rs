@@ -309,6 +309,34 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
+/// The store's git repository directory: git owns every mode inside it, and a chmod sweep that
+/// descended into it would fight `core.fileMode` and dirty a clean checkout.
+pub const GIT_DIR: &str = ".git";
+
+/// Tighten the whole store to owner-only: `0700` on the store dir and every directory under it,
+/// `0600` on every regular file, and [`GIT_DIR`] left entirely alone. Symlinks are skipped, so
+/// a link planted in the store cannot redirect the sweep outside it.
+pub fn enforce_store_modes(store: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dirs = vec![store.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_name() == GIT_DIR {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` via temp-file + rename so a crash can't leave a partial file.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EnvErr> {
     let tmp = path.with_extension("hctmp");

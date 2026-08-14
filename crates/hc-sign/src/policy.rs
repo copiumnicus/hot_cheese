@@ -1,6 +1,8 @@
 //! Fail-closed, per-key signing policy loaded from `<store>/policies/<name>.toml`.
-use crate::adapter::OWNER_MGMT;
 use crate::intent::{Operation, SafeTxIntent};
+use crate::schema::{
+    check_call_rules, check_schemas, CallRule, RuleErr, Site, TypedDataSchema, OWNER_MGMT,
+};
 use alloy_primitives::{Address, FixedBytes, B256, U256};
 use err_mac::create_err_with_impls;
 use serde::Deserialize;
@@ -8,7 +10,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// One key's policy: which Safe, the mandatory chain pin, allowed contract calls, whether
-/// owner/threshold rotations are permitted, and any opt-in refund allowance.
+/// owner/threshold rotations are permitted, any opt-in refund allowance, and the EIP-712
+/// message shapes this key may sign.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -21,6 +24,9 @@ pub struct Policy {
     pub owner_management: OwnerMgmt,
     #[serde(default)]
     pub refunds: Option<RefundPolicy>,
+    /// EIP-712 message schemas this key may sign, each complete: domain, types, constraints.
+    #[serde(default)]
+    pub typed_data: Vec<TypedDataSchema>,
 }
 
 /// Opt-in allowance for Safe gas-refund fields: only when present may an intent carry any
@@ -45,14 +51,16 @@ pub struct RefundPolicy {
     pub max_safe_tx_gas: U256,
 }
 
-/// A permitted destination: its selectors, a value ceiling, and the required operation. A
-/// term this struct does not name is a refusal to load, in a policy file and in an adapter
-/// manifest alike: an unrecognised rule term is something the daemon does not enforce.
+/// A permitted destination: the calls it may receive, a native-value ceiling, and the required
+/// operation. A term this struct does not name is a refusal to load, in a policy file and in an
+/// adapter manifest alike: an unrecognised rule term is something the daemon does not enforce.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowRule {
     pub to: Address,
-    pub selectors: Vec<FixedBytes<4>>,
+    /// Calls permitted at this destination, each a full canonical signature plus its
+    /// per-argument bounds. The 4-byte selector is derived from the signature.
+    pub call: Vec<CallRule>,
     #[serde(default)]
     pub max_value: U256,
     #[serde(default)]
@@ -64,7 +72,13 @@ pub struct AllowRule {
 #[serde(deny_unknown_fields)]
 pub struct OwnerMgmt {
     pub allow: bool,
-    pub selectors: Vec<FixedBytes<4>>,
+    /// Rotation calls permitted against the Safe, each of which must be one of
+    /// [`OWNER_MGMT`](crate::schema::OWNER_MGMT).
+    pub call: Vec<CallRule>,
+    /// Native value a rotation call may carry. Zero unless an operator says otherwise: a
+    /// rotation has no need to move value, and the ceiling never reached these calls before.
+    #[serde(default)]
+    pub max_value: U256,
 }
 
 create_err_with_impls!(
@@ -74,7 +88,7 @@ create_err_with_impls!(
     ;
     ToNotAllowed { to: Address },
     OperationNotAllowed { rule: Operation, got: Operation },
-    SelectorNotAllowed { selector: FixedBytes<4> },
+    SignatureNotAllowed { to: Address, selector: FixedBytes<4> },
     ValueTooHigh { value: U256, max: U256 }
 );
 
@@ -99,7 +113,8 @@ create_err_with_impls!(
     Refund(RefundDenied)
     ;
     SafeMismatch { expected: Address, got: Address },
-    ChainMismatch { expected: U256, got: U256 }
+    ChainMismatch { expected: U256, got: U256 },
+    OwnerManagementValueTooHigh { value: U256, max: U256 }
 );
 
 create_err_with_impls!(
@@ -107,6 +122,7 @@ create_err_with_impls!(
     pub PolicyErr,
     Denied(PolicyDenied),
     Io(std::io::Error),
+    Rule(RuleErr),
     Toml(toml::de::Error)
     ;
     DuplicateRule { to: Address, operation: Operation }
@@ -129,6 +145,8 @@ impl Policy {
         let text = std::fs::read_to_string(&path)?;
         let policy: Policy = toml::from_str(&text)?;
         no_duplicate_rules(&policy.allow)?;
+        check_call_rules(&policy.owner_management.call)?;
+        check_schemas(&policy.typed_data)?;
         Ok(LoadedPolicy {
             digest: B256::from_slice(&Sha256::digest(text.as_bytes())),
             policy,
@@ -139,7 +157,8 @@ impl Policy {
 /// Refuse an allow-list holding two rules for the same destination AND operation. [`match_call`]
 /// takes the first such rule, so a later duplicate could never fire: an operator who wrote one
 /// believes in a rule the daemon does not enforce. Both a policy file and an adapter manifest's
-/// `grants.calls` are checked with this, at load, before anything can be evaluated against them.
+/// `grants.calls` are checked with this, at load, before anything can be evaluated against them —
+/// and with it every rule's declared signatures and argument bounds.
 pub(crate) fn no_duplicate_rules(rules: &[AllowRule]) -> Result<(), PolicyErr> {
     for (i, rule) in rules.iter().enumerate() {
         for other in &rules[i + 1..] {
@@ -150,31 +169,28 @@ pub(crate) fn no_duplicate_rules(rules: &[AllowRule]) -> Result<(), PolicyErr> {
                 });
             }
         }
+        check_call_rules(&rule.call)?;
     }
     Ok(())
 }
 
-fn selector4(i: &SafeTxIntent) -> Option<[u8; 4]> {
-    i.data.get(..4).map(|s| {
-        let mut a = [0u8; 4];
-        a.copy_from_slice(s);
-        a
-    })
-}
-
-/// Match an intent against a list of [`AllowRule`]s: the rule is selected by destination AND
-/// operation together, so two rules for one destination each govern their own operation. A
-/// per-key policy's `allow` and an adapter manifest's `grants.calls` are both lists of these,
-/// and this is the only code that reads one — an adapter cannot be granted a call shape the
-/// policy language cannot express.
-pub fn match_call(rules: &[AllowRule], i: &SafeTxIntent) -> Result<(), CallDenied> {
+/// Match one call against a list of [`AllowRule`]s: the rule is selected by destination AND
+/// operation together, so two rules for one destination each govern their own operation, and then
+/// the declared signature is selected by the 4 bytes the calldata starts with. A per-key policy's
+/// `allow` and an adapter manifest's `grants.calls` are both lists of these, and this is the only
+/// code that reads one — an adapter cannot be granted a call shape the policy language cannot
+/// express.
+///
+/// The empty-calldata refusal lives here rather than in the decoder, because a call with no
+/// selector is a call no [`AllowRule`] can permit: that is a policy verdict, not a decode failure.
+pub fn match_call<'p>(rules: &'p [AllowRule], site: &Site) -> Result<&'p CallRule, CallDenied> {
     let mut matched = None;
     let mut other_operation = None;
     for rule in rules {
-        if rule.to != i.to {
+        if rule.to != site.to {
             continue;
         }
-        if rule.operation == i.operation {
+        if rule.operation == site.operation {
             matched = Some(rule);
             break;
         }
@@ -184,26 +200,64 @@ pub fn match_call(rules: &[AllowRule], i: &SafeTxIntent) -> Result<(), CallDenie
         return match other_operation {
             Some(allowed) => Err(CallDenied::OperationNotAllowed {
                 rule: allowed,
-                got: i.operation,
+                got: site.operation,
             }),
-            None => Err(CallDenied::ToNotAllowed { to: i.to }),
+            None => Err(CallDenied::ToNotAllowed { to: site.to }),
         };
     };
-    let Some(sel) = selector4(i) else {
+    let Some(head) = site.data.get(..4) else {
         return Err(CallDenied::NoSelector);
     };
-    if !rule.selectors.contains(&FixedBytes::from(sel)) {
-        return Err(CallDenied::SelectorNotAllowed {
-            selector: FixedBytes::from(sel),
+    let selector = FixedBytes::<4>::from_slice(head);
+    let Some(call) = rule
+        .call
+        .iter()
+        .find(|c| c.signature.selector() == selector)
+    else {
+        return Err(CallDenied::SignatureNotAllowed {
+            to: site.to,
+            selector,
         });
-    }
-    if i.value > rule.max_value {
+    };
+    if site.value > rule.max_value {
         return Err(CallDenied::ValueTooHigh {
-            value: i.value,
+            value: site.value,
             max: rule.max_value,
         });
     }
-    Ok(())
+    Ok(call)
+}
+
+/// The authority check for ONE call the Safe makes — the transaction's own, or one entry of a
+/// `multiSend` — returning the declared shape its calldata is then decoded against. Finding the
+/// rule IS the authority decision, which is what makes "anything policy permits is decodable"
+/// structural rather than a convention.
+pub fn match_site<'p>(site: &Site, policy: &'p Policy) -> Result<&'p CallRule, PolicyDenied> {
+    if site.to != policy.safe {
+        return Ok(match_call(&policy.allow, site)?);
+    }
+    let Some(head) = site.data.get(..4) else {
+        return Err(PolicyDenied::NoSelector);
+    };
+    let selector = FixedBytes::<4>::from_slice(head);
+    let matched = policy
+        .owner_management
+        .call
+        .iter()
+        .find(|c| c.signature.selector() == selector);
+    let allowed = policy.owner_management.allow
+        && site.operation == Operation::Call
+        && matches!(matched, Some(c) if OWNER_MGMT.contains(&c.signature.canonical()));
+    let Some(call) = matched.filter(|_| allowed) else {
+        return Err(PolicyDenied::OwnerManagementNotAllowed);
+    };
+    if site.value > policy.owner_management.max_value {
+        return Err(PolicyDenied::OwnerManagementValueTooHigh {
+            value: site.value,
+            max: policy.owner_management.max_value,
+        });
+    }
+    Ok(call)
 }
 
 /// Match an intent's gas-refund fields against an allowance. An absent allowance denies any
@@ -271,30 +325,14 @@ pub fn evaluate(i: &SafeTxIntent, policy: &Policy) -> Result<(), PolicyDenied> {
         });
     }
     match_refunds(policy.refunds.as_ref(), i)?;
-
-    if i.to == policy.safe {
-        let Some(sel) = selector4(i) else {
-            return Err(PolicyDenied::NoSelector);
-        };
-        let allowed = policy.owner_management.allow
-            && i.operation == Operation::Call
-            && policy
-                .owner_management
-                .selectors
-                .contains(&FixedBytes::from(sel))
-            && OWNER_MGMT.contains(&sel);
-        if !allowed {
-            return Err(PolicyDenied::OwnerManagementNotAllowed);
-        }
-        return Ok(());
-    }
-
-    Ok(match_call(&policy.allow, i)?)
+    match_site(&Site::own(i), policy)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::unbounded_call;
     use alloy_primitives::Bytes;
 
     const SAFE: [u8; 20] = [0x11; 20];
@@ -325,17 +363,19 @@ mod tests {
             chain_id: U256::from(1u64),
             allow: vec![AllowRule {
                 to: Address::from(TOKEN),
-                selectors: vec![FixedBytes::from(TRANSFER)],
+                call: vec![unbounded_call("transfer(address,uint256)")],
                 max_value: U256::from(100u64),
                 operation: Operation::Call,
             }],
             owner_management: OwnerMgmt::default(),
             refunds: None,
+            typed_data: Vec::new(),
         }
     }
 
     /// The happy path and every fail-closed branch, plus the guarded owner-rotation allow —
-    /// the non-trivial policy logic this module exists to enforce.
+    /// the non-trivial policy logic this module exists to enforce. A call with no selector is
+    /// refused HERE, by the policy, which is what keeps a bare ETH transfer unsignable.
     #[test]
     fn each_deny_branch_and_rotation_allow() {
         let p = contract_policy();
@@ -380,7 +420,7 @@ mod tests {
         i.data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
         assert!(matches!(
             evaluate(&i, &p),
-            Err(PolicyDenied::Call(CallDenied::SelectorNotAllowed { .. }))
+            Err(PolicyDenied::Call(CallDenied::SignatureNotAllowed { .. }))
         ));
 
         let mut i = base_intent();
@@ -390,12 +430,12 @@ mod tests {
             Err(PolicyDenied::Call(CallDenied::ValueTooHigh { .. }))
         ));
 
-        // Rotation against the Safe itself is denied unless explicitly enabled. The
-        // selector is taken from the sol!-derived set so the test can't misname it.
-        let swap_owner = OWNER_MGMT[0];
+        // Rotation against the Safe itself is denied unless explicitly enabled, and even then
+        // it may not move native value: `max_value` defaults to zero for a self-call.
+        let swap = unbounded_call(OWNER_MGMT[0]);
         let mut rot = base_intent();
         rot.to = Address::from(SAFE);
-        rot.data = Bytes::from(swap_owner.to_vec());
+        rot.data = Bytes::from(swap.signature.selector().to_vec());
         assert!(matches!(
             evaluate(&rot, &p),
             Err(PolicyDenied::OwnerManagementNotAllowed)
@@ -404,9 +444,27 @@ mod tests {
         let mut allow_rot = p.clone();
         allow_rot.owner_management = OwnerMgmt {
             allow: true,
-            selectors: vec![FixedBytes::from(swap_owner)],
+            call: vec![swap],
+            max_value: U256::ZERO,
         };
         assert!(evaluate(&rot, &allow_rot).is_ok());
+
+        let mut paid_rot = rot.clone();
+        paid_rot.value = U256::from(1u64);
+        assert!(matches!(
+            evaluate(&paid_rot, &allow_rot),
+            Err(PolicyDenied::OwnerManagementValueTooHigh { .. })
+        ));
+
+        let mut not_rotation = rot;
+        not_rotation.data = Bytes::from(TRANSFER.to_vec());
+        assert!(
+            matches!(
+                evaluate(&not_rotation, &allow_rot),
+                Err(PolicyDenied::OwnerManagementNotAllowed)
+            ),
+            "a self-call outside the rotation set is never owner management"
+        );
     }
 
     /// Gas-refund fields drain funds independently of (to,value,data): any refund activity is
@@ -470,7 +528,7 @@ mod tests {
             Err(PolicyDenied::Refund(RefundDenied::BaseGasTooHigh { .. }))
         ));
 
-        let mut over_safe_tx = drain.clone();
+        let mut over_safe_tx = drain;
         over_safe_tx.safe_tx_gas = U256::from(1u64);
         assert!(matches!(
             evaluate(&over_safe_tx, &opt_in),
@@ -478,12 +536,48 @@ mod tests {
         ));
     }
 
-    /// chain_id is a mandatory pin: the exact scripts/demo.sh policy (`chain_id = 1`, plus its
-    /// allow rule) still loads, but a policy omitting chain_id fails to load (= deny), closing
-    /// the cross-chain replay hole.
+    /// chain_id is a mandatory pin: the exact scripts/demo.sh policy still loads, but a policy
+    /// omitting chain_id fails to load (= deny), closing the cross-chain replay hole. A policy
+    /// still written in the retired `selectors` language fails to load for the same reason,
+    /// naming the term it does not understand.
     #[test]
     fn chain_id_is_required_to_load() {
         let demo = concat!(
+            "safe = \"0x1111111111111111111111111111111111111111\"\n",
+            "chain_id = 1\n",
+            "\n",
+            "[[allow]]\n",
+            "to = \"0x2222222222222222222222222222222222222222\"\n",
+            "max_value = \"0\"\n",
+            "operation = \"call\"\n",
+            "\n",
+            "  [[allow.call]]\n",
+            "  signature = \"transfer(address,uint256)\"\n",
+            "\n",
+            "    [[allow.call.arg]]\n",
+            "    at = 0\n",
+            "    name = \"to\"\n",
+            "    rule = { one_of = { addresses = \
+             [\"0x3333333333333333333333333333333333333333\"] } }\n",
+            "\n",
+            "    [[allow.call.arg]]\n",
+            "    at = 1\n",
+            "    name = \"amount\"\n",
+            "    rule = { max = { max = \"1000000000\", amount_of = \
+             \"0x2222222222222222222222222222222222222222\" } }\n",
+        );
+        let p: Policy = toml::from_str(demo).expect("demo policy must load");
+        assert_eq!(p.chain_id, U256::from(1u64));
+        assert_eq!(p.allow.len(), 1);
+        assert_eq!(
+            p.allow[0].call[0].signature.canonical(),
+            "transfer(address,uint256)"
+        );
+
+        let without_chain = "safe = \"0x1111111111111111111111111111111111111111\"\n";
+        assert!(toml::from_str::<Policy>(without_chain).is_err());
+
+        let retired = concat!(
             "safe = \"0x1111111111111111111111111111111111111111\"\n",
             "chain_id = 1\n",
             "\n",
@@ -493,12 +587,11 @@ mod tests {
             "max_value = \"0\"\n",
             "operation = \"call\"\n",
         );
-        let p: Policy = toml::from_str(demo).expect("demo policy must load");
-        assert_eq!(p.chain_id, U256::from(1u64));
-        assert_eq!(p.allow.len(), 1);
-
-        let without_chain = "safe = \"0x1111111111111111111111111111111111111111\"\n";
-        assert!(toml::from_str::<Policy>(without_chain).is_err());
+        let refused = toml::from_str::<Policy>(retired).expect_err("selectors is retired");
+        assert!(
+            refused.to_string().contains("selectors"),
+            "the refusal must name the term: {refused}"
+        );
     }
 
     fn write_policy(dir: &Path, rules: &str) -> std::path::PathBuf {
@@ -520,18 +613,20 @@ mod tests {
     fn same_destination_rules_split_by_operation_and_duplicates_die_at_load() {
         let dir = std::env::temp_dir().join("hot_cheese_policy_rule_test");
         let _ = std::fs::remove_dir_all(&dir);
-        let split = concat!(
-            "[[allow]]\n",
-            "to = \"0x2222222222222222222222222222222222222222\"\n",
-            "selectors = [\"0xdeadbeef\"]\n",
-            "operation = \"delegatecall\"\n",
-            "\n",
-            "[[allow]]\n",
-            "to = \"0x2222222222222222222222222222222222222222\"\n",
-            "selectors = [\"0xa9059cbb\"]\n",
-            "operation = \"call\"\n",
+        let rule = |operation: &str, signature: &str| {
+            format!(
+                "[[allow]]\nto = \"0x2222222222222222222222222222222222222222\"\noperation = \
+                 \"{operation}\"\n\n  [[allow.call]]\n  signature = \"{signature}\"\n\n    \
+                 [[allow.call.arg]]\n    at = 0\n    name = \"a\"\n    rule = \"unbounded\"\n\n    \
+                 [[allow.call.arg]]\n    at = 1\n    name = \"b\"\n    rule = \"unbounded\"\n\n"
+            )
+        };
+        let split = format!(
+            "{}{}",
+            rule("delegatecall", "approve(address,uint256)"),
+            rule("call", "transfer(address,uint256)")
         );
-        let store = write_policy(&dir, split);
+        let store = write_policy(&dir, &split);
         let loaded = Policy::load(&store, "K").expect("split rules load");
 
         let call = base_intent();
@@ -541,31 +636,25 @@ mod tests {
         );
         let mut delegate = base_intent();
         delegate.operation = Operation::Delegatecall;
-        delegate.data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        delegate.data = Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]);
         assert!(evaluate(&delegate, &loaded.policy).is_ok());
 
         let mut crossed = base_intent();
-        crossed.data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        crossed.data = Bytes::from(vec![0x09, 0x5e, 0xa7, 0xb3]);
         assert!(
             matches!(
                 evaluate(&crossed, &loaded.policy),
-                Err(PolicyDenied::Call(CallDenied::SelectorNotAllowed { .. }))
+                Err(PolicyDenied::Call(CallDenied::SignatureNotAllowed { .. }))
             ),
-            "each rule keeps its own selectors"
+            "each rule keeps its own declared signatures"
         );
 
-        let duplicate = concat!(
-            "[[allow]]\n",
-            "to = \"0x2222222222222222222222222222222222222222\"\n",
-            "selectors = [\"0xa9059cbb\"]\n",
-            "operation = \"call\"\n",
-            "\n",
-            "[[allow]]\n",
-            "to = \"0x2222222222222222222222222222222222222222\"\n",
-            "selectors = [\"0xdeadbeef\"]\n",
-            "operation = \"call\"\n",
+        let duplicate = format!(
+            "{}{}",
+            rule("call", "transfer(address,uint256)"),
+            rule("call", "approve(address,uint256)")
         );
-        let store = write_policy(&dir, duplicate);
+        let store = write_policy(&dir, &duplicate);
         assert!(matches!(
             Policy::load(&store, "K"),
             Err(PolicyErr::DuplicateRule { .. })

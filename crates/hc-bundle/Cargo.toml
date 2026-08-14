@@ -18,3 +18,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 k256.workspace = true
+parking_lot.workspace = true

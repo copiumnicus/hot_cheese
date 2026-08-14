@@ -93,5 +93,7 @@ qrcode = { version = "=0.14.1", default-features = false }
 
 alloy-primitives = { version = "=0.8.26", features = ["serde"] }
 alloy-sol-types = "=0.8.26"
+alloy-dyn-abi = { version = "=0.8.26", features = ["eip712"] }
+alloy-json-abi = "=0.8.26"
 
 ureq = "=2.12.1"

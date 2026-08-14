@@ -8,14 +8,15 @@
 //! with a timeout, which is the seam a later drain of queued requests goes through.
 use super::approval::RawScreen;
 use super::menu::{MenuErr, Nav};
+use super::status::BandCache;
 use crossterm::cursor::{self, Hide, MoveTo};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{self, enable_raw_mode, Clear, ClearType};
+use hc_daemon::live::Live;
 use std::fmt;
 use std::io::Write;
-use std::time::Duration;
 
 /// Option rows one frame shows before the list scrolls, and the jump PageUp and PageDown make.
 const MAX_PAGE: usize = 12;
@@ -35,9 +36,6 @@ const MIN_FRAME: usize = TITLE + MIN_PAGE + HELP;
 
 /// Columns every row and the panel are indented by.
 const INDENT: usize = 2;
-
-/// How long a frame waits on the keyboard before it is drawn again.
-const TICK: Duration = Duration::from_millis(120);
 
 /// A row of the console's list: what it says, and what → opens under it.
 pub(crate) trait Pick: fmt::Display {
@@ -81,6 +79,8 @@ struct State<'a> {
     typed: String,
     /// Whether typing filters at all.
     filter: Filter,
+    /// The live status line as it stands on screen.
+    band: BandCache,
     /// Whether the frame has to be drawn again.
     dirty: bool,
 }
@@ -103,6 +103,7 @@ impl<'a> State<'a> {
             expanded: false,
             typed: String::new(),
             filter,
+            band: BandCache::default(),
             dirty: true,
         }
     }
@@ -202,18 +203,24 @@ fn step(state: &mut State, key: KeyEvent) -> Option<Outcome> {
 }
 
 /// How one frame splits the rows it has. The list is served first, so a terminal too short for
-/// everything drops the description and then the help line, never the options.
+/// everything drops the description, then the band, and then the help line, never the options.
 #[derive(Debug, PartialEq, Eq)]
 struct Budget {
     /// Rows the option list occupies, markers included.
     page: usize,
+    /// Rows the live status line occupies: the one it asked for, or none.
+    band: usize,
     /// Rows the description panel may use; under two it is left off this frame.
     room: usize,
     /// Whether the help line fits.
     help: bool,
 }
 
-fn budget(rows: usize, start: usize, options: usize, wanted: usize) -> Budget {
+/// `band` in is the row the status line wants; `band` out is what the frame may draw. It is paid
+/// AFTER the help line: the help line is how the operator leaves the screen and the band is
+/// decoration, so at [`MIN_FRAME`] the band is what goes. Payment order is priority; draw order
+/// is layout, and the two are independent.
+fn budget(rows: usize, start: usize, options: usize, band: usize, wanted: usize) -> Budget {
     let mut left = rows.saturating_sub(start).saturating_sub(TITLE);
     let page = options.min(MAX_PAGE).min(left);
     left -= page;
@@ -221,8 +228,11 @@ fn budget(rows: usize, start: usize, options: usize, wanted: usize) -> Budget {
     if help {
         left -= HELP;
     }
+    let band = band.min(left);
+    left -= band;
     Budget {
         page,
+        band,
         room: wanted.min(left),
         help,
     }
@@ -309,7 +319,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// Cut a line to `width` characters — never bytes, because the labels carry arrows and warning
 /// marks that byte truncation would split — and mark the cut.
-fn clip(line: &str, width: usize) -> String {
+pub(crate) fn clip(line: &str, width: usize) -> String {
     if line.chars().count() <= width {
         return line.to_string();
     }
@@ -349,13 +359,22 @@ fn render(state: &State, title: &str, cols: usize, rows: usize, start: usize) ->
         true => 0,
         false => wrapped.len() + 1,
     };
-    let budget = budget(rows, start, state.matches.len().max(1), wanted);
+    let budget = budget(
+        rows,
+        start,
+        state.matches.len().max(1),
+        usize::from(!state.band.line().is_empty()),
+        wanted,
+    );
 
     let head = match state.typed.is_empty() {
         true => title.to_string(),
         false => format!("{title}  {}", state.typed),
     };
     let mut lines = vec![clip(&head, cols)];
+    if budget.band > 0 {
+        lines.push(clip(&format!("{:INDENT$}{}", "", state.band.line()), cols));
+    }
 
     let win = window(state.matches.len(), state.cursor, budget.page);
     if win.above > 0 {
@@ -439,7 +458,12 @@ fn draw(state: &State, title: &str, start: u16) -> Result<(), MenuErr> {
 /// Put the list in front of the operator and hand back what they did with it. The frame is
 /// erased on the way out so the prompts that still run on inquire start on a clean line, and
 /// the header the screen wrote above the anchor is left alone.
+///
+/// The band is ticked at the TOP of the loop rather than in the poll-timeout branch: a held
+/// arrow key wakes the loop through the key branch, and a tick that only ran on a timeout would
+/// freeze the status for as long as the key is down.
 pub(crate) fn pick<T: Pick>(
+    live: &Live,
     title: &str,
     mut options: Vec<T>,
     filter: Filter,
@@ -456,11 +480,14 @@ pub(crate) fn pick<T: Pick>(
     let _screen = RawScreen;
     let mut state = State::new(&rows, filter);
     let outcome = loop {
+        if state.band.tick(live)? {
+            state.dirty = true;
+        }
         if state.dirty {
             draw(&state, title, start)?;
             state.dirty = false;
         }
-        if !crossterm::event::poll(TICK)? {
+        if !crossterm::event::poll(super::TICK)? {
             continue;
         }
         match crossterm::event::read()? {
@@ -519,42 +546,62 @@ mod tests {
 
     /// The frame must never be taller than the rows between the anchor and the bottom, or the
     /// terminal scrolls and the anchor is a lie. Within that, the list is paid first: a short
-    /// terminal keeps its rows and loses the description, and a tall one funds both.
+    /// terminal keeps its rows and loses the description, then the band, and a tall one funds all
+    /// of them. The sweep proves the sum for every geometry and both band heights, which is what
+    /// catches a band that is measured but never subtracted; the fixed cases pin the order the
+    /// sweep cannot see, because an inequality holds either way round.
     #[test]
     fn the_budget_pays_the_list_first_and_never_overdraws() {
-        let tight = budget(6, 1, 9, 6);
+        let tight = budget(6, 1, 9, 1, 6);
         assert_eq!(
             tight,
             Budget {
                 page: MIN_PAGE + 1,
+                band: 0,
                 room: 0,
                 help: false
             }
         );
 
-        let tiny = budget(5, 1, 9, 6);
+        let tiny = budget(5, 1, 9, 1, 6);
         assert_eq!(tiny.page, MIN_PAGE, "the list keeps its rows");
         assert_eq!(tiny.room, 0, "the description is what goes");
 
-        let roomy = budget(40, 8, 9, 6);
+        let roomy = budget(40, 8, 9, 1, 6);
         assert_eq!(
             roomy,
             Budget {
                 page: 9,
+                band: 1,
                 room: 6,
                 help: true
             }
         );
 
+        assert_eq!(
+            budget(MIN_FRAME, 0, MIN_PAGE, 1, 6),
+            Budget {
+                page: MIN_PAGE,
+                band: 0,
+                room: 0,
+                help: true
+            },
+            "the minimum frame keeps the line that says how to leave and drops the band"
+        );
+
         for rows in 0..30usize {
             for start in 0..rows {
                 for options in [0usize, 1, 9, 200] {
-                    let b = budget(rows, start, options, 40);
-                    let chrome = TITLE + usize::from(b.help);
-                    assert!(
-                        b.page + b.room + chrome <= rows - start,
-                        "frame overdrew {rows}x{start} with {options} options: {b:?}"
-                    );
+                    for band in [0usize, 1] {
+                        let b = budget(rows, start, options, band, 40);
+                        let chrome = TITLE + b.band + usize::from(b.help);
+                        assert!(
+                            b.page + b.room + chrome <= rows - start,
+                            "frame overdrew {rows}x{start} with {options} options \
+                             and band {band}: {b:?}"
+                        );
+                        assert!(b.band <= band, "the frame drew a band nobody asked for");
+                    }
                 }
             }
         }

@@ -53,12 +53,14 @@ pub const GRANT_TTL_MS: u64 = 5_000;
 #[serde(rename_all = "snake_case")]
 pub enum IntentKind {
     SafeTx,
+    TypedData,
 }
 
 impl IntentKind {
     fn tag(self) -> u8 {
         match self {
             IntentKind::SafeTx => 1,
+            IntentKind::TypedData => 2,
         }
     }
 }
@@ -175,6 +177,14 @@ pub fn now_ms() -> Result<u64, GrantErr> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64)
+}
+
+/// Seconds since the Unix epoch. Every timestamp a status type publishes is this, so nothing
+/// downstream has to know which of two units it was handed.
+pub fn now_secs() -> Result<u64, GrantErr> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
 }
 
 /// A grant for the tests that exercise signing itself; it cannot exist in a real build.

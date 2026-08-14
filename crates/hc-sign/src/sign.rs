@@ -1,14 +1,18 @@
 //! The signing flow, split at the biometric so every front end shares one implementation.
 //!
-//! [`prepare`] runs everything that can refuse — the policy, the rebuilt digest — and hands
-//! back the summary a human has to read. The CALLER owns the human interaction: the daemon
-//! prints that text and takes Touch ID, a phone shows a sheet and takes Face ID. [`finish`]
-//! then consumes the [`ApprovedSafeTx`] that only [`prepare`] can mint, so "the policy ran
-//! before the prompt" is a fact of the type system rather than of the call order.
+//! [`prepare`] and [`prepare_typed_data`] run everything that can refuse — the policy, the typed
+//! deconstruction, the rebuilt digest — and hand back the summary a human has to read. The
+//! CALLER owns the human interaction: the daemon prints that text and takes Touch ID, a phone
+//! shows a sheet and takes Face ID. [`finish`] then consumes the [`Approved`] that only those two
+//! can mint, so "the policy ran before the prompt" is a fact of the type system rather than of
+//! the call order — and because the summary and the digest leave the same function together, the
+//! digest signed is the digest that was read.
+use crate::adapter::{self, typed};
 use crate::grant::{self, GrantTerms, IntentKind, SignGrant};
-use crate::intent::SafeTxIntent;
+use crate::intent::{SafeTxIntent, TypedDataIntent};
+use crate::manifest::Grant;
 use crate::policy::{self, LoadedPolicy};
-use crate::{adapter, address_of, SafeSignature, SignErr, SignResponse};
+use crate::{address_of, SafeSignature, SignErr, SignResponse};
 use alloy_primitives::{Bytes, B256};
 use hc_core::config::Config;
 use hc_core::crypto::envelope::decrypt_file;
@@ -17,43 +21,82 @@ use hc_core::mac::BackendImpl;
 use rand::RngCore;
 use zeroize::Zeroize;
 
-/// A SafeTx that has passed its policy, holding the exact terms one grant will be minted over.
+/// A payload that has passed its policy, holding the exact terms one grant will be minted over.
 /// Not `Clone`: one preparation buys one signature, and [`finish`] takes it by value.
-pub struct ApprovedSafeTx {
+pub struct Approved {
     key: String,
     digest: B256,
     policy_digest: B256,
     manifest_digest: B256,
+    kind: IntentKind,
 }
 
-/// Check `intent` against the policy in force, rebuild its `safeTxHash`, and return the terms
+/// Check `intent` against the policy in force, deconstruct every call it makes into typed
+/// arguments the policy declared the shape of, rebuild its `safeTxHash`, and return the terms
 /// [`finish`] will sign together with the summary the caller must put in front of a human.
 /// Everything that can refuse runs here, before the prompt, so a refusal costs no biometric.
 pub fn prepare(
     intent: SafeTxIntent,
     policy: &LoadedPolicy,
+    grant: Option<&Grant>,
     manifest_digest: B256,
     config: &Config,
-) -> Result<(ApprovedSafeTx, String), SignErr> {
+) -> Result<(Approved, String), SignErr> {
     policy::evaluate(&intent, &policy.policy)?;
-    let digest = adapter::safe_tx_hash(&intent);
-    let summary = adapter::summary(&intent, config);
+    let admitted = adapter::admit(
+        intent,
+        &policy.policy,
+        grant,
+        grant::now_ms()? / MILLIS_PER_SECOND,
+    )?;
+    let digest = admitted.digest();
+    let summary = admitted.summary(config);
     Ok((
-        ApprovedSafeTx {
-            key: intent.key,
+        Approved {
+            key: admitted.intent().key.clone(),
             digest,
             policy_digest: policy.digest,
             manifest_digest,
+            kind: IntentKind::SafeTx,
         },
         summary,
     ))
 }
 
+/// The same split for an EIP-712 message: the schema is the policy's, the domain is the policy's,
+/// and the message is coerced ONCE into the value that is both hashed and rendered here.
+pub fn prepare_typed_data(
+    intent: TypedDataIntent,
+    policy: &LoadedPolicy,
+    manifest_digest: B256,
+    config: &Config,
+) -> Result<(Approved, String), SignErr> {
+    let admitted = typed::admit(
+        &intent,
+        &policy.policy,
+        grant::now_ms()? / MILLIS_PER_SECOND,
+    )?;
+    let summary = admitted.summary(&intent.key, config);
+    Ok((
+        Approved {
+            key: intent.key,
+            digest: admitted.digest(),
+            policy_digest: policy.digest,
+            manifest_digest,
+            kind: IntentKind::TypedData,
+        },
+        summary,
+    ))
+}
+
+/// The repo's one clock reports milliseconds and every timestamp downstream is seconds.
+const MILLIS_PER_SECOND: u64 = 1_000;
+
 /// Mint the grant the approval just paid for, verify it against the pinned enclave public key,
 /// and sign. `auth` is the context the approval already evaluated, so neither the enclave grant
 /// signature nor the DEK unwrap shows a second sheet.
 pub fn finish(
-    approved: ApprovedSafeTx,
+    approved: Approved,
     backend: &dyn BackendImpl,
     pinned_grant_pub: &str,
     auth: Option<&LaContext>,
@@ -67,7 +110,7 @@ pub fn finish(
             intent_digest: approved.digest,
             policy_digest: approved.policy_digest,
             manifest_digest: approved.manifest_digest,
-            kind: IntentKind::SafeTx,
+            kind: approved.kind,
             nonce,
             expires_at_ms: grant::now_ms()? + grant::GRANT_TTL_MS,
         },

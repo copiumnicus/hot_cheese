@@ -25,6 +25,30 @@ impl Operation {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Intent {
     SafeTx(SafeTxIntent),
+    TypedData(TypedDataIntent),
+}
+
+/// A request to sign ONE EIP-712 message against a schema the POLICY declared.
+///
+/// It carries no type definitions, no primary type and no domain object, because the shape is
+/// not the requester's to describe: a requester who chose the field names would choose the words
+/// a human reads. `deny_unknown_fields` on THIS struct — not the enum, whose container attribute
+/// is inert for newtype variants — is what makes a body carrying `types`, `primaryType` or
+/// `domain` a parse failure at the boundary rather than something to compare against.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedDataIntent {
+    /// Local keystore name authorized to sign this message.
+    pub key: String,
+    /// Name of the `[[typed_data]]` block in this key's policy that governs this message.
+    pub schema: String,
+    /// The chain the declared domain pins; a mismatch is a refusal, not a re-domaining.
+    #[serde(with = "hc_core::wire::u256")]
+    pub chain_id: U256,
+    /// The contract that will verify the signature; a mismatch is a refusal.
+    pub verifying_contract: Address,
+    /// The message field VALUES, read only against the declared schema.
+    pub message: serde_json::Value,
 }
 
 /// The ten Safe `execTransaction` fields plus the local keystore `key` to sign with. A field

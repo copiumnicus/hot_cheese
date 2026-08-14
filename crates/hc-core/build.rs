@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rustc-link-lib=framework=Security");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    println!("cargo:rustc-link-lib=framework=LocalAuthentication");
-
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+
+    println!("cargo:rustc-link-lib=framework=Security");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    println!("cargo:rustc-link-lib=framework=LocalAuthentication");
 
     println!("cargo:rerun-if-changed=swift/se_bridge.swift");
     println!("cargo:rerun-if-changed=build.rs");

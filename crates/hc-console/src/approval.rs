@@ -1,22 +1,19 @@
 //! The main thread's privileged-op loop. It owns Touch ID and the DEK, so every operation a
 //! connection task forwarded is executed here and only here.
-use super::exposure::TunnelManager;
-use super::UnlockGate;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use super::renderer::Terminal;
+use super::status::BandCache;
+use super::Key;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{cursor, execute};
 use err_mac::create_err_with_impls;
-use hc_core::mac::local_auth::LaContext;
-use hc_daemon::{Approver, HotApi, OpContext, OpErr, Operation, PrivilegedOp};
-use hc_sign::SignErr;
-use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
-use std::fmt;
-use std::io::{self, Write};
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use hc_daemon::approval::Approver;
+use hc_daemon::exposure::TunnelManager;
+use hc_daemon::live::Live;
+use hc_daemon::renderer::{Decision, Renderer};
+use hc_daemon::runtime::{service_one, Outcome};
+use hc_daemon::{HotApi, OpErr, PrivilegedOp};
+use std::io;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -25,178 +22,34 @@ create_err_with_impls!(
     pub ApprovalErr,
     ListenerGone,
     ShutdownRequested,
-    Inquire(inquire::InquireError),
-    Sign(SignErr),
+    NoApprovalTerminal,
+    Grant(hc_sign::grant::GrantErr),
     StdIo(io::Error)
     ;
 );
-
-/// How long the serve screen waits on the keyboard before looking for a new request.
-const TICK: Duration = Duration::from_millis(120);
 
 /// Requests one drain pass may put in front of the operator. A freed queue slot refills at
 /// once, so this — not the queue depth — is what keeps a flood from owning the terminal.
 const PROMPTS_PER_DRAIN: usize = 2;
 
-/// Hex characters of the body digest shown at the prompt.
-const DIGEST_CHARS: usize = 16;
-
-/// What the operator did at one approval prompt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    /// Answered yes.
-    Approve,
-    /// Answered no.
-    Deny,
-    /// Esc, or a prompt that could not be shown: deny, and stop pulling requests.
-    Cancel,
-    /// Ctrl-C, which inquire consumes in raw mode: deny, and leave the console.
-    Interrupt,
+/// What the drain loops do after one prompt.
+pub(crate) enum After {
+    Continue,
+    Stop,
+    Leave,
+    /// The prompt could not be shown at all, which is not an answer and not an ending the
+    /// operator chose: it ends the session loudly, the way the menu ends on the same cause.
+    Fail,
 }
 
-/// The approver the drain loop drives. It also reports how the operator left the last prompt,
-/// so Esc and Ctrl-C escape a flood instead of handing over the next request.
-pub trait DrainApprover: Approver {
-    fn decision(&self) -> Decision;
-}
-
-/// Asks the operator in the console, then takes the single biometric the enclave op reuses —
-/// only for a sign under the Secure Enclave gate, which is the one flow that reuses it.
-pub struct ConsoleApprover {
-    /// Which KEK opened this session: a passphrase session has no per-request biometric.
-    gate: UnlockGate,
-    /// Prompts shown this session, so no two prompts are byte-identical.
-    shown: AtomicU64,
-    /// How the operator left the last prompt.
-    decision: Mutex<Decision>,
-}
-
-impl ConsoleApprover {
-    pub fn new(gate: UnlockGate) -> Self {
-        Self {
-            gate,
-            shown: AtomicU64::new(1),
-            decision: Mutex::new(Decision::Deny),
-        }
+/// Written once so `NoTerminal` cannot be classified one way here and another way there.
+pub(crate) fn after(decision: Decision) -> After {
+    match decision {
+        Decision::Approve | Decision::Deny => After::Continue,
+        Decision::Cancel => After::Stop,
+        Decision::NoTerminal => After::Fail,
+        Decision::Interrupt => After::Leave,
     }
-
-    /// Show one request and take the operator's yes/no. The terminal must be in cooked mode,
-    /// and everything is written to the stream inquire prompts on so a redirect cannot
-    /// separate the decoded action from the question about it.
-    fn ask(&self, ctx: &OpContext, summary: &str) -> Decision {
-        let seq = self.shown.fetch_add(1, Ordering::Relaxed);
-        let decision = match show(seq, summary) {
-            Ok(()) => {
-                let message = format!("#{seq} {} - approve?", ctx.reason());
-                match inquire::Confirm::new(&message).with_default(false).prompt() {
-                    Ok(true) => Decision::Approve,
-                    Ok(false) => Decision::Deny,
-                    Err(inquire::InquireError::OperationCanceled) => Decision::Cancel,
-                    Err(inquire::InquireError::OperationInterrupted) => Decision::Interrupt,
-                    Err(e) => {
-                        tracing::warn!(error = %e, key = %ctx.key, "approval prompt failed");
-                        Decision::Cancel
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, key = %ctx.key, "could not show the request");
-                Decision::Cancel
-            }
-        };
-        *self.decision.lock() = decision;
-        decision
-    }
-}
-
-impl Approver for ConsoleApprover {
-    fn approve(&self, ctx: &OpContext, summary: &str) -> Result<Option<LaContext>, SignErr> {
-        if self.ask(ctx, summary) != Decision::Approve {
-            return Err(SignErr::ApprovalDenied);
-        }
-        if self.gate == UnlockGate::Passphrase || ctx.op != Operation::Sign {
-            return Ok(None);
-        }
-        let head = summary.lines().take(3).collect::<Vec<_>>().join("\n");
-        let reason = if head.is_empty() {
-            ctx.reason()
-        } else {
-            format!("{}\n{head}", ctx.reason())
-        };
-        Ok(Some(LaContext::evaluate_biometric(&reason)?))
-    }
-}
-
-impl DrainApprover for ConsoleApprover {
-    fn decision(&self) -> Decision {
-        *self.decision.lock()
-    }
-}
-
-/// Write the request above the prompt, on the same stream inquire uses.
-fn show(seq: u64, summary: &str) -> Result<(), io::Error> {
-    let mut out = io::stderr();
-    writeln!(out, "\n=== hot_cheese request #{seq} ===")?;
-    if !summary.is_empty() {
-        writeln!(out, "{summary}")?;
-    }
-    out.flush()
-}
-
-/// Names the exact bytes a body-carrying route was asked to act on, so two prompts from a
-/// flood are never the same line twice.
-fn body_digest(body: &[u8]) -> String {
-    let full = hex::encode(Sha256::digest(body));
-    full.chars().take(DIGEST_CHARS).collect()
-}
-
-/// How one serviced request ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
-    Approved,
-    Denied,
-    Failed,
-}
-
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Outcome::Approved => "approved",
-            Outcome::Denied => "denied",
-            Outcome::Failed => "failed",
-        })
-    }
-}
-
-/// Run one queued request on this thread and answer its reply channel exactly once.
-fn service_one(api: &HotApi, approver: &dyn DrainApprover, op: PrivilegedOp) -> Outcome {
-    let PrivilegedOp { ctx, body, reply } = op;
-    let result = match ctx.op {
-        Operation::Sign => hc_daemon::execute(api, approver, &ctx, &body),
-        _ => {
-            let summary = if body.is_empty() {
-                String::new()
-            } else {
-                format!("request body sha256 {}", body_digest(&body))
-            };
-            match approver.approve(&ctx, &summary) {
-                Ok(_) => hc_daemon::execute(api, approver, &ctx, &body),
-                Err(e) => Err(OpErr::Sign(e)),
-            }
-        }
-    };
-    let outcome = match &result {
-        Ok(_) => Outcome::Approved,
-        Err(OpErr::Denied | OpErr::Sign(SignErr::ApprovalDenied)) => Outcome::Denied,
-        Err(e) => {
-            tracing::error!(error = ?e, key = %ctx.key, "operation failed");
-            Outcome::Failed
-        }
-    };
-    if reply.send(result).is_err() {
-        tracing::warn!(key = %ctx.key, "caller disconnected before its answer");
-    }
-    outcome
 }
 
 /// Deny every request still queued, without a prompt. Nothing may be left hanging when a pass
@@ -228,7 +81,7 @@ pub struct Drained {
 /// is left over is denied unprompted so the terminal always comes back.
 pub fn drain(
     api: &HotApi,
-    approver: &dyn DrainApprover,
+    approver: &Approver,
     ops: &mut mpsc::Receiver<PrivilegedOp>,
     tunnels: &TunnelManager,
 ) -> Result<Drained, ApprovalErr> {
@@ -244,13 +97,17 @@ pub fn drain(
         let outcome = service_one(api, approver, op);
         drained.answered += 1;
         tracing::info!(%outcome, %reason, "serviced a queued request");
-        match approver.decision() {
-            Decision::Cancel => break,
-            Decision::Interrupt => {
+        match after(approver.decision()) {
+            After::Stop => break,
+            After::Leave => {
                 drained.quit = true;
                 break;
             }
-            Decision::Approve | Decision::Deny => {}
+            After::Fail => {
+                refuse_queued(ops);
+                return Err(ApprovalErr::NoApprovalTerminal);
+            }
+            After::Continue => {}
         }
     }
     drained.refused = refuse_queued(ops);
@@ -262,8 +119,7 @@ pub(crate) struct RawScreen;
 
 impl Drop for RawScreen {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stderr(), cursor::Show);
+        Terminal.restore();
     }
 }
 
@@ -280,14 +136,15 @@ struct Tally {
     last: Option<String>,
 }
 
-fn draw(tally: &Tally, addr: SocketAddr, tunnels: usize) -> Result<(), io::Error> {
+fn draw(tally: &Tally, serving: &str, tunnels: usize, band: &str) -> Result<(), io::Error> {
     let last = match &tally.last {
         Some(line) => line.as_str(),
         None => "none yet",
     };
     let panel = format!(
         "hot_cheese - serve and approve\r\n\r\n  \
-         serving https://{addr}   tunnels open: {tunnels}\r\n  \
+         serving {serving}   tunnels open: {tunnels}\r\n  \
+         {band}\r\n  \
          approved {} | denied {} | failed {}\r\n  \
          last: {last}\r\n\r\n  \
          waiting for requests   [q] menu   [ctrl-c] shut down\r\n",
@@ -305,16 +162,21 @@ fn draw(tally: &Tally, addr: SocketAddr, tunnels: usize) -> Result<(), io::Error
 /// Stay on this thread approving incoming ops until the operator stops serving. Every
 /// serviced request is followed by a keyboard poll, so `q` is reachable between any two
 /// prompts, and escaping a prompt leaves the screen with the rest of the queue denied.
+///
+/// The band ticks once per pass, whatever woke the pass, so a background task publishing while
+/// nothing is arriving still repaints the frame.
 pub fn serve_and_approve(
     api: &HotApi,
-    approver: &dyn DrainApprover,
+    approver: &Approver,
     ops: &mut mpsc::Receiver<PrivilegedOp>,
-    addr: SocketAddr,
+    serving: &str,
     tunnels: &TunnelManager,
+    live: &Live,
 ) -> Result<(), ApprovalErr> {
     enable_raw_mode()?;
     let _screen = RawScreen;
     let mut tally = Tally::default();
+    let mut band = BandCache::default();
     let mut dirty = true;
     loop {
         match ops.try_recv() {
@@ -332,38 +194,37 @@ pub fn serve_and_approve(
                 }
                 tally.last = Some(format!("{outcome}: {reason}"));
                 dirty = true;
-                match approver.decision() {
-                    Decision::Cancel => {
+                match after(approver.decision()) {
+                    After::Stop => {
                         refuse_queued(ops);
                         return Ok(());
                     }
-                    Decision::Interrupt => {
+                    After::Leave => {
                         refuse_queued(ops);
                         return Err(ApprovalErr::ShutdownRequested);
                     }
-                    Decision::Approve | Decision::Deny => {}
+                    After::Fail => {
+                        refuse_queued(ops);
+                        return Err(ApprovalErr::NoApprovalTerminal);
+                    }
+                    After::Continue => {}
                 }
             }
             Err(TryRecvError::Disconnected) => return Err(ApprovalErr::ListenerGone),
             Err(TryRecvError::Empty) => {}
         }
+        if band.tick(live)? {
+            dirty = true;
+        }
         if dirty {
-            draw(&tally, addr, tunnels.list().len())?;
+            draw(&tally, serving, tunnels.list().len(), band.line())?;
             dirty = false;
         }
-        if !crossterm::event::poll(TICK)? {
-            continue;
-        }
-        match crossterm::event::read()? {
-            Event::Key(key) => match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Err(ApprovalErr::ShutdownRequested)
-                }
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                _ => {}
-            },
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
+        match super::tick()? {
+            Key::Quit => return Err(ApprovalErr::ShutdownRequested),
+            Key::Leave => return Ok(()),
+            Key::Redraw => dirty = true,
+            Key::Other(_) | Key::Ignore => {}
         }
     }
 }
@@ -372,10 +233,14 @@ pub fn serve_and_approve(
 mod tests {
     use super::*;
     use hc_core::crypto::envelope::Dek;
+    use hc_core::mac::local_auth::LaContext;
     use hc_core::mac::BackendImpl;
     use hc_core::unlock::UnlockErr;
-    use hc_daemon::{Peer, PENDING_OPS};
+    use hc_daemon::runtime::UnlockGate;
+    use hc_daemon::{OpContext, Operation, Peer, PENDING_OPS};
+    use hc_sign::SignErr;
     use hyper::body::Bytes;
+    use std::sync::Arc;
     use tokio::sync::oneshot;
 
     const POLICY: &str = concat!(
@@ -384,16 +249,28 @@ mod tests {
         "\n",
         "[[allow]]\n",
         "to = \"0x2222222222222222222222222222222222222222\"\n",
-        "selectors = [\"0xa9059cbb\"]\n",
         "max_value = \"0\"\n",
         "operation = \"call\"\n",
+        "\n",
+        "  [[allow.call]]\n",
+        "  signature = \"transfer(address,uint256)\"\n",
+        "\n",
+        "    [[allow.call.arg]]\n",
+        "    at = 0\n",
+        "    name = \"to\"\n",
+        "    rule = \"unbounded\"\n",
+        "\n",
+        "    [[allow.call.arg]]\n",
+        "    at = 1\n",
+        "    name = \"amount\"\n",
+        "    rule = \"unbounded\"\n",
     );
 
     const INTENT: &str = concat!(
         "{\"kind\":\"safe_tx\",\"key\":\"CONSOLE_DRAIN\",",
         "\"safe\":\"0x1111111111111111111111111111111111111111\",",
         "\"chain_id\":1,\"to\":\"0x2222222222222222222222222222222222222222\",",
-        "\"value\":\"0\",\"data\":\"0xa9059cbb\",\"operation\":\"call\",\"nonce\":0}"
+        "\"value\":\"0\",\"data\":\"0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a\",\"operation\":\"call\",\"nonce\":0}"
     );
 
     struct FakeBackend {
@@ -408,19 +285,19 @@ mod tests {
         }
     }
 
-    /// Refuses every request the way the operator would have, without touching the terminal.
+    /// Answers every request the way the operator would have, without touching the terminal.
     struct Stub {
         decision: Decision,
     }
-    impl Approver for Stub {
-        fn approve(&self, _ctx: &OpContext, _summary: &str) -> Result<Option<LaContext>, SignErr> {
-            Err(SignErr::ApprovalDenied)
-        }
-    }
-    impl DrainApprover for Stub {
-        fn decision(&self) -> Decision {
+    impl Renderer for Stub {
+        fn ask(&self, _seq: u64, _ctx: &OpContext, _summary: &str) -> Decision {
             self.decision
         }
+        fn restore(&self) {}
+    }
+
+    fn stub(decision: Decision) -> Approver {
+        Approver::new(UnlockGate::Biometric, Arc::new(Stub { decision }))
     }
 
     /// A store, a full queue of sign requests, and the caller side of every one of them.
@@ -491,9 +368,7 @@ mod tests {
 
         let drained = drain(
             &queued.api,
-            &Stub {
-                decision: Decision::Deny,
-            },
+            &stub(Decision::Deny),
             &mut queued.ops,
             &TunnelManager::new(),
         )
@@ -522,7 +397,7 @@ mod tests {
 
             let drained = drain(
                 &queued.api,
-                &Stub { decision },
+                &stub(decision),
                 &mut queued.ops,
                 &TunnelManager::new(),
             )

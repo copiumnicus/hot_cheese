@@ -10,6 +10,8 @@ test-util = []
 [dependencies]
 hc-core.workspace = true
 
+alloy-dyn-abi.workspace = true
+alloy-json-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 err_mac.workspace = true

@@ -21,9 +21,12 @@ pub struct Config {
     /// Uncompressed SEC1 hex (65 bytes) of the Secure Enclave grant key `serve` must find.
     #[serde(default)]
     pub grant_public_key: Option<String>,
-    /// Seconds `bundle watch` waits between polls.
+    /// Seconds the background bundle poller waits between ticks.
     #[serde(default)]
     pub bundle_watch_secs: Option<u64>,
+    /// Seconds the runtime waits between backup fetches; 0 disables the periodic fetch.
+    #[serde(default)]
+    pub backup_fetch_secs: Option<u64>,
     /// Limits on what the MCP proposal server may leave in the review queue.
     #[serde(default)]
     pub mcp: Option<Mcp>,
@@ -57,6 +60,20 @@ const DEFAULT_PEER_BUNDLES_DIR: &str = ".config/hot_cheese/bundles";
 /// Unsigned bundles an agent may leave waiting before the proposal server refuses to file
 /// another. The queue is read by a human, so it is bounded by what a human will read.
 const DEFAULT_MCP_MAX_PENDING: usize = 16;
+
+/// Seconds between backup fetches when `config.toml` does not say otherwise. A fetch is one
+/// `ls-remote` plus at most one transfer per remote, so it is cheap enough to run unattended
+/// and slow enough not to hammer a sleeping host.
+const DEFAULT_BACKUP_FETCH_SECS: u64 = 300;
+
+/// Seconds between bundle polls when `config.toml` does not say otherwise. The poller is
+/// continuous and unattended rather than a screen someone is staring at, so halving the ssh
+/// handshakes is worth more than five seconds of latency.
+const DEFAULT_BUNDLE_POLL_SECS: u64 = 30;
+
+/// The floor under that. `bundle_watch_secs = 0` would otherwise spin rsync subprocesses as fast
+/// as ssh can connect; 5 is one peer's own connect timeout.
+const MIN_BUNDLE_POLL_SECS: u64 = 5;
 
 /// What an agent proposing over MCP is allowed to accumulate.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -281,7 +298,12 @@ impl Config {
         self.port.unwrap_or(5555)
     }
     pub fn bundle_watch_secs(&self) -> u64 {
-        self.bundle_watch_secs.unwrap_or(15)
+        self.bundle_watch_secs
+            .unwrap_or(DEFAULT_BUNDLE_POLL_SECS)
+            .max(MIN_BUNDLE_POLL_SECS)
+    }
+    pub fn backup_fetch_secs(&self) -> u64 {
+        self.backup_fetch_secs.unwrap_or(DEFAULT_BACKUP_FETCH_SECS)
     }
     pub fn mcp_max_pending(&self) -> usize {
         match &self.mcp {
@@ -373,6 +395,7 @@ impl Config {
                     .to_string(),
             ),
             bundle_watch_secs: None,
+            backup_fetch_secs: None,
             mcp: None,
             backup_remotes: Vec::new(),
             adapters: Vec::new(),

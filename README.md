@@ -72,11 +72,14 @@ without the DEK ever crossing the wire in plaintext.
 5. **Recovery passphrase backstop** — an Argon2id-derived KEK that can unwrap the
    same DEK on any machine. It is the only cross-machine restore path (Secure
    Enclave keys are device-bound).
-6. **Safe-to-replicate backups** — best-effort `rsync` push after every mutation,
-   auto-pull on `serve` when the local store is missing, and manual
-   `backup push` / `backup pull`. The remote only ever sees ciphertext, and each
-   install replicates into its own **vault** subtree, so machines holding different
-   keys can share one backup host and folder.
+6. **Safe-to-replicate backups** — the store is a **git repository**. Every
+   mutation auto-commits, a session pushes in the background, fetches on a timer,
+   and applies a remote's commits only when they are a fast-forward; a fork is
+   reported, never merged over. `serve` clones the store when it is missing, and
+   `backup push` / `backup fetch` / `backup pull --force` are the manual verbs. The
+   remote only ever sees ciphertext, and each install owns its own **vault**
+   repository, so machines holding different keys can share one backup host and
+   folder.
 7. **End-to-end encrypted reads** — per-request Diffie-Hellman exchange means the
    secret is encrypted specifically for the requesting client, on top of pinned
    TLS.
@@ -122,12 +125,13 @@ without the DEK ever crossing the wire in plaintext.
      never leaves the enclave and each ECDH requires a live Touch ID.
    - **Passphrase KEK** = `Argon2id(passphrase, salt)`.
 3. **Serving.** `hot_cheese serve` binds HTTPS on loopback, presents the pinned
-   self-signed certificate, and answers the endpoints below. Secrets are returned
-   through a df-share Diffie-Hellman exchange so only the requesting client can
-   read them.
-4. **Replication.** After any mutation the store is best-effort `rsync`-pushed to
-   the configured remotes, into this install's vault subtree
-   (`<folder>/<vault_id>/`); ciphertext only.
+   self-signed certificate, and answers the endpoints below. Every one of those
+   endpoints except `/health` is put in front of the operator for an explicit
+   approval before anything unlocks. Secrets are returned through a df-share
+   Diffie-Hellman exchange so only the requesting client can read them.
+4. **Replication.** Any mutation commits the store and the session pushes that
+   commit to the configured remotes, into this install's vault repository
+   (`<folder>/<vault_id>.git`); ciphertext only.
 
 ---
 
@@ -183,7 +187,10 @@ remote caller may never create itself an exportable key.
 - **Rust toolchain** and the **Xcode Command Line Tools** (`swiftc`) to build the
   `hot_cheese` binary — the Secure Enclave bridge is a small Swift shim compiled and
   linked at build time.
-- **`rsync`** and **`ssh`** on the host (for backups and the bootstrap ritual).
+- **`git`**, **`rsync`** and **`ssh`** on the host — `git` for backups, `rsync` for
+  bundle sync, `ssh` for both and for the bootstrap ritual. The **backup host** now
+  needs `git` where it used to need `rsync`; a host that has only `rsync` can no
+  longer take backups.
 - The Secure Enclave KEK needs **no code signing, Team ID, entitlements, or Apple
   Developer Program** — a plain `cargo build --release` works. It only requires that the
   daemon run in your **active GUI login session** (Touch ID can't fire under pure
@@ -371,10 +378,27 @@ read [Key uses](#key-uses) before you create a key some service is going to fetc
 hot_cheese serve
 ```
 
-Binds HTTPS on `127.0.0.1:<port>` (default **5555**). If the local store is empty
-and a backup remote is configured, `serve` auto-pulls the store first — this
-install's [vault](#vaults-several-installs-one-backup-folder), or the remote's only
-vault when there is no local keyring to name one.
+Binds HTTPS on `127.0.0.1:<port>` (default **5555**), plus one unix socket per
+trusted adapter. If the local store has no `keyring.json` and a backup remote is
+configured, `serve` **clones** the store first — this install's
+[vault](#vaults-several-installs-one-backup-folder), or the remote's only vault
+when there is no local keyring to name one. The clone needs an empty store dir and
+refuses, naming what it found, rather than starting a second history over files
+that are already there.
+
+`serve` holds this install's store claim for its whole life, so it and the
+interactive console cannot run at the same time; the second one refuses at once,
+naming the lock file, and every mutating subcommand (`add`, `generate`, `seal`,
+`enroll`, `migrate`, `backup push|fetch|pull`, `bootstrap-from`, `init --force`)
+does the same rather than writing underneath a live daemon. `address`, `list`,
+`adapters`, `backup status`, `backup list` and every `bundle` verb still work while
+one is running.
+
+Every request that arrives over the network surface — the loopback listener and
+the adapter sockets — prints itself on the daemon's terminal and waits for `y`
+before any unlock. Run it in the foreground where you can answer it. With no
+terminal at all the daemon refuses those requests by type rather than pretending
+somebody said no.
 
 ---
 
@@ -385,16 +409,15 @@ vault when there is no local keyring to name one.
 | `init [--import-cert <pem> --import-key <pem>] [--force]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase, print the cert fingerprint. |
 | `enroll se [--label <s>]` | Enroll this machine's Secure Enclave as a KEK for the same DEK. No code signing, and **no Touch ID prompt** — it needs only the enclave's public key. |
 | `enroll passphrase [--label <s>]` | Enroll an additional recovery passphrase. |
-| `enroll grant` | Create this machine's Secure Enclave **grant-signing** key and pin its public key in `config.toml`. Prompts nothing — no Touch ID, no passphrase. Required before `serve` or `sign`. Losing this key is benign; re-run to recover. |
+| `enroll grant` | Create this machine's Secure Enclave **grant-signing** key and pin its public key in `config.toml`. Prompts nothing — no Touch ID, no passphrase. Required before `serve` or `bundle sign`. Losing this key is benign; re-run to recover. |
 | `add <name> <ethereum\|solana\|bytes> [--use <shareable\|sign-only>]` | Import an existing secret under `name` (read from a hidden prompt). Defaults to `sign-only`. |
 | `generate <evm\|solana> <name> [--use <shareable\|sign-only>]` | Generate a fresh key under `name`. Defaults to `sign-only`. |
 | `address <evm\|solana> <name>` | Print the public address / pubkey of a stored key. |
 | `list` | List stored keystores (with each one's use) and keyring enrollments. Prompts nothing. |
 | `adapters` | Show every trusted adapter: manifest path, pinned vs computed hash, socket path, and the policy-intersection verdict `serve` will act on. Prompts nothing, unlocks nothing. |
 | `seal [<name>\|--all] [--use <shareable\|sign-only>]` | Bind a key's use into its envelope. Tightens only; `--all` binds just the still-unsealed keys. One unlock for the whole batch. |
-| `sign [--file <json>]` | Sign a Safe transaction from a JSON intent (stdin by default). Policy-checked, grant-gated, one Touch ID. Needs `enroll grant`. |
 | `bundle new [--file <json>]` | Start a bundle from a JSON intent; the threshold comes from `bundles/safes.toml`. Refuses a Safe that file does not describe. Prompts nothing. **Pushes.** |
-| `bundle sign <hash> --key <name>` | Sign the bundle with a local key and file the signature under this device's signer address. The **only** bundle verb that prompts — same policy, same grant, same single Touch ID as `sign`. **Pulls, then pushes.** |
+| `bundle sign <hash> --key <name>` | Sign the bundle with a local key and file the signature under this device's signer address. The **only** bundle verb that prompts, and the only human signing verb there is: policy-checked, grant-gated, one Touch ID. Needs `enroll grant`. **Pulls, then pushes.** |
 | `bundle status <hash>` | Merged view: signatures collected vs threshold, which owners are still missing, rivals, packed length, age. Prompts nothing. **Pulls.** |
 | `bundle list` | Every bundle, grouped by the `(Safe, chain, nonce)` it competes for, with a loud `RIVAL` line when two digests share one slot. Prompts nothing. **Pulls the whole tree.** |
 | `bundle merge <hash> [--file <path>]` | Union an external bundle file, a whole bundle directory, or one on stdin into the store. Prompts nothing. **Pushes.** |
@@ -403,16 +426,16 @@ vault when there is no local keyring to name one.
 | `bundle qr <hash>` | Render the transaction as a QR for another device's camera. Prompts nothing. |
 | `bundle rm <hash>` | Retire a bundle on this machine. Deliberately never syncs. |
 | `bundle sync [<hash>]` | Exchange with every enrolled peer, both directions, right now. Rarely needed — the verbs above already do it. |
-| `bundle watch [<hash>]` | Foreground poll loop that reports signatures as they arrive; stops when a named bundle's threshold is met. Ctrl-C ends it. |
 | `bundle peer list` | Every machine on the tailnet, with its MagicDNS name, whether it is online, and whether it is enrolled. |
 | `bundle peer add <name>` | Enroll a tailnet machine, once, after checking it answers and has a bundles dir. Writes `[[bundle_peers]]`. |
 | `bundle peer rm <name>` | Stop syncing with a machine. |
 | `bundle … --no-sync` | Do the verb and touch no peer. Accepted on every bundle verb, anywhere in the line. |
-| `serve` | Run the HTTPS daemon (auto-pulls the store from the first backup remote if absent). Refuses to start without an enrolled grant key matching the `config.toml` pin. |
-| `backup push` | Push the store to every configured remote, under this install's vault id. |
-| `backup pull [--vault <id>]` | Pull one vault from the first configured remote. Defaults to this install's own vault id. |
+| `serve` | Run the HTTPS daemon and the adapter sockets (clones the store from the first backup remote when there is no local keyring). Takes this install's store claim, prompts on its own terminal for every request, and refuses to start without an enrolled grant key matching the `config.toml` pin. |
+| `backup status` | Print this install's vault, its local commit, and every configured remote. No network, no write, no claim. |
+| `backup push` | Push this install's commits to every configured remote, under its vault id. Fails only when **every** remote failed. |
+| `backup fetch` | Fetch every remote and fast-forward where the ancestry allows it. Fails with `Diverged` when a remote's history has forked from this one. |
+| `backup pull --force [--vault <id>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. |
 | `backup list` | List the vaults sharing the first remote's folder, flagging this install's. Prompts nothing. |
-| `backup adopt` | Mint a vault id for a keyring written before vault ids existed. |
 | `migrate --old-store <dir> --new-store <dir> [--shareable <name>]…` | Migrate legacy Keychain-master keystores into the envelope format. Everything not named `--shareable` lands `sign_only` (see [MIGRATION.md](./MIGRATION.md)). |
 | `bootstrap-from <user@host>` | Bootstrap this machine's DEK + store from an authority machine over SSH. |
 
@@ -444,7 +467,7 @@ account = "hot_cheese_master"
 store = "~/.config/hot_cheese/store"
 port = 5555
 grant_public_key = "04…"
-bundle_watch_secs = 15
+bundle_watch_secs = 30
 
 [mcp]
 max_pending = 16
@@ -480,10 +503,11 @@ name = "Vendor payouts"
 | `store` | Directory holding the encrypted keystores + `keyring.json` (`~/` is expanded). |
 | `port` | HTTPS listen port (optional; defaults to `5555`). |
 | `grant_public_key` | Uncompressed SEC1 hex (65 bytes, `04`-prefixed) of the Secure Enclave grant key, written by `enroll grant`. **Required to sign**: every signature verifies its grant against this key, and `serve` refuses to start without it (`GrantKeyMissingRunEnrollGrant`) or when the on-disk grant key exports something else (`GrantKeyPinMismatch`). The *pin* is an identity check against a swapped or restored blob — **not** a defence against someone who can write the home dir. |
-| `backup_remotes` | List of `{ host, folder }` rsync targets. `folder` is relative to the remote home dir, and several installs may share one — each replicates into `<folder>/<vault_id>/` (see [Backups](#backups)). |
+| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. A bare IPv6 literal in `host` does not work in scp syntax; use `user@name`. |
 | `adapters` | List of `{ id, manifest, sha256 }` trusted signing adapters. `manifest` resolves under the home dir when relative; `sha256` is the pin the file's bytes must hash to *before* they are parsed. `serve` refuses to start on a mismatch, or when a manifest claims more than the key's policy grants. See [Signing Adapters](#signing-adapters). |
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
-| `bundle_watch_secs` | Seconds between polls in `bundle watch` (optional; defaults to `15`). |
+| `bundle_watch_secs` | Seconds between ticks of the background bundle poller a session runs (optional; defaults to `30`, floored at `5`). The name is kept so an existing `config.toml` is not silently ignored. |
+| `backup_fetch_secs` | Seconds a session waits between backup fetches (optional; defaults to `300`). `0` disables the timer, leaving pushes-after-mutation and the manual verbs; re-enabling it takes a restart. |
 | `mcp.max_pending` | Unsigned bundles the MCP proposal server may leave waiting before it refuses to file another (optional; defaults to `16`). The queue is read by a human, so it is bounded by what a human will read. See [MCP](#mcp-an-agent-proposes-you-sign). |
 | `token` | List of `{ address, chain_id, symbol, decimals, standard }` contracts the approval summary may also render **scaled**: `1.000000 USDC (1000000)` — always both forms, so a wrong `decimals` is bounded by the integer beside it. `address = "0x0…0"` annotates the chain's native `value`. `standard` is `erc20`, `erc721` or `erc1155`; a non-fungible standard must carry `decimals = 0`, because scaling a `tokenId` would render token #42 as `0.000042`. **An unlisted contract is not guessed at** — it renders the raw integer, exactly as it did before the table existed. |
 | `label` | List of `{ address, chain_id, name }` names the approval summary may show **beside** an address: `0x2222… (Vendor payouts)`. The full EIP-55 address is always printed — a name never replaces one, and nothing is ever truncated, because two addresses sharing their leading digits are trivial to grind. `name` is refused at load if it is empty, longer than 32 chars, holds anything but printable ASCII and spaces, holds a parenthesis, or starts with `0x`; a second `token` or `label` for one `(address, chain_id)` is refused too, since it could never fire. |
@@ -496,25 +520,27 @@ rebuild.
 
 ## Server Endpoints
 
-All endpoints are served over pinned HTTPS on loopback. Every key access prompts
-for **Touch ID** (when a Secure Enclave enrollment is in use). Names must match
-`[A-Za-z0-9_]+`. On failure the server returns `500 INTERNAL_SERVER_ERROR`.
+All endpoints are served over pinned HTTPS on loopback. Every endpoint but `/health`
+is a privileged operation: it is printed on the daemon's terminal and answered `y`
+by the operator, and then prompts for **Touch ID** (when a Secure Enclave enrollment
+is in use). Names must match `[A-Za-z0-9_]+`. On failure the server returns
+`500 INTERNAL_SERVER_ERROR`.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/health` | GET | Returns `ok` if the server is running. |
 | `/read/<name>` | GET (with body) | df-share Diffie-Hellman read: the body carries the client's ephemeral public key; the response is the secret encrypted so only that client can decrypt it. Works for both EVM and Solana keys. **Only for a `shareable` key** — see below. |
 | `/sign/<name>` | GET (with body) | Sign a Safe transaction. The body is a JSON intent carrying the `execTransaction` **fields**, never a hash; the response is `{safe_tx_hash, signature, signer}`. Policy-checked and grant-gated — see below. |
-| `/evm_generate/<name>` | GET | Generate a new secp256k1 key, **always `sign_only`**, then best-effort backup push. |
+| `/evm_generate/<name>` | GET | Generate a new secp256k1 key, **always `sign_only`**, then commit the store and push it in the background. |
 | `/evm_address/<name>` | GET | Return the Ethereum address derived from `<name>`. |
-| `/solana_generate/<name>` | GET | Generate a new ed25519 keypair, **always `sign_only`**, then best-effort backup push. |
+| `/solana_generate/<name>` | GET | Generate a new ed25519 keypair, **always `sign_only`**, then commit the store and push it in the background. |
 | `/solana_address/<name>` | GET | Return the Solana pubkey of `<name>`. |
 
 `/read` is the only endpoint that exports a key, and it serves **only** a key sealed
 `shareable`. A `sign_only` (or still-`unsealed`) key answers `500` and the daemon logs
 `Envelope(ExportRefused { key_use: SignOnly })` / `Envelope(NotSealed)`. That decision is
-made from the file's cleartext header **before any unlock**, so a refused export prompts the
-owner for **no biometric at all**. The generate endpoints always mint `sign_only`: a remote
+made from the file's cleartext header **before the approval prompt and before any unlock**, so
+a refused export costs the owner **no approval and no biometric at all**. The generate endpoints always mint `sign_only`: a remote
 caller can never create itself an exportable key. See [Key uses](#key-uses).
 
 > TLS cert-pinning and the df-share Diffie-Hellman transfer are **unchanged** — existing
@@ -560,6 +586,121 @@ ignores one), so there the grant takes its own `LAContext` and you see exactly o
 sheet. That is deliberate: an operator whose enclave *KEK* died can still sign. If biometrics
 are unavailable entirely, the signature fails closed.
 
+### Typed-only admission: the policy declares the shape
+
+**The daemon signs only what it can fully deconstruct, and it deconstructs against a shape the
+POLICY declared — never against a shape the request described about itself.** There is no
+"unknown selector", no `UNDECODED CALL 0x…`, no hex blob for a human to eyeball. Anything that
+cannot be read against a declared shape is a typed refusal, raised before any prompt.
+
+A rule therefore names the **full canonical signature** and the daemon derives the four bytes
+from it, and every declared argument carries its own bound:
+
+```toml
+safe = "0x1111111111111111111111111111111111111111"
+chain_id = 1
+
+[[allow]]
+to = "0x2222222222222222222222222222222222222222"
+max_value = "0"
+operation = "call"
+
+  [[allow.call]]
+  signature = "transfer(address,uint256)"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["0x3333333333333333333333333333333333333333"] } }
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "1000000000", amount_of = "0x2222222222222222222222222222222222222222" } }
+```
+
+`signature` must be the **canonical** spelling — no argument names, no `function` keyword, no
+`uint` alias, no `returns` clause — because the file's SHA-256 is what a grant is bound to and
+one rule set must have one spelling. A non-canonical form is refused at load and the refusal
+prints the text to write instead.
+
+`at` is the argument's position and `name` is the label the human reads beside its value, so
+the words on the approval sheet come from the operator who wrote the policy rather than from a
+table that guessed which standard was meant.
+
+**A field with no rule does not parse.** Every declared position must carry one, and the only
+way to say "no bound" is to type it out:
+
+| `rule` | Applies to | Means |
+| --- | --- | --- |
+| `{ one_of = { addresses = […] } }` | `address` | one of these addresses |
+| `{ max = { max = "…", amount_of = "0x…" } }` | `uintN` | at most this, rendered scaled against `amount_of`'s `[[token]]` decimals |
+| `{ eq = { eq = "…" } }` | `uintN` | exactly this |
+| `{ bool_eq = { eq = true } }` | `bool` | exactly this — what tells an infinite `setApprovalForAll` from a revocation |
+| `{ bytes_eq = { eq = "0x…" } }` | `bytes`, `bytesN` | exactly these bytes |
+| `{ deadline = { within_secs = 1800 } }` | `uintN`, N ≥ 40 | a unix-seconds timestamp no further out than this |
+| `{ enum = { one_of = […] } }` | `string` | one of these strings |
+| `{ each = { max_len = 4, of = … } }` | `T[]`, `T[k]` | every element bounded by `of`, at most `max_len` of them |
+| `"struct"` | a declared EIP-712 struct | bounded by its own `[[typed_data.types]]` block |
+| `"batch"` | `multiSend`'s `bytes` | a packed batch; every entry is matched against the policy in its own right |
+| `"unbounded"` | anything | **deliberately unbounded**, and every approval says so at the head of the sheet |
+
+Rules are **externally tagged** so an unrecognised term inside one is a refusal to load rather
+than a silently dropped field: `{ unbounded = { max = "100" } }` does not parse.
+
+`multiSend` is no longer a hole. Every entry of a batch is matched against the policy — its own
+destination, its own operation, its own native value, its own declared signature and its own
+argument bounds — so a batch whose entries the policy does not cover refuses the whole
+transaction. A malformed packing, more than 32 entries in the tree, or a nest deeper than 2 are
+all refusals now, not display limits.
+
+### EIP-712 typed data
+
+A `[[typed_data]]` block makes an off-chain message signable. The **policy** declares the
+domain and the complete struct schema; a request names the schema and supplies field VALUES and
+nothing else. It carries no `types`, no `primaryType` and no `domain` object — those are not
+fields of the wire type at all, so a body that states one fails to parse at the boundary.
+
+```toml
+[[typed_data]]
+schema = "permit2_usdc"
+primary_type = "PermitSingle"
+
+  [typed_data.domain]
+  name = "Permit2"
+  chain_id = 1
+  verifying_contract = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+
+  [[typed_data.types]]
+  name = "PermitSingle"
+
+    [[typed_data.types.field]]
+    name = "spender"
+    type = "address"
+    rule = { one_of = { addresses = ["0x4444444444444444444444444444444444444444"] } }
+
+    [[typed_data.types.field]]
+    name = "sigDeadline"
+    type = "uint256"
+    rule = { deadline = { within_secs = 1800 } }
+```
+
+A request is `{"kind":"typed_data","key":"…","schema":"permit2_usdc","chain_id":1,
+"verifying_contract":"0x…","message":{…}}`. The echoed `chain_id` and `verifying_contract` must
+equal the declared domain's or it is a refusal, never a re-domaining. The message's field set
+must equal the declared set exactly — an extra key and a missing key are each their own
+refusal — and a `bytesN` value that is not exactly N bytes is refused rather than silently
+padded or truncated.
+
+The message is coerced **once**, and that single value is both what is hashed and what is
+rendered, so the digest signed is the digest read.
+
+EIP-1271 Safe messages are one such declared schema (`SafeMessage(bytes message)` with a
+`chainId`/`verifyingContract`-only domain), not special-cased code. There is **no multi-device
+signature collection for typed data**: a bundle carries a Safe transaction by type, so a typed
+message yields one signature from one device. That is useful on a 1-of-N Safe or for a contract
+checking a single signer, and nothing more.
+
 ---
 
 ## Signing Adapters
@@ -579,7 +720,7 @@ Each adapter gets:
 | a **route table** | `/health` and `/sign/<KEY>`. That is the whole table |
 | **provenance** | taken from the listener that accepted the connection, never from the request |
 
-Adapters live in the **home dir, not the store**. The store is rsynced to backup hosts and
+Adapters live in the **home dir, not the store**. The store is pushed to backup hosts and
 replicated by `bootstrap-from`; adapter trust is per-machine local config and must not travel.
 A bootstrapped machine therefore starts with **no adapters at all**, which is the correct
 fail-closed default.
@@ -598,16 +739,41 @@ safes = ["0x1111111111111111111111111111111111111111"]
 
 [[grants.calls]]
 to = "0x2222222222222222222222222222222222222222"
-selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
+
+  [[grants.calls.call]]
+  signature = "transfer(address,uint256)"
+
+    [[grants.calls.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["0x3333333333333333333333333333333333333333"] } }
+
+    [[grants.calls.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "1000000000", amount_of = "0x2222222222222222222222222222222222222222" } }
 ```
 
 `[[grants.calls]]` is the **same rule language** `policies/<KEY>.toml` uses — the same
-`AllowRule` type, not a second dialect. Every struct in the schema is
-`deny_unknown_fields`: a term the daemon does not implement is a **refusal to load**, never a
-silently dropped field. (That now holds for `[[allow]]` rules in a policy file too, since it
-is the same type.)
+`AllowRule` type, not a second dialect. A rule declares the **full canonical signature** and
+the daemon derives the 4-byte selector from it, so anything a manifest or a policy permits is
+decodable by construction. Every struct in the schema is `deny_unknown_fields`, and
+`FieldRule` is externally tagged for the same reason: a term the daemon does not implement is
+a **refusal to load**, never a silently dropped field.
+
+A grant may also name EIP-712 schemas:
+
+```toml
+[[grants]]
+key = "TREASURY"
+intent_kinds = ["safe_tx", "typed_data"]
+typed_data = ["permit2_usdc"]
+```
+
+`intent_kinds` gates the shape and `typed_data` gates which of the policy's `[[typed_data]]`
+blocks this adapter may name. Both are needed; the schema's contents are always the policy's.
 
 Pin it in `config.toml`, and point `serve` at it:
 
@@ -633,9 +799,15 @@ provenance. At `serve` startup, for every grant:
 | `grants.safes` ⊆ `{policy.safe}` | `Widens { source: Safe { safe } }` |
 | `grants.chain_ids` ⊆ `{policy.chain_id}` | `Widens { source: Chain { chain_id } }` |
 | every `grants.calls` rule has a policy `allow` rule with the same `to` **and** `operation` | `Widens { source: Call { to, operation } }` |
-| policy rule's `selectors` ⊇ the grant's | `Widens { source: Selector { to, selector } }` |
+| every grant `signature` appears verbatim in the policy rule, compared as **canonical text** | `Widens { source: Signature { to, signature } }` |
+| every grant argument rule is no wider than the policy's at that position | `Widens { source: Arg { to, signature, at } }` |
+| `grants.typed_data` ⊆ the policy's declared schema names | `Widens { source: Schema { schema } }` |
 | policy rule's `max_value` ≥ the grant's | `Widens { source: MaxValue { to, max_value } }` |
 | no `grants.calls` rule targets the Safe itself | `Widens { source: OwnerManagement { safe } }` |
+
+The signature comparison is on the canonical **text**, not on the four bytes. Two different
+signatures can be ground to share a selector, and a manifest is the lower-trust file: comparing
+selectors would let it declare a *different* call under a permitted one.
 
 Every refusal names the **adapter**, the **key** and the offending rule, and it stops the
 daemon from starting. Refusing loudly beats silently intersecting: a manifest broader than
@@ -679,9 +851,18 @@ connect means another daemon is live, so this one **refuses to start**; only `EC
 proves the file outlived its process, and only then is it unlinked. Nothing is ever
 blind-unlinked. A clean exit unlinks its own sockets.
 
-Adapter sockets belong to **`hot_cheese serve`**. The interactive console binds a
-kernel-chosen loopback port for the lifetime of its session and opens no adapter sockets, so
-a console session and a serving daemon never contend for the same path.
+Both front ends bind the adapter sockets: they are the same runtime with a different way of
+asking the operator. The interactive console binds a **kernel-chosen** loopback port instead of
+`config.port`, because its listener is reached only through tunnels it opens itself and hands
+`ssh` the real port at that moment — so an `ssh -R` that outlived an earlier session points at
+a port nothing will be holding. `serve` takes the documented port, because its clients have to
+find it.
+
+A console session and a serving daemon therefore **cannot** run at the same time: the second
+one refuses immediately with the store claim's typed error naming `<home>/.store.lock`, rather
+than half-binding a set of adapter sockets. A passphrase-unlocked console binds nothing at all
+— no listener and no adapter socket — because a session with no per-request biometric may not
+answer a request either.
 
 ```bash
 hot_cheese adapters
@@ -755,9 +936,10 @@ one transaction collects them.
 
 **The key daemon is not involved.** A bundle is the transaction's *fields* plus signatures
 over a digest anyone can recompute. There is no secret in it, no new endpoint, no new
-listener, and no change to what `serve` exposes. `bundle sign` reaches the key through the
-same call `hot_cheese sign` does — one policy check, one grant, one Touch ID — and every
-other verb prompts nothing and unlocks nothing.
+listener, and no change to what `serve` exposes. `bundle sign` reaches the key through
+`HotApi::sign_typed` and `hc_sign::sign::prepare` — the same policy check, the same grant and
+the same single Touch ID that `/sign/<name>` pays — and every other verb prompts nothing and
+unlocks nothing.
 
 ### Layout
 
@@ -883,13 +1065,21 @@ path it tried. A backend that is not `Running` is a refusal naming the state —
 
 | Direction | Verbs |
 | --- | --- |
-| Pull first | `status`, `export`, `list`, `watch`, `sign` (so a machine that has never seen the bundle can still be asked to sign it) |
+| Pull first | `status`, `export`, `list`, `sign` (so a machine that has never seen the bundle can still be asked to sign it) |
 | Push after | `new`, `sign`, `merge`, `add-sig` |
 | Both, on demand | `sync` |
 | Never | `rm` (a pull would resurrect it), `qr` |
 
-Every verb that names a hash syncs **only that directory**; `list`, `sync` and a bare `watch` move
-the whole tree. `--no-sync` suppresses it anywhere on the line.
+Every verb that names a hash syncs **only that directory**; `list` and `sync` move the whole
+tree. `--no-sync` suppresses it anywhere on the line.
+
+**Enrolment has to be mutual.** A session pulls from every peer and pushes back **only** the
+bundles this device itself wrote into — it is deliberately not a relay, so nothing a peer sent us
+is ever redistributed unattended. Signatures converge because every machine pulls from every
+machine, which means a one-sided `peer add` is a one-way street: A's signatures reach B, B's never
+reach A. Run `bundle peer add` on **both** machines. `bundle peer list` shows each side's own
+enrolment; nothing can check the other side's without asking it, and asking is a wire protocol
+this design does not have.
 
 Sync is **best-effort and non-fatal**: an asleep laptop produces a warning and the command
 succeeds. `bundle sign` on the desktop cannot be broken by the MacBook being shut. ssh runs with
@@ -948,20 +1138,30 @@ in each `<safeTxHash>/` directory must:
 4. hash, from its own fields, to the **directory it sits in** — `Digest`;
 5. ecrecover every signature to the address that signature claims, with no two contradicting
    signatures from one signer — `Signature`;
-6. carry **only** the signer its filename names, and none at all in `unsigned.json` — `Misfiled`.
+6. carry **only** the signer its filename names, and none at all in `unsigned.json` — `Misfiled`;
+7. carry **at most one** signature, which is all any writer here produces — `Stuffed`. This is
+   checked *before* the ecrecover loop, so one file cannot cost 300 recoveries by repeating a
+   valid signature.
 
 A file that fails is **moved**, never deleted, to `$HOT_CHEESE_HOME/bundle-quarantine/<hash>/`,
-which is outside `bundles/` so nothing quarantined is ever synced back out. Every rule is one this
-machine's own writes satisfy by construction, so **quarantine can never eat your own signature**,
-whatever a peer floods the directory with.
+which is outside `bundles/` so nothing quarantined is ever synced back out. Every rule above is
+one this machine's own writes satisfy by construction, so **quarantine can never eat your own
+signature** on any of them.
 
-Two caps bound the work rather than the correctness: a directory holding more than **64** files is
-reported as `CROWDED` (nothing is moved — those signatures are individually valid, and `export`
-already refuses a signer `safes.toml` does not list), and a pass stops after **4096** files and
-says it stopped. A bundle directory that still will not load is skipped with a warning instead of
-taking `bundle list` down with it.
+The caps then bound the work. A pass **judges** at most **4096** files — the ones whose local
+identity (inode, ctime, length) moved since the last pass, so an unchanged file costs an `open`
+and an `fstat` and nothing else — and leaves the rest to the next pass rather than never judging
+them. A directory holding more than **64** files keeps 64 (`unsigned.json` first, then what has
+already been judged, then name order) and the overflow is **moved to quarantine, not deleted**:
+this is the one rule that can catch a valid local signature no pass has judged yet, which is
+exactly why it is reversible. A **65th bundle directory that arrives** is removed whole; one that
+was already here, or one this device wrote into, never is. The quarantine tree itself stops at
+**1024** files, past which a rejected file is deleted instead — except for the two rules a local
+file could trip, which are left in place.
 
-**A hostile peer can therefore waste disk, and nothing else.**
+**A hostile peer can therefore waste bounded disk, and nothing else.** Bandwidth is not bounded:
+nothing tells rsync "never fetch this path again", so a peer that re-sends what we quarantined
+re-sends it every tick until the backoff engages.
 
 **The security lives at the signer, not on the wire.** Every device independently:
 
@@ -981,15 +1181,23 @@ and your signature. Read the destination and the amount on the prompt, every tim
 
 ### Waiting on a co-signer
 
-```bash
-hot_cheese bundle watch 0x44ae…87b5    # polls the peers, prints each signature as it lands
-```
+Nothing to run. `hot_cheese` and `hot_cheese serve` both carry a background poller on their own
+thread: every `bundle_watch_secs` (30 by default) it pulls the whole tree from each enrolled peer
+in turn, judges only the files that pull actually changed, and pushes back the bundles this device
+wrote into. The console's bundle list shows what it last found — how many bundles are here, how
+many have met their threshold, how many peers answered, how long ago, and what was quarantined —
+and every bundle's own row still shows `met` when it is ready.
 
-A **foreground** loop on `bundle_watch_secs` (15 by default). It pulls, validates, and reports
-only what was not there at the previous poll; naming a hash makes it stop as soon as that
-bundle's threshold is met. Ctrl-C ends it, and takes any `rsync` it happened to be running down
-with it — nothing is backgrounded, nothing is spawned, nothing is left behind. Omit the hash to
-watch the whole tree until you stop it.
+A peer is an untrusted writer, and a poller makes that continuous rather than occasional, so the
+caps are enforced rather than reported: 64 KiB per file, 64 files per bundle directory (the
+overflow is **moved to `bundle-quarantine`**, never deleted), 64 bundle directories — one that
+*arrives* past the cap is removed, one that was already here is never touched — 1024 files in the
+quarantine tree, one signature per per-signer file, and 4096 files judged per tick, with the rest
+left to the next tick. A peer that trips those is skipped for a doubling number of ticks, up to
+32, which self-clears; it stays enrolled, and the console says why it went quiet.
+
+With no session running there is no poller: `hot_cheese bundle sync` remains the scriptable
+one-shot exchange, and `bundle list` / `bundle status` still pull for themselves.
 
 ---
 
@@ -1044,7 +1252,7 @@ Logs go to **stderr**, because stdout is the protocol.
 | Tool | Writes? | What it does |
 | --- | --- | --- |
 | `list_safes` | no | Every Safe from `bundles/safes.toml`: address, chain, threshold, owners. |
-| `list_signing_keys` | no | Every key's **policy**: pinned Safe and chain, allowed destinations and selectors, value ceilings, owner-rotation flag, whether refunds are opted in. |
+| `list_signing_keys` | no | Every key's **policy**: pinned Safe and chain, allowed destinations and the full canonical signatures permitted at each, value ceilings, owner-rotation flag, declared EIP-712 schema names, whether refunds are opted in. |
 | `list_bundles` | no | Every proposal waiting, grouped by the `(Safe, chain, nonce)` slot it competes for, rival slots flagged. This is how the agent picks a free nonce. |
 | `bundle_status` | no | One proposal in full, plus the decoded summary the approval prompt will show. |
 | `preview_erc20_transfer` | **no** | The verdict without a write: `safeTxHash`, decoded summary, `allowed` or the exact typed refusal with its offending values, whether the Safe is known, whether the nonce is taken. |
@@ -1101,8 +1309,10 @@ a replacement for it: if a policy ever has a gap, the agent no longer has a way 
 exotic transaction that would walk through it.
 
 **The library stays general.** `SafeTxIntent`, `hc_bundle::new`, `hc_sign::sign::prepare` and the
-whole CLI and console path are unchanged and still carry any Safe transaction — you can still
-sign a delegatecall by hand. Only the *MCP surface* is narrow.
+whole CLI and console path are unchanged and still carry any Safe transaction the policy
+declares a shape for — a delegatecall included. Only the *MCP surface* is narrow. What bounds
+every path equally is [typed-only admission](#typed-only-admission-the-policy-declares-the-shape):
+the daemon signs nothing it cannot deconstruct against a declared signature.
 
 **Extending it:** a new supported transaction shape gets its **own tool** with its own
 constrained arguments — `propose_erc20_approve`, say, or `propose_safe_owner_swap`. Never widen
@@ -1141,7 +1351,7 @@ constructible, the field does not exist on the tool, or the verb does not exist 
 
 - **Describe any transaction but an ERC-20 transfer.** No calldata field, no `operation` field,
   no `value` field, no refund fields, no `to` field. See [the narrow schema](#the-narrow-schema).
-- **Sign anything.** No `sign`, no `collect`, no `merge`. The daemon is not a dependency.
+- **Sign anything.** No `bundle sign`, no `collect`, no `merge`. The daemon is not a dependency.
 - **Read or derive a key.** No `/read`, no key export, and deliberately **no key addresses in
   `list_signing_keys`** — deriving one decrypts a keystore and would prompt *you* for Touch ID,
   so an agent in a loop could spam a human. Owner addresses come from `list_safes`, a plain TOML
@@ -1161,11 +1371,15 @@ one thing: **a row in your review queue, and that row is an ERC-20 transfer.** T
 blast radius, and it is not zero:
 
 - It can propose a transfer that is *within policy* but not what you wanted — the wrong
-  recipient, or the right recipient and far too many base units. The policy bounds the token and
-  the selector; it does not know your intent, and it does not cap the amount. **The decoded
-  summary on the approval prompt is the only thing that catches this**, which is why it renders
-  the actual arguments — `transfer(to=0x…, amount=…)` — and flags `⚠ UNLIMITED` and `⚠ HUGE`
-  amounts in the first three lines. Read it, every time, and read the amount as base units.
+  recipient, or the right recipient and far too many base units. The policy bounds the token, the
+  declared signature and whatever each argument rule says; it does not know your intent. A
+  `one_of` on the recipient and a `max` on the amount are what turn "within policy" into
+  something narrow, and an argument left `"unbounded"` puts the whole weight back on you.
+  **The decoded summary on the approval prompt is the last thing that catches this**, which is
+  why it renders the actual arguments under the names you gave them —
+  `transfer(to=0x…, amount=…)` — leads with `⚠ UNBOUNDED FIELD` for anything the policy did not
+  bound, and flags `⚠ UNLIMITED` and `⚠ HUGE` amounts in the first three lines. Read it, every
+  time, and read the amount as base units.
 - It can fill the queue up to `max_pending`, which is noise, not loss.
 - It can claim a nonce, which the rival guard makes visible rather than silent.
 
@@ -1231,17 +1445,41 @@ only ever sees ciphertext and `keyring.json` (which holds the DEK only in wrappe
 form). Only the **store dir** is synced; the certs/keys under the home dir are
 deliberately never replicated.
 
-Backups are automated:
+**The store is a git repository.** `<store>/.git` holds the history, the branch is
+always `main`, and `<store>/.git/info/exclude` keeps a half-written `*.hctmp` out of
+it. There is no `.gitignore` and there are no named remotes: `config.toml` is the
+only place a backup target is written down.
 
-- **After every mutation** — `add`, `generate`, `seal`, `migrate`, and the HTTP
-  `/evm_generate` / `/solana_generate` endpoints trigger a best-effort `rsync`
-  push to every configured remote. Failures are logged, not fatal.
-- **On `serve`** — if the local store is absent, it is auto-pulled from the first
-  configured remote before the daemon starts.
-- **Manually** — `hot_cheese backup push` (all remotes) and
-  `hot_cheese backup pull` (first remote).
+Backups are automatic:
+
+- **After every mutation** — `init`, `add`, `generate`, `seal`, `enroll`, `migrate`
+  and the HTTP `/evm_generate` / `/solana_generate` endpoints commit the store. A
+  failed **commit** is an error you see; a failed **push** is a warning the status
+  carries. A mutation that changed nothing commits nothing.
+- **Pushing** — a session coalesces commits and pushes in the background; a
+  subcommand run with no daemon pushes before it returns. Every remote is attempted,
+  and only *all* of them failing is an error.
+- **Fetching** — a session fetches every `backup_fetch_secs` (default 300) and
+  applies what it finds **only when it is a fast-forward**.
+- **Divergence** — when both sides have moved, nothing is merged, nothing is pushed
+  and nothing is deleted. It is a reported state, and only
+  `hot_cheese backup pull --force` resolves it.
+- **On `serve`** — if the store has no `keyring.json`, it is **cloned** from the
+  first configured remote before the daemon starts.
+- **Manually** — `backup status`, `backup push`, `backup fetch`,
+  `backup pull --force`.
 
 Configure targets in `backup_remotes` (see [Configuration](#configuration)).
+
+**History is forever, and now replicated.** Every version of every keystore stays in
+the history on every remote; a key removed from the store is still recoverable from
+any clone. Under the old rsync backup a deleted keystore also survived on the remote,
+so this is not new — but it is now permanent and distributed, and
+`receive.denyNonFastForwards` on the remote deliberately forbids rewriting it away.
+
+**This upgrade is one-way per machine.** Rolling a machine back to a pre-git build
+would rsync the whole `.git` into the old plain folder and then commit whatever rsync
+landed. Nothing in either binary detects the mismatch.
 
 ### Vaults: several installs, one backup folder
 
@@ -1250,12 +1488,18 @@ minted by `init`, stored **in cleartext** in `keyring.json`. It is a label, not 
 secret: a push reads it without unlocking anything, so replication never prompts
 for Touch ID or a passphrase.
 
-Every install replicates into its **own subtree**:
+Every install pushes to its **own bare repository**:
 
 ```
-rsync -az <store>/ <host>:~/<folder>/<vault_id>/     # push
-rsync -az <host>:~/<folder>/<vault_id>/ <store>/     # pull
+git push  <host>:<folder>/<vault_id>.git refs/heads/main:refs/heads/main   # push
+git fetch <host>:<folder>/<vault_id>.git refs/heads/main                   # fetch
 ```
+
+The repository is created on first contact with
+`git init --bare`, its `HEAD` is pointed at `main` so a plain `git clone` of it
+checks something out, and `receive.denyNonFastForwards` plus `receive.denyDeletes`
+are set on it so no push from this code — or from a future bug in it — can rewrite
+or delete the backup.
 
 So a desktop and a laptop holding **different** multisig signer keys (different
 DEKs, deliberately) can point at the same `host` + `folder` and never clobber each
@@ -1265,16 +1509,23 @@ both machines replicate into the same subtree.
 
 | Command | What it does |
 | --- | --- |
+| `backup status` | Print this install's vault, its local commit and every configured remote. No network, no write, no store claim. |
 | `backup list` | List the vault ids sharing the first remote's folder, flagging which one is this install's. Prompts nothing, unlocks nothing. |
-| `backup pull --vault <id>` | Pull a named vault — disaster recovery onto a bare machine, where all you have is the recovery passphrase and the remote. |
-| `backup adopt` | Mint a vault id for a pre-vault keyring (see below). |
+| `backup pull --force --vault <id>` | Take a named vault — disaster recovery onto a bare machine, where all you have is the recovery passphrase and the remote. |
 
-**A pull only ever lands the vault you asked for.** Before rsync runs, a pull into
-a store whose `keyring.json` names a *different* vault is refused; after rsync, the
-pulled `keyring.json` must carry the requested id or the command fails naming both.
-`rsync -az` carries no `--delete`, so a mixed pull would merge, leaving keystores
-this install's DEK cannot open — refusing is safer than deleting, and no `--delete`
-is ever added.
+**A pull only ever lands the vault you asked for.** A pull into a store whose
+`keyring.json` names a *different* vault is refused before anything is fetched, and
+the **remote's** `keyring.json` is then read straight out of the fetched objects and
+checked before a single file in the worktree is touched. That is strictly stronger
+than the old rsync guard, which could only re-check after it had already overwritten
+the local keyring.
+
+**`backup pull --force` is the one command here that can destroy key material.** It
+resets the worktree to the remote's commit and cleans up after itself, so a keystore
+generated on this machine and never pushed is **deleted**. It therefore names every
+such file and its count first, and without `--force` it prints that list and does
+nothing else. The discarded commits are still in the local reflog and object store
+until git garbage-collects them.
 
 Restoring a vault onto a bare machine therefore starts from an **empty store**. You
 still need a `config.toml` naming the remote, and `init` writes one — along with a
@@ -1285,31 +1536,43 @@ hot_cheese init                          # config.toml + TLS cert (and a throwaw
 $EDITOR ~/.config/hot_cheese/config.toml # add the [[backup_remotes]] entry
 rm -rf ~/.config/hot_cheese/store        # drop the just-minted keyring: different vault
 hot_cheese backup list                   # which vaults are on the remote?
-hot_cheese backup pull --vault v_…       # then unlock with the recovery passphrase
+hot_cheese backup pull --force --vault v_…  # then unlock with the recovery passphrase
 ```
 
 Only run that `rm -rf` on a machine whose store holds nothing you need — here it
 contains one keyring that encrypts nothing. Skip `init` entirely if you would rather
 write `config.toml` and the cert by hand.
 
-`serve`'s auto-pull uses this install's vault id. On a machine with **no store at
-all** it cannot know its id: it adopts the remote's vault if there is exactly one,
-and refuses when there are several, listing them so you can run
-`backup pull --vault <id>`. It never guesses.
+`serve`'s clone uses this install's vault id. On a machine with **no keyring at all**
+it cannot know its id: it takes the remote's vault if there is exactly one, and
+refuses when there are several, listing them so you can run
+`backup pull --force --vault <id>`. It never guesses. The clone also refuses when the
+store dir is not empty, naming what it found, rather than starting a second history
+on top of files that are already there.
 
 **A fresh `init` mints a new DEK *and* a new vault id.** It therefore lands *beside*
-the previous backup — `<folder>/<new_id>/` — instead of overwriting a vault whose
-keys you may still need. The old subtree stays exactly where it was; delete it
+the previous backup — `<folder>/<new_id>.git` — instead of overwriting a vault whose
+keys you may still need. The old repository stays exactly where it was; delete it
 yourself once you are sure.
 
-**Keyrings written before vault ids** (i.e. an existing `~/.config/hot_cheese/store`)
-keep working untouched: they have no id, and they push and pull the un-namespaced
-`<host>:~/<folder>/` exactly as before. Nothing mints an id behind your back — run
-`hot_cheese backup adopt` when you want one. After adopting, backups move to
-`<folder>/<vault_id>/`; the old un-namespaced copy is left alone at the folder root.
-One caveat while you stay un-namespaced: pulling the folder root pulls *everything*
-under it, including any sibling `v_…/` vault directories (inert locally — they are
-directories, and only files are read as keystores). Adopt an id and that stops.
+**Keyrings written before vault ids** get one **automatically**, the first time this
+version opens the store. There is no un-namespaced git layout to keep, so there is
+nothing to opt into and `backup adopt` is gone.
+
+**An older rsync backup is left alone, not migrated.** The bare repository is
+`<folder>/<vault_id>.git`, a different path from the old `<folder>/<vault_id>/`, so
+the two sit side by side and the old directory becomes a stale last-known-good copy
+the moment this version first pushes. Nothing deletes it and nothing reports its age;
+delete it yourself once you are satisfied. While a fleet is **half** upgraded the two
+paths mean the machines no longer see each other's keys — `backup list` flags a plain
+`<vault_id>` directory beside our repository for exactly that reason.
+
+**Two machines sharing one vault will diverge on first git contact.** `bootstrap-from`
+gives B the same DEK and the same vault id, and under rsync both merged into one
+subtree. Under git they start unrelated histories and the second push is refused as a
+non-fast-forward. Resolve it once, by hand, with `backup pull --force` on whichever
+machine's store is stale. Nothing auto-heals this, because the auto-heal would be the
+silent overwrite the whole design refuses.
 
 **Still never backed up:** the TLS cert/key (`ssl-cert.pem`, `ssl-key.pem`) and
 `config.toml`. Only the store dir is replicated. Re-`init` or hand-copy those.
@@ -1368,6 +1631,28 @@ key your services still read. Read [Key uses](#key-uses) first.
 This is a non-destructive, verify-before-finalize cutover with a dual-run and
 rollback plan. **Do not** improvise it — follow the full runbook in
 **[MIGRATION.md](./MIGRATION.md)**.
+
+### Policy files written before typed-only admission
+
+**Every policy file still carrying `selectors = [...]` refuses to load**, and nothing is
+auto-converted: a 4-byte selector is a keccak image with no preimage, so a table-driven
+conversion would silently fail to convert every selector not in the table and produce a policy
+narrower than the file says. `AllowRule` is `deny_unknown_fields` and has no `selectors` field,
+so `toml::from_str` fails with an unknown-key error naming `selectors` and its line and column,
+inside `PolicyErr::Toml`.
+
+That is fail-closed and it reaches startup: `serve` loads every policy named by an adapter
+grant before it binds anything, so on a machine with a pinned adapter the daemon **refuses to
+start** until every such policy is converted.
+[MIGRATION.md §6c](./MIGRATION.md) carries the conversion table for the nineteen signatures the
+old decoder knew, and `docs/plans/06-typed-admission.md` records why nothing is converted for
+you. Any selector not in that table names a call this daemon could never decode; write its real
+signature from the contract's ABI and it becomes both decodable and constrainable.
+
+**Still not expressible: a bare ETH transfer from the Safe.** An `[[allow]]` rule has no way to
+permit a call with no selector, and the policy layer refuses one (`NoSelector`) before any
+prompt. That predates this change and is unchanged by it — widening the policy language under
+cover of a change about narrowing is how mistakes ship.
 
 ---
 

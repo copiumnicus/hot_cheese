@@ -57,12 +57,11 @@ pub struct TunnelManager {
     next_id: AtomicU64,
 }
 
-/// An `ssh` reverse forward into a loopback port of this machine that this console did not
-/// open: what a session killed before its teardown leaves pointed at whoever binds that port
-/// next.
+/// A reverse forward into a loopback port of this machine that this session did not open:
+/// what a session killed before its teardown leaves pointed at whoever binds that port next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StrandedTunnel {
-    /// Pid of the surviving `ssh`.
+    /// Pid of the surviving forwarder.
     pub pid: u32,
     /// The argv the process table reports for it.
     pub argv: String,
@@ -118,8 +117,10 @@ pub fn validate_target(target: &str) -> Result<(), TunnelErr> {
     Ok(())
 }
 
-/// Every `ssh` in `ps_output` that reverse-forwards a remote port into `local_port` on this
-/// machine's loopback. Lines are `pid=,args=`: the pid, a space, then the argv.
+/// Every process in `ps_output` that reverse-forwards a remote port into `local_port` on this
+/// machine's loopback. Lines are `pid=,args=`: the pid, a space, then the argv. The program name
+/// is not consulted: `autossh`, `socat` and any hand-rolled forwarder hold the same forward as
+/// `ssh` does, and the `-R` shape is what makes a line a forward.
 pub fn stranded_tunnels(ps_output: &str, local_port: u16) -> Vec<StrandedTunnel> {
     let mut found = Vec::new();
     for line in ps_output.lines() {
@@ -130,9 +131,6 @@ pub fn stranded_tunnels(ps_output: &str, local_port: u16) -> Vec<StrandedTunnel>
             continue;
         };
         let mut tokens = argv.split_whitespace();
-        if tokens.next().and_then(|p| p.rsplit('/').next()) != Some("ssh") {
-            continue;
-        }
         while let Some(token) = tokens.next() {
             let Some(attached) = token.strip_prefix("-R") else {
                 continue;
@@ -160,10 +158,13 @@ pub fn stranded_tunnels(ps_output: &str, local_port: u16) -> Vec<StrandedTunnel>
     found
 }
 
-/// Ask the process table which `ssh` processes already forward into `local_port`.
+/// Ask the process table which processes already forward into `local_port`. Best effort: `ps`
+/// hides another uid's argv, this runs once at startup, and a forward established from the
+/// remote side is invisible here. `-ww` is load-bearing — without it BSD `ps` cuts every line at
+/// 79 columns and the `-R` token of a real tunnel sits past column 90.
 pub fn scan_stranded(local_port: u16) -> Result<Vec<StrandedTunnel>, TunnelErr> {
     let ps = Command::new("/bin/ps")
-        .args(["-axo", "pid=,args="])
+        .args(["-ww", "-axo", "pid=,args="])
         .output()?;
     if !ps.status.success() {
         return Err(TunnelErr::ProcessTable { status: ps.status });
@@ -349,8 +350,8 @@ mod tests {
 
     /// A tunnel that survived its console re-attaches to whoever binds its local port next,
     /// invisibly. Detection has to read the forward's DESTINATION out of every `-R` shape
-    /// (attached or separate argument, with or without a remote bind address) and ignore
-    /// forwards into other ports, `-L` forwards, and processes that are not `ssh`.
+    /// (attached or separate argument, with or without a remote bind address), ignore forwards
+    /// into other ports and `-L` forwards, and catch a forwarder that is not `ssh`.
     #[test]
     fn stranded_scan_finds_reverse_forwards_into_our_port() {
         let ps = concat!(
@@ -362,15 +363,50 @@ mod tests {
             "  205 ssh -N -R 7777:localhost:9999 ops@e\n",
             "  206 ssh -N -L 7777:localhost:51234 ops@f\n",
             "  207 ssh -N -R 7777:otherhost:51234 ops@g\n",
-            "  208 notssh -N -R 7777:localhost:51234 ops@h\n",
+            "  208 autossh -N -R 7777:localhost:51234 ops@h\n",
             "  209 ssh ops@i\n",
         );
         let mut pids = Vec::new();
         for tunnel in stranded_tunnels(ps, 51234) {
             pids.push(tunnel.pid);
         }
-        assert_eq!(pids, vec![201, 202, 203, 204]);
+        assert_eq!(pids, vec![201, 202, 203, 204, 208]);
         assert!(stranded_tunnels(ps, 51236).is_empty());
+    }
+
+    /// The synthetic case above feeds `stranded_tunnels` a string, so it can never catch the
+    /// defect that made the whole scan useless: BSD `ps` wraps at 79 columns when stdout is not
+    /// a tty, and [`ssh_reverse_args`] puts `-R` past column 90. This drives the REAL `ps` over
+    /// a live process wearing that exact argv.
+    #[test]
+    fn the_real_process_table_is_read_wide_enough_to_show_the_forward() {
+        const LOCAL_PORT: u16 = 51237;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30")
+            .args(ssh_reverse_args(&spec(LOCAL_PORT)));
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a process wearing an ssh reverse-tunnel argv");
+
+        let mut seen = false;
+        for _ in 0..100 {
+            if scan_stranded(LOCAL_PORT)
+                .expect("read the process table")
+                .iter()
+                .any(|t| t.pid == child.id())
+            {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "a live forward into {LOCAL_PORT} must be found");
     }
 
     fn spec(local_port: u16) -> TunnelSpec {

@@ -1,22 +1,23 @@
 //! The arrow-key menu tree: one [`super::pick::pick`] list per screen, redrawn rather than
 //! streamed. The prompts that are not a list — a line of text, a number, a masked secret, a
 //! yes/no — stay on inquire, so [`nav`] and [`MenuErr::Inquire`] stay with them.
-use super::approval::{self, ApprovalErr, ConsoleApprover, Drained};
-use super::exposure::{TunnelId, TunnelSpec};
+use super::approval::{self, ApprovalErr, Drained};
 use super::pick::{pick, Filter, Pick};
-use super::{bundles, readtest, status, Console, Serving, UnlockGate};
+use super::{bundles, readtest, status, Console};
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType};
 use err_mac::create_err_with_impls;
 use hc_core::crypto::envelope::{encrypt_file, read_keystore, Dek, KeyUse};
+use hc_core::is_valid_string_name;
 use hc_core::keyring::{EnrollParams, Keyring};
 use hc_core::mac::secure_enclave::{ensure_se_key, SE_KEY_LABEL};
 use hc_core::mac::MacBackend;
 use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
-use hc_core::{is_valid_string_name, resolve_path};
-use hc_daemon::backup;
-use hc_daemon::{OpContext, Operation, Peer};
-use hc_sign::intent::Intent;
+use hc_daemon::exposure::{TunnelId, TunnelSpec};
+use hc_daemon::git_store;
+use hc_daemon::live::Live;
+use hc_daemon::runtime::{Runtime, Serving, UnlockGate};
+use hc_daemon::{OpContext, Operation};
 use inquire::{Confirm, CustomType, InquireError, Password, PasswordDisplayMode, Text};
 use std::fmt;
 use std::io::Write;
@@ -40,23 +41,24 @@ create_err_with_impls!(
     NotServing,
     NoKeystores,
     NoTunnels,
-    NoBackupRemote,
     NoDiscoveredPeers,
     NoEnrolledPeers,
     BadHexSecret,
     ReadTestTimedOut,
     Inquire(inquire::InquireError),
-    Tunnel(super::exposure::TunnelErr),
+    Tunnel(hc_daemon::exposure::TunnelErr),
     Approval(super::approval::ApprovalErr),
     ReadTest(super::readtest::ReadTestErr),
     ApiBackend(hc_daemon::ApiBackendErr),
     Bundle(hc_bundle::BundleErr),
+    BundlePoll(hc_bundle::poll::PollErr),
     BundleSync(hc_bundle::sync::SyncErr),
     Render(hc_daemon::qr_term::RenderErr),
+    Grant(hc_sign::grant::GrantErr),
     Sign(hc_sign::SignErr),
     Unlock(hc_core::unlock::UnlockErr),
     Keyring(hc_core::keyring::KeyringErr),
-    Backup(hc_daemon::backup::BackupErr),
+    Git(hc_daemon::git_store::GitErr),
     Config(hc_core::config::ConfigErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
     Se(hc_core::mac::secure_enclave::SeErr),
@@ -67,6 +69,7 @@ create_err_with_impls!(
     ;
     InvalidKeyName { name: String },
     KeyExists { name: String },
+    NotBundleable { kind: hc_sign::grant::IntentKind },
     NotATerminal { source: std::io::Error }
 );
 
@@ -75,7 +78,6 @@ create_err_with_impls!(
 pub enum MenuState {
     Root,
     Keys,
-    Sign,
     Bundles,
     BundlePeers,
     Exposure,
@@ -90,7 +92,6 @@ pub enum MenuState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuChoice {
     Keys,
-    Sign,
     Bundles,
     BundlePeers,
     Exposure,
@@ -106,7 +107,6 @@ impl fmt::Display for MenuChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             MenuChoice::Keys => "Keys",
-            MenuChoice::Sign => "Sign",
             MenuChoice::Bundles => "Bundles",
             MenuChoice::BundlePeers => "Peers",
             MenuChoice::Exposure => "Exposure",
@@ -128,10 +128,6 @@ impl Pick for MenuChoice {
                 "List, generate, import and address the keystores in the store dir. Only the \
                  address and import verbs unlock anything."
             }
-            MenuChoice::Sign => {
-                "Signs one JSON intent file from disk with the key it names: the policy is \
-                 checked, you approve the summary, and a biometric session takes one Touch ID."
-            }
             MenuChoice::Bundles => {
                 "Collect several owners' signatures for one Safe transaction across machines: \
                  sign, import, export, watch, and sync over the tailnet."
@@ -145,16 +141,17 @@ impl Pick for MenuChoice {
                  test over the pinned TLS route. Every tunnel dies with the session."
             }
             MenuChoice::Backup => {
-                "Rsync the encrypted store to the configured remotes, or pull it back over the \
-                 local copy. Ciphertext only: nothing is decrypted here."
+                "Push the store's commits to the configured remotes, fetch theirs, and read how \
+                 the two stand. Ciphertext only: nothing is decrypted here."
             }
             MenuChoice::Enroll => {
                 "Add another way to unwrap the DEK — a Secure Enclave key, or a recovery \
                  passphrase. It unlocks once, with the method that opened this session."
             }
             MenuChoice::Status => {
-                "Where the daemon listens, what is exposed, how many keystores and enrollments \
-                 exist, and the tail of the console log. Prompts for nothing."
+                "A panel that keeps itself up to date: where the daemon listens, how the store \
+                 stands against every remote, what the bundle poller last did, and the log tail. \
+                 [p] asks for a fetch, [r] re-reads the store, [q] leaves."
             }
             MenuChoice::ServeAndApprove => {
                 "Waits on the incoming requests and puts each one in front of you as it lands, \
@@ -194,7 +191,6 @@ pub fn next(state: MenuState, choice: MenuChoice) -> MenuState {
         (MenuState::BundlePeers, MenuChoice::Back) => MenuState::Bundles,
         (_, MenuChoice::Back) => MenuState::Root,
         (_, MenuChoice::Keys) => MenuState::Keys,
-        (_, MenuChoice::Sign) => MenuState::Sign,
         (_, MenuChoice::Bundles) => MenuState::Bundles,
         (_, MenuChoice::BundlePeers) => MenuState::BundlePeers,
         (_, MenuChoice::Exposure) => MenuState::Exposure,
@@ -203,6 +199,13 @@ pub fn next(state: MenuState, choice: MenuChoice) -> MenuState {
         (_, MenuChoice::Status) => MenuState::Status,
         (_, MenuChoice::ServeAndApprove) => MenuState::ServeAndApprove,
     }
+}
+
+/// Whether a session that is not serving may enter `target`. The two screens that open a tunnel
+/// or read a key off-process are the ones a refused session must not reach.
+pub(crate) fn allowed(target: MenuState, serving: &Serving) -> bool {
+    !matches!(target, MenuState::Exposure | MenuState::ServeAndApprove)
+        || !matches!(serving, Serving::Refused)
 }
 
 /// One screen's choices: each variant carries the line the list shows and the sentence → opens
@@ -239,14 +242,14 @@ menu_enum!(KeyAction {
         "Reads the store dir and the keyring header: every keystore with its use, and every \
          enrolled unlock method. Decrypts nothing and prompts for nothing.",
     Generate => "Generate a new key",
-        "Mints a key, seals it under the DEK — one unlock of the store — and rsyncs the store to \
-         every backup remote. The use you pick is permanent.",
+        "Mints a key, seals it under the DEK — one unlock of the store — and commits the store, \
+         which the session then pushes to every backup remote. The use you pick is permanent.",
     Address => "Show a public address",
         "Decrypts one keystore to derive its public address: an unlock of the store, and a Touch \
          ID where that is the gate, even though nothing leaves this machine.",
     Add => "Import an existing secret",
-        "Takes a secret at a masked prompt, seals it under the DEK, and rsyncs the store to \
-         every backup remote. The use you pick is permanent.",
+        "Takes a secret at a masked prompt, seals it under the DEK, and commits the store, which \
+         the session then pushes to every backup remote. The use you pick is permanent.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -268,12 +271,18 @@ menu_enum!(ExposureAction {
 });
 
 menu_enum!(BackupAction {
+    Status => "Show the store and its remotes",
+        "Prints this install's vault, its local commit, and how each remote stood at the last \
+         fetch. Touches no network and writes nothing.",
     Push => "Push the store to every remote",
-        "Rsyncs this install's vault to every configured remote, ciphertext as it sits on disk. \
-         A remote that does not answer is a warning, not a failure.",
-    Pull => "Pull the store from the first remote",
-        "Rsyncs the first remote's vault over the local store after a confirmation, and refuses \
-         outright if the local store belongs to another vault.",
+        "Pushes this install's commits to every configured remote, ciphertext as it sits on \
+         disk. A remote that does not answer is a warning; all of them failing is an error.",
+    Fetch => "Fetch and fast-forward",
+        "Fetches every remote and takes its commits only when they are a fast-forward. A fork \
+         is reported and left alone.",
+    Pull => "Forced pull from the first remote (DESTRUCTIVE)",
+        "Throws away this machine's commits and takes the first remote's, DELETING every \
+         keystore made here and never pushed. It names them before it asks.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -285,13 +294,6 @@ menu_enum!(EnrollAction {
     Passphrase => "Recovery passphrase",
         "Wraps the DEK under a passphrase you type twice. It is the only way back into the \
          store if the Secure Enclave key is ever lost.",
-    Back => "Back",
-        "Leave this screen for the one above it.",
-});
-
-menu_enum!(StatusAction {
-    Refresh => "Refresh",
-        "Re-reads the store, the keyring, the tunnels and the log tail, and draws them again.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -368,11 +370,10 @@ pub(crate) use ask;
 /// having asked anything must not be re-entered on the next pass: the two screens that need a
 /// live listener fall back to the root, and a terminal that cannot prompt at all ends the run.
 pub fn run(console: &mut Console) -> Result<(), MenuErr> {
-    let approver = ConsoleApprover::new(console.gate);
     let mut state = MenuState::Root;
     let mut notice = String::new();
     loop {
-        match service_pending(console, &approver) {
+        match service_pending(console) {
             Ok(drained) => {
                 if drained.answered > 0 || drained.refused > 0 {
                     notice = format!(
@@ -385,16 +386,17 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
                 }
             }
             Err(MenuErr::Approval(ApprovalErr::ListenerGone)) => {
-                console.serving = Serving::Refused;
+                console.rt.serving = Serving::Refused;
                 notice = "the https listener exited: nothing is served any more".to_string();
             }
+            Err(e @ MenuErr::Approval(ApprovalErr::NoApprovalTerminal)) => return Err(e),
             Err(e) => notice = format!("error: {e}"),
         }
         if state == MenuState::Quit {
             return Ok(());
         }
         draw(console, &notice)?;
-        let step = match screen(console, &approver, state) {
+        let step = match screen(console, state) {
             Ok(step) => step,
             Err(MenuErr::Inquire(InquireError::OperationCanceled)) => Step {
                 choice: MenuChoice::Back,
@@ -407,7 +409,10 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
             Err(MenuErr::Inquire(e @ (InquireError::NotTTY | InquireError::IO(_)))) => {
                 return Err(MenuErr::Inquire(e))
             }
-            Err(e @ MenuErr::NotATerminal { .. }) => return Err(e),
+            Err(
+                e @ (MenuErr::NotATerminal { .. }
+                | MenuErr::Approval(ApprovalErr::NoApprovalTerminal)),
+            ) => return Err(e),
             Err(e) => {
                 notice = format!("error: {e}");
                 if matches!(state, MenuState::Exposure | MenuState::ServeAndApprove) {
@@ -418,8 +423,7 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
         };
         notice = step.notice;
         let target = next(state, step.choice);
-        let refused = matches!(target, MenuState::Exposure | MenuState::ServeAndApprove)
-            && matches!(console.serving, Serving::Refused);
+        let refused = !allowed(target, &console.rt.serving);
         if refused {
             notice = format!("error: {}", MenuErr::NotServing);
         }
@@ -428,16 +432,14 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
 }
 
 /// Run the requests that queued while the operator was elsewhere in the tree.
-pub(crate) fn service_pending(
-    console: &mut Console,
-    approver: &ConsoleApprover,
-) -> Result<Drained, MenuErr> {
-    let Console {
+pub(crate) fn service_pending(console: &mut Console) -> Result<Drained, MenuErr> {
+    let Runtime {
         api,
+        approver,
         serving,
         tunnels,
         ..
-    } = console;
+    } = &mut console.rt;
     let Serving::Live { ops, .. } = serving else {
         return Ok(Drained::default());
     };
@@ -447,7 +449,7 @@ pub(crate) fn service_pending(
 /// The read test's own request may still be queued when it is abandoned, and its caller is
 /// then gone: deny it rather than prompting the operator for an answer nobody will read.
 fn refuse_pending(console: &mut Console) {
-    let Serving::Live { ops, .. } = &mut console.serving else {
+    let Serving::Live { ops, .. } = &mut console.rt.serving else {
         return;
     };
     approval::refuse_queued(ops);
@@ -458,7 +460,7 @@ fn draw(console: &Console, notice: &str) -> Result<(), MenuErr> {
     let mut out = std::io::stderr();
     crossterm::execute!(out, Clear(ClearType::All), MoveTo(0, 0))?;
     writeln!(out, "hot_cheese")?;
-    match console.gate {
+    match console.rt.gate {
         UnlockGate::Biometric => {
             writeln!(out, "unlock:  Secure Enclave, Touch ID gates every request")?
         }
@@ -468,11 +470,8 @@ fn draw(console: &Console, notice: &str) -> Result<(), MenuErr> {
              tunnels and read tests are refused"
         )?,
     }
-    match &console.serving {
-        Serving::Live { addr, .. } => writeln!(out, "serving: https://{addr}")?,
-        Serving::Refused => writeln!(out, "serving: refused")?,
-    }
-    writeln!(out, "store:   {}", console.config.store_path().display())?;
+    writeln!(out, "serving: {}", console.rt.serving)?;
+    writeln!(out, "store:   {}", console.rt.config.store_path().display())?;
     if !notice.is_empty() {
         writeln!(out, "\n{notice}")?;
     }
@@ -481,22 +480,17 @@ fn draw(console: &Console, notice: &str) -> Result<(), MenuErr> {
     Ok(())
 }
 
-fn screen(
-    console: &mut Console,
-    approver: &ConsoleApprover,
-    state: MenuState,
-) -> Result<Step, MenuErr> {
+fn screen(console: &mut Console, state: MenuState) -> Result<Step, MenuErr> {
     match state {
-        MenuState::Root => root_screen(),
+        MenuState::Root => root_screen(&console.rt.live),
         MenuState::Keys => keys_screen(console),
-        MenuState::Sign => sign_screen(console, approver),
-        MenuState::Bundles => bundles::screen(console, approver),
-        MenuState::BundlePeers => bundles::peers_screen(),
-        MenuState::Exposure => exposure_screen(console, approver),
+        MenuState::Bundles => bundles::screen(console),
+        MenuState::BundlePeers => bundles::peers_screen(console),
+        MenuState::Exposure => exposure_screen(console),
         MenuState::Backup => backup_screen(console),
         MenuState::Enroll => enroll_screen(console),
-        MenuState::Status => status_screen(console),
-        MenuState::ServeAndApprove => serve_screen(console, approver),
+        MenuState::Status => status::panel(console),
+        MenuState::ServeAndApprove => serve_screen(console),
         MenuState::Quit => Ok(Step {
             choice: MenuChoice::Quit,
             notice: String::new(),
@@ -504,10 +498,9 @@ fn screen(
     }
 }
 
-fn root_screen() -> Result<Step, MenuErr> {
+fn root_screen(live: &Live) -> Result<Step, MenuErr> {
     let options = vec![
         MenuChoice::Keys,
-        MenuChoice::Sign,
         MenuChoice::Bundles,
         MenuChoice::Exposure,
         MenuChoice::Backup,
@@ -516,7 +509,7 @@ fn root_screen() -> Result<Step, MenuErr> {
         MenuChoice::ServeAndApprove,
         MenuChoice::Quit,
     ];
-    let choice = ask!(pick("hot_cheese", options, Filter::Off));
+    let choice = ask!(pick(live, "hot_cheese", options, Filter::Off));
     Ok(Step {
         choice,
         notice: String::new(),
@@ -524,7 +517,12 @@ fn root_screen() -> Result<Step, MenuErr> {
 }
 
 fn keys_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(pick("Keys", KeyAction::ALL.to_vec(), Filter::Off));
+    let action = ask!(pick(
+        &console.rt.live,
+        "Keys",
+        KeyAction::ALL.to_vec(),
+        Filter::Off
+    ));
     match action {
         KeyAction::Back => Ok(Step {
             choice: MenuChoice::Back,
@@ -541,29 +539,38 @@ fn keys_screen(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn generate(console: &Console) -> Result<Step, MenuErr> {
-    let chain = ask!(pick("Chain", Chain::ALL.to_vec(), Filter::Off));
+    let chain = ask!(pick(
+        &console.rt.live,
+        "Chain",
+        Chain::ALL.to_vec(),
+        Filter::Off
+    ));
     let name = ask!(nav(Text::new("New key name (a-z A-Z 0-9 _)").prompt()));
     let name = name.trim().to_string();
     if name.is_empty() || !is_valid_string_name(&name) {
         return Err(MenuErr::InvalidKeyName { name });
     }
-    if console.config.store_path().join(&name).exists() {
+    if console.rt.config.store_path().join(&name).exists() {
         return Err(MenuErr::KeyExists { name });
     }
-    let key_use = ask!(pick(USE_PROMPT, KeyUse::ALL.to_vec(), Filter::Off));
-    let ctx = OpContext {
-        key: name.clone(),
-        op: match chain {
+    let key_use = ask!(pick(
+        &console.rt.live,
+        USE_PROMPT,
+        KeyUse::ALL.to_vec(),
+        Filter::Off
+    ));
+    let ctx = OpContext::local(
+        name.clone(),
+        match chain {
             Chain::Evm => Operation::EvmGenerate,
             Chain::Solana => Operation::SolanaGenerate,
         },
-        peer: Peer::Cli,
-    };
+    );
     match chain {
-        Chain::Evm => console.api.generate(&ctx, key_use)?,
-        Chain::Solana => console.api.generate_solana(&ctx, key_use)?,
+        Chain::Evm => console.rt.api.generate(&ctx, key_use)?,
+        Chain::Solana => console.rt.api.generate_solana(&ctx, key_use)?,
     }
-    backup::push_all(&console.config)?;
+    console.rt.git.after_mutation()?;
     Ok(Step {
         choice: MenuChoice::Keys,
         notice: format!("generated {chain} key \"{name}\" ({key_use})"),
@@ -571,19 +578,28 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn address(console: &Console) -> Result<Step, MenuErr> {
-    let chain = ask!(pick("Chain", Chain::ALL.to_vec(), Filter::Off));
-    let name = ask!(pick("Key", keystore_names(console)?, Filter::On));
-    let ctx = OpContext {
-        key: name.clone(),
-        op: match chain {
+    let chain = ask!(pick(
+        &console.rt.live,
+        "Chain",
+        Chain::ALL.to_vec(),
+        Filter::Off
+    ));
+    let name = ask!(pick(
+        &console.rt.live,
+        "Key",
+        keystore_names(console)?,
+        Filter::On
+    ));
+    let ctx = OpContext::local(
+        name.clone(),
+        match chain {
             Chain::Evm => Operation::EvmAddress,
             Chain::Solana => Operation::SolanaAddress,
         },
-        peer: Peer::Cli,
-    };
+    );
     let addr = match chain {
-        Chain::Evm => console.api.address(&ctx)?,
-        Chain::Solana => console.api.address_solana(&ctx)?,
+        Chain::Evm => console.rt.api.address(&ctx)?,
+        Chain::Solana => console.rt.api.address_solana(&ctx)?,
     };
     Ok(Step {
         choice: MenuChoice::Keys,
@@ -597,16 +613,22 @@ fn add(console: &Console) -> Result<Step, MenuErr> {
     if name.is_empty() || !is_valid_string_name(&name) {
         return Err(MenuErr::InvalidKeyName { name });
     }
-    let store = console.config.store_path();
+    let store = console.rt.config.store_path();
     if store.join(&name).exists() {
         return Err(MenuErr::KeyExists { name });
     }
     let kind = ask!(pick(
+        &console.rt.live,
         "Secret encoding",
         SecretKind::ALL.to_vec(),
         Filter::Off
     ));
-    let key_use = ask!(pick(USE_PROMPT, KeyUse::ALL.to_vec(), Filter::Off));
+    let key_use = ask!(pick(
+        &console.rt.live,
+        USE_PROMPT,
+        KeyUse::ALL.to_vec(),
+        Filter::Off
+    ));
     let entered = Zeroizing::new(ask!(nav(Password::new("Secret")
         .with_display_mode(PasswordDisplayMode::Masked)
         .without_confirmation()
@@ -619,7 +641,7 @@ fn add(console: &Console) -> Result<Step, MenuErr> {
         &format!("Unlock \"{name}\" to import a key")
     ));
     encrypt_file(&store, &name, &dek, key_use, &secret)?;
-    backup::push_all(&console.config)?;
+    console.rt.git.after_mutation()?;
     Ok(Step {
         choice: MenuChoice::Keys,
         notice: format!("imported \"{name}\" as {kind} ({key_use})"),
@@ -634,28 +656,17 @@ fn decode_secret(kind: SecretKind, entered: &str) -> Result<Vec<u8>, MenuErr> {
     }
 }
 
-fn sign_screen(console: &Console, approver: &ConsoleApprover) -> Result<Step, MenuErr> {
-    let path = ask!(nav(Text::new("JSON intent file").prompt()));
-    let body = std::fs::read(resolve_path(path.trim()))?;
-    let Intent::SafeTx(intent) = serde_json::from_slice(&body)?;
-    let ctx = OpContext {
-        key: intent.key,
-        op: Operation::Sign,
-        peer: Peer::Cli,
-    };
-    let signed = console.api.sign_intent(&ctx, &body, approver)?;
-    Ok(Step {
-        choice: MenuChoice::Back,
-        notice: String::from_utf8_lossy(&signed).into_owned(),
-    })
-}
-
-fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<Step, MenuErr> {
-    let addr = match &console.serving {
+fn exposure_screen(console: &mut Console) -> Result<Step, MenuErr> {
+    let addr = match &console.rt.serving {
         Serving::Live { addr, .. } => *addr,
         Serving::Refused => return Err(MenuErr::NotServing),
     };
-    let action = ask!(pick("Exposure", ExposureAction::ALL.to_vec(), Filter::Off));
+    let action = ask!(pick(
+        &console.rt.live,
+        "Exposure",
+        ExposureAction::ALL.to_vec(),
+        Filter::Off
+    ));
     let notice = match action {
         ExposureAction::Back => {
             return Ok(Step {
@@ -663,7 +674,7 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
                 notice: String::new(),
             })
         }
-        ExposureAction::ReadTest => return read_test(console, approver, addr),
+        ExposureAction::ReadTest => return read_test(console, addr),
         ExposureAction::Open => {
             let target = ask!(nav(Text::new("SSH target (user@host)").prompt()));
             let remote_port = ask!(nav(CustomType::<u16>::new("Remote port").prompt()));
@@ -672,11 +683,11 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
                 remote_port,
                 local_port: addr.port(),
             };
-            let id = console.tunnels.open(spec.clone())?;
+            let id = console.rt.tunnels.open(spec.clone())?;
             format!("opened {}", tunnel_label(id, &spec))
         }
         ExposureAction::List => {
-            let open = console.tunnels.list();
+            let open = console.rt.tunnels.list();
             if open.is_empty() {
                 "no tunnels open".to_string()
             } else {
@@ -688,7 +699,7 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
             }
         }
         ExposureAction::Close => {
-            let open = console.tunnels.list();
+            let open = console.rt.tunnels.list();
             if open.is_empty() {
                 return Err(MenuErr::NoTunnels);
             }
@@ -699,8 +710,8 @@ fn exposure_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<
                     label: tunnel_label(id, &spec),
                 });
             }
-            let chosen = ask!(pick("Close tunnel", options, Filter::Off));
-            console.tunnels.close(chosen.id)?;
+            let chosen = ask!(pick(&console.rt.live, "Close tunnel", options, Filter::Off));
+            console.rt.tunnels.close(chosen.id)?;
             format!("closed {}", chosen.label)
         }
     };
@@ -741,20 +752,17 @@ fn tunnel_label(id: TunnelId, spec: &TunnelSpec) -> String {
 /// while the main thread keeps servicing the very request it made. The timeout measures idle
 /// time only: a request answered at the prompt restarts the clock, so a key that really was
 /// released is never reported as a timeout.
-fn read_test(
-    console: &mut Console,
-    approver: &ConsoleApprover,
-    addr: SocketAddr,
-) -> Result<Step, MenuErr> {
+fn read_test(console: &mut Console, addr: SocketAddr) -> Result<Step, MenuErr> {
     let key = ask!(pick(
+        &console.rt.live,
         "Key to read-test",
         keystore_names(console)?,
         Filter::On
     ));
-    let handle = readtest::spawn(&console.runtime, addr, key);
+    let handle = readtest::spawn(console.rt.tokio.handle(), addr, key);
     let mut idle = Instant::now();
     loop {
-        let drained = match service_pending(console, approver) {
+        let drained = match service_pending(console) {
             Ok(drained) => drained,
             Err(e) => {
                 handle.abort();
@@ -783,7 +791,7 @@ fn read_test(
         }
         std::thread::sleep(DRAIN_POLL);
     }
-    let proof = console.runtime.block_on(handle)??;
+    let proof = console.rt.tokio.block_on(handle)??;
     let mut lines = vec![
         format!("read \"{}\" over https://{}", proof.key, addr),
         format!("secret bytes: {}", proof.secret_len),
@@ -799,7 +807,12 @@ fn read_test(
 }
 
 fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(pick("Backup", BackupAction::ALL.to_vec(), Filter::Off));
+    let action = ask!(pick(
+        &console.rt.live,
+        "Backup",
+        BackupAction::ALL.to_vec(),
+        Filter::Off
+    ));
     let notice = match action {
         BackupAction::Back => {
             return Ok(Step {
@@ -807,37 +820,35 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
                 notice: String::new(),
             })
         }
+        BackupAction::Status => backup_notice(&console.rt.git.status().snapshot()),
         BackupAction::Push => {
-            if console.config.backup_remotes.is_empty() {
-                return Err(MenuErr::NoBackupRemote);
-            }
-            backup::push_all(&console.config)?;
+            console.rt.git.push_every(&console.rt.config)?;
             format!(
                 "pushed the store to {} remote(s)",
-                console.config.backup_remotes.len()
+                console.rt.config.backup_remotes.len()
             )
         }
+        BackupAction::Fetch => {
+            console.rt.git.fetch_every(&console.rt.config)?;
+            backup_notice(&console.rt.git.status().snapshot())
+        }
         BackupAction::Pull => {
-            let Some(remote) = console.config.backup_remotes.first() else {
-                return Err(MenuErr::NoBackupRemote);
+            let Some(remote) = console.rt.config.backup_remotes.first() else {
+                return Err(git_store::GitErr::NoBackupRemote.into());
             };
-            let vault = backup::pull_vault(&console.config, remote, None)?;
-            let confirmed = ask!(nav(Confirm::new(
-                "Pull replaces the local store with the remote copy. Continue?"
-            )
-            .with_default(false)
-            .prompt()));
+            let vault = git_store::pull_vault(&console.rt.config, remote, None)?;
+            let doomed = console.rt.git.pull_preview(remote, &vault)?;
+            let confirmed = ask!(nav(Confirm::new(&doomed_prompt(&doomed))
+                .with_default(false)
+                .prompt()));
             if !confirmed {
                 return Ok(Step {
                     choice: MenuChoice::Backup,
                     notice: "pull declined".to_string(),
                 });
             }
-            backup::pull(&console.config, remote, vault.as_ref())?;
-            match vault {
-                Some(v) => format!("pulled vault {v} from {}", remote.host),
-                None => format!("pulled the store from {}", remote.host),
-            }
+            console.rt.git.pull_apply(&doomed)?;
+            format!("pulled vault {vault} from {}", remote.host)
         }
     };
     Ok(Step {
@@ -846,8 +857,67 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
     })
 }
 
+/// A forced pull is the one action here that can destroy key material, so the question names
+/// every file it will delete: "discards local history" cannot tell an operator whether that
+/// means commits or keys.
+fn doomed_prompt(doomed: &git_store::Doomed) -> String {
+    let mut lost: Vec<&str> = doomed.tracked.iter().map(String::as_str).collect();
+    lost.extend(doomed.untracked.iter().map(String::as_str));
+    if lost.is_empty() {
+        return "Pull replaces this machine's history with the remote's. \
+                Nothing on this machine is lost. Continue?"
+            .to_string();
+    }
+    format!(
+        "Pull DELETES {} file(s) that exist only here — {} — and replaces this machine's \
+         history with the remote's. Continue?",
+        lost.len(),
+        lost.join(", ")
+    )
+}
+
+/// One line per remote: how it stood at the last fetch, and why it last failed.
+fn backup_notice(state: &git_store::GitState) -> String {
+    let mut lines = vec![format!(
+        "vault {} at {}{}",
+        match &state.vault {
+            Some(v) => v.to_string(),
+            None => "none".to_string(),
+        },
+        match &state.head {
+            Some(head) => head.to_string(),
+            None => "no commit yet".to_string(),
+        },
+        match state.fetching {
+            true => "  (fetching)",
+            false => "",
+        }
+    )];
+    if state.remotes.is_empty() {
+        lines.push("no backup remotes configured".to_string());
+    }
+    for remote in &state.remotes {
+        lines.push(format!(
+            "{} {} {}",
+            remote.host, remote.folder, remote.relation
+        ));
+        if let Some(failure) = &remote.last_failure {
+            lines.push(format!(
+                "  last failure {:?}: {} {}",
+                failure.op, failure.cause, failure.stderr
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
-    let action = ask!(pick("Enroll", EnrollAction::ALL.to_vec(), Filter::Off));
+    let action = ask!(pick(
+        &console.rt.live,
+        "Enroll",
+        EnrollAction::ALL.to_vec(),
+        Filter::Off
+    ));
     let (kind, default_label, unlocker): (&str, &str, Box<dyn Unlocker>) = match action {
         EnrollAction::Back => {
             return Ok(Step {
@@ -887,79 +957,64 @@ fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
     let enrollment = unlocker.enroll(label.trim(), &dek)?;
     let id = enrollment.id.clone();
     keyring.add(enrollment);
-    keyring.save(&MacBackend::keyring_path(&console.config.store))?;
+    keyring.save(&MacBackend::keyring_path(&console.rt.config.store))?;
+    console.rt.git.after_mutation()?;
     Ok(Step {
         choice: MenuChoice::Enroll,
         notice: format!("enrolled {kind} as {id}"),
     })
 }
 
-fn status_screen(console: &Console) -> Result<Step, MenuErr> {
-    let mut out = std::io::stderr();
-    writeln!(out, "{}\n", status::view(console))?;
-    out.flush()?;
-    let action = ask!(pick("Status", StatusAction::ALL.to_vec(), Filter::Off));
-    match action {
-        StatusAction::Refresh => Ok(Step {
-            choice: MenuChoice::Status,
-            notice: String::new(),
-        }),
-        StatusAction::Back => Ok(Step {
-            choice: MenuChoice::Back,
-            notice: String::new(),
-        }),
-    }
-}
-
-fn serve_screen(console: &mut Console, approver: &ConsoleApprover) -> Result<Step, MenuErr> {
-    let Console {
+fn serve_screen(console: &mut Console) -> Result<Step, MenuErr> {
+    let label = console.rt.serving.to_string();
+    let Runtime {
         api,
+        approver,
         serving,
         tunnels,
+        live,
         ..
-    } = console;
-    let Serving::Live { addr, ops, .. } = serving else {
+    } = &mut console.rt;
+    let Serving::Live { ops, .. } = serving else {
         return Err(MenuErr::NotServing);
     };
-    let addr = *addr;
     let mut out = std::io::stderr();
     writeln!(
         out,
         "approving every incoming request here; esc stops serving, ctrl-c quits\n"
     )?;
     out.flush()?;
-    match approval::serve_and_approve(api, approver, ops, addr, tunnels) {
-        Ok(()) | Err(ApprovalErr::Inquire(InquireError::OperationCanceled)) => Ok(Step {
+    match approval::serve_and_approve(api, approver, ops, &label, tunnels, live) {
+        Ok(()) => Ok(Step {
             choice: MenuChoice::Back,
             notice: "stopped serving".to_string(),
         }),
-        Err(
-            ApprovalErr::ShutdownRequested
-            | ApprovalErr::Inquire(InquireError::OperationInterrupted),
-        ) => Ok(Step {
+        Err(ApprovalErr::ShutdownRequested) => Ok(Step {
             choice: MenuChoice::Quit,
             notice: String::new(),
         }),
         Err(ApprovalErr::ListenerGone) => {
-            console.serving = Serving::Refused;
+            console.rt.serving = Serving::Refused;
             Ok(Step {
                 choice: MenuChoice::Back,
                 notice: "the https listener exited: nothing is served any more".to_string(),
             })
         }
-        Err(e) => Err(e.into()),
+        Err(
+            e @ (ApprovalErr::NoApprovalTerminal | ApprovalErr::StdIo(_) | ApprovalErr::Grant(_)),
+        ) => Err(e.into()),
     }
 }
 
 fn keyring_of(console: &Console) -> Result<Keyring, MenuErr> {
     Ok(Keyring::load(&MacBackend::keyring_path(
-        &console.config.store,
+        &console.rt.config.store,
     ))?)
 }
 
 /// Unwrap the DEK through the same KEK that opened this session.
 fn dek_for(console: &Console, keyring: &Keyring, reason: &str) -> Result<Nav<Dek>, MenuErr> {
-    let unlocker: Box<dyn Unlocker> = match console.gate {
+    let unlocker: Box<dyn Unlocker> = match console.rt.gate {
         UnlockGate::Biometric => Box::new(SecureEnclaveUnlocker::new(SE_KEY_LABEL)),
         UnlockGate::Passphrase => {
             let entered = match nav(Password::new("Recovery passphrase")
@@ -979,9 +1034,9 @@ fn dek_for(console: &Console, keyring: &Keyring, reason: &str) -> Result<Nav<Dek
 
 /// Every keystore in the store dir, sorted, excluding the keyring envelope itself.
 pub(crate) fn keystore_names(console: &Console) -> Result<Vec<String>, MenuErr> {
-    let keyring = MacBackend::keyring_path(&console.config.store);
+    let keyring = MacBackend::keyring_path(&console.rt.config.store);
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(console.config.store_path())? {
+    for entry in std::fs::read_dir(console.rt.config.store_path())? {
         let entry = entry?;
         if !entry.file_type()?.is_file() || entry.path() == keyring {
             continue;
@@ -1000,7 +1055,7 @@ pub(crate) fn keystore_names(console: &Console) -> Result<Vec<String>, MenuErr> 
 
 fn list_notice(console: &Console) -> Result<String, MenuErr> {
     let keyring = keyring_of(console)?;
-    let store = console.config.store_path();
+    let store = console.rt.config.store_path();
     let mut lines = Vec::new();
     match keystore_names(console) {
         Ok(names) => {
@@ -1035,6 +1090,46 @@ fn list_notice(console: &Console) -> Result<String, MenuErr> {
 mod tests {
     use super::*;
 
+    /// Every screen the menu can be on, so one added later is considered by the gate test.
+    const EVERY_STATE: [MenuState; 10] = [
+        MenuState::Root,
+        MenuState::Keys,
+        MenuState::Bundles,
+        MenuState::BundlePeers,
+        MenuState::Exposure,
+        MenuState::Backup,
+        MenuState::Enroll,
+        MenuState::Status,
+        MenuState::ServeAndApprove,
+        MenuState::Quit,
+    ];
+
+    /// A session that cannot serve must not reach the two screens that publish this machine or
+    /// read a key off-process: a passphrase session has no per-request biometric to gate a
+    /// release with, so an `ssh -R` from it would expose a key API nothing can guard. Getting
+    /// the set wrong is invisible until it matters, and no test reached this guard before.
+    #[test]
+    fn a_refused_session_may_not_reach_the_screens_that_expose_keys() {
+        let (_tx, ops) = tokio::sync::mpsc::channel(1);
+        let (shutdown, _rx) = tokio::sync::watch::channel(false);
+        let live = Serving::Live {
+            addr: "127.0.0.1:1".parse().expect("a loopback address"),
+            ops,
+            shutdown,
+        };
+        for state in EVERY_STATE {
+            assert!(
+                allowed(state, &live),
+                "{state:?} must be reachable while serving"
+            );
+            assert_eq!(
+                allowed(state, &Serving::Refused),
+                !matches!(state, MenuState::Exposure | MenuState::ServeAndApprove),
+                "{state:?} is gated wrongly for a refused session"
+            );
+        }
+    }
+
     /// Every section is reachable from the root, re-picking a section stays put so the
     /// drain runs between screens, Back climbs exactly one level, and both Quit anywhere
     /// and Back at the root terminate the loop.
@@ -1042,7 +1137,6 @@ mod tests {
     fn transitions_enter_and_leave_submenus() {
         for (choice, state) in [
             (MenuChoice::Keys, MenuState::Keys),
-            (MenuChoice::Sign, MenuState::Sign),
             (MenuChoice::Bundles, MenuState::Bundles),
             (MenuChoice::Exposure, MenuState::Exposure),
             (MenuChoice::Backup, MenuState::Backup),

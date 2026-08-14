@@ -18,7 +18,8 @@ use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand};
 use err_mac::create_err_with_impls;
 use hc_core::config::{
-    adapter_socket, adapters_dir, cert_paths, config_path, env_log_level, home_dir, Config,
+    adapter_socket, adapters_dir, cert_paths, config_path, env_log_level, home_dir, BackupRemote,
+    Config,
 };
 use hc_core::crypto::envelope::{
     atomic_write, encrypt_file, parse_keystore, read_keystore, seal_keystore, write_private_file,
@@ -29,7 +30,11 @@ use hc_core::keyring::{EnrollParams, Keyring, VaultId};
 use hc_core::mac::secure_enclave;
 use hc_core::mac::{authorize_with_touch_id, get_password_from_keychain, BackendImpl, MacBackend};
 use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
-use hc_daemon::{backup, run_server, HotApi, OpContext, Operation, Peer};
+use hc_daemon::approval::Approver;
+use hc_daemon::git_store::{self, GitStore};
+use hc_daemon::renderer::Headless;
+use hc_daemon::runtime::UnlockGate;
+use hc_daemon::{flock, HotApi, OpContext, Operation};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -58,15 +63,15 @@ const DEFAULT_ACCOUNT: &str = "hot_cheese_master";
 
 // Variants in source order: PassphraseMismatch (prompt confirmation differed),
 // AlreadyInitialized (`init` without `--force`), CertKeyPairRequired (one of
-// --import-cert/--import-key supplied), NoBackupRemote (pull/push with none set),
-// ServeRefusesPassphraseUnlock (`serve --unlock passphrase` would cache the passphrase for
-// the daemon's lifetime and drop the per-request biometric), SealNeedsTarget (`seal` with
-// neither a name nor --all), then `#[from]` wrappers for each module error this CLI touches,
-// then ExistingStore (`init` found key material), NotInitialized (no config.toml, so there is
-// nothing for the console to open), SealCannotLoosen (sealing is one-way),
-// SealVerifyMismatch (the re-sealed file did not re-open to the same bytes; nothing written),
-// VaultAlreadyAdopted (`backup adopt` on a keyring that already has a vault id) and
-// GrantKeyPinMismatch (`serve` found a grant key that is not the one config.toml pins).
+// --import-cert/--import-key supplied), PullNeedsForce (`backup pull` without --force, after
+// naming everything the pull would destroy), ServeRefusesPassphraseUnlock (`serve --unlock
+// passphrase` would cache the passphrase for the daemon's lifetime and drop the per-request
+// biometric), SealNeedsTarget (`seal` with neither a name nor --all), then `#[from]` wrappers
+// for each module error this CLI touches, then ExistingStore (`init` found key material),
+// NotInitialized (no config.toml, so there is nothing for the console to open),
+// SealCannotLoosen (sealing is one-way), SealVerifyMismatch (the re-sealed file did not re-open
+// to the same bytes; nothing written) and GrantKeyPinMismatch (`serve` found a grant key that
+// is not the one config.toml pins).
 // GrantKeyMissingRunEnrollGrant is `serve` without an enrolled grant key, which every
 // signature needs: nothing is pinned in config.toml, or the enclave blob is gone.
 create_err_with_impls!(
@@ -75,7 +80,7 @@ create_err_with_impls!(
     PassphraseMismatch,
     AlreadyInitialized,
     CertKeyPairRequired,
-    NoBackupRemote,
+    PullNeedsForce,
     ServeRefusesPassphraseUnlock,
     SealNeedsTarget,
     TouchIdDenied,
@@ -85,7 +90,7 @@ create_err_with_impls!(
     Unlock(hc_core::unlock::UnlockErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
     ApiBackend(hc_daemon::ApiBackendErr),
-    Backup(hc_daemon::backup::BackupErr),
+    Git(hc_daemon::git_store::GitErr),
     Migrate(migrate::MigrateErr),
     Bootstrap(bootstrap::BootstrapErr),
     Bundle(hc_bundle::BundleErr),
@@ -96,7 +101,8 @@ create_err_with_impls!(
     Sign(hc_sign::SignErr),
     Grant(hc_sign::grant::GrantErr),
     Serde(serde_json::Error),
-    Serve(hc_daemon::ServeErr),
+    Runtime(hc_daemon::runtime::RuntimeErr),
+    Flock(hc_daemon::flock::FlockErr),
     Console(ConsoleErr),
     Rcgen(rcgen::Error),
     StdIo(std::io::Error)
@@ -105,7 +111,7 @@ create_err_with_impls!(
     NotInitialized { config: PathBuf },
     SealCannotLoosen { name: String, from: KeyUse, to: KeyUse },
     SealVerifyMismatch { name: String },
-    VaultAlreadyAdopted { vault: VaultId },
+    NotBundleable { kind: hc_sign::grant::IntentKind },
     GrantKeyPinMismatch { pinned: String, found: String }
 );
 
@@ -168,12 +174,6 @@ enum Commands {
         chain: Chain,
         /// Keystore name.
         name: String,
-    },
-    /// Sign a Safe transaction from a JSON intent (policy-checked, single Touch ID).
-    Sign {
-        /// Read the JSON intent from this file instead of stdin.
-        #[arg(long, value_name = "JSON")]
-        file: Option<PathBuf>,
     },
     /// Collect owner signatures for one Safe transaction across several devices.
     Bundle {
@@ -249,18 +249,24 @@ enum EnrollCmd {
 
 #[derive(Subcommand, Debug)]
 enum BackupCmd {
+    /// Print what this install knows about its store and its remotes. No network, no write.
+    Status,
     /// Push the store to every configured remote, under this install's vault id.
     Push,
-    /// Pull one vault from the first configured remote into the local store.
+    /// Fetch the first configured remote and fast-forward; refuses to merge a fork.
+    Fetch,
+    /// Discard local history for the first remote's copy. Names what it destroys, and does
+    /// nothing without --force.
     Pull {
         /// Vault to pull (`v_<hex>`); defaults to this install's own vault id.
         #[arg(long, value_name = "ID")]
         vault: Option<VaultId>,
+        /// Actually discard local history. Without it the destruction is only listed.
+        #[arg(long)]
+        force: bool,
     },
     /// List the vaults sharing the first configured remote's folder.
     List,
-    /// Mint a vault id for a keyring written before vault ids existed.
-    Adopt,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,7 +366,6 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
             key_use,
         } => cmd_generate(chain, &name, key_use, unlock),
         Commands::Address { chain, name } => cmd_address(chain, &name, unlock),
-        Commands::Sign { file } => cmd_sign(file, unlock),
         Commands::Bundle { cmd, no_sync } => bundle::run(cmd, no_sync, unlock),
         Commands::List => cmd_list(),
         Commands::Adapters => cmd_adapters(),
@@ -372,7 +377,10 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
             new_store,
             shareable,
         } => cmd_migrate(&old_store, &new_store, shareable, unlock),
-        Commands::BootstrapFrom { target } => Ok(bootstrap::bootstrap_from(&target)?),
+        Commands::BootstrapFrom { target } => {
+            let _store = flock::store_claim()?;
+            Ok(bootstrap::bootstrap_from(&target)?)
+        }
         Commands::BootstrapServe => Ok(bootstrap::bootstrap_serve()?),
         Commands::SeSelftest => cmd_se_selftest(),
     }
@@ -383,20 +391,15 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
 /// the console starts no listener and refuses every tunnel.
 #[cfg(feature = "console")]
 fn cmd_console(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
-    use hc_console::UnlockGate;
-
     if !config_path().exists() {
         return Err(CliErr::NotInitialized {
             config: config_path(),
         });
     }
-    let (config, keyring) = load_config_and_keyring()?;
-    let gate = match resolve_unlock_method(&keyring, unlock) {
-        UnlockMethod::Se => UnlockGate::Biometric,
-        UnlockMethod::Passphrase => UnlockGate::Passphrase,
-    };
-    let backend = open_backend(&config, unlock)?;
-    Ok(hc_console::run_console(config, Box::new(backend), gate)?)
+    let store = flock::store_claim()?;
+    let config = Config::load()?;
+    let (backend, gate) = backend_for(&config, unlock)?;
+    Ok(hc_console::run(config, Box::new(backend), gate, store)?)
 }
 
 /// Without the console feature there is no interactive session to open, so a bare
@@ -479,11 +482,20 @@ fn keyring_file(config: &Config) -> PathBuf {
     config.store_path().join("keyring.json")
 }
 
-/// Load the keyring, choose the unlocker, and open the Mac backend for `config`.
-fn open_backend(config: &Config, method: Option<UnlockMethod>) -> Result<MacBackend, CliErr> {
+/// Load the keyring once, resolve which KEK this invocation runs under, build the unlocker and
+/// open the Mac backend. The gate travels with the backend because everything that raises an
+/// approval prompt needs to know whether a per-request biometric exists to reuse.
+fn backend_for(
+    config: &Config,
+    method: Option<UnlockMethod>,
+) -> Result<(MacBackend, UnlockGate), CliErr> {
     let keyring = Keyring::load(&keyring_file(config))?;
+    let gate = match resolve_unlock_method(&keyring, method) {
+        UnlockMethod::Se => UnlockGate::Biometric,
+        UnlockMethod::Passphrase => UnlockGate::Passphrase,
+    };
     let unlocker = make_unlocker(&keyring, method)?;
-    Ok(MacBackend::new(&config.store, unlocker)?)
+    Ok((MacBackend::new(&config.store, unlocker)?, gate))
 }
 
 fn cmd_init(
@@ -523,6 +535,10 @@ fn cmd_init(
     }
 
     std::fs::create_dir_all(&home)?;
+    let _store = match force {
+        true => Some(flock::store_claim()?),
+        false => None,
+    };
     let config = Config {
         service: DEFAULT_SERVICE.to_string(),
         account: DEFAULT_ACCOUNT.to_string(),
@@ -530,6 +546,7 @@ fn cmd_init(
         port: None,
         grant_public_key: None,
         bundle_watch_secs: None,
+        backup_fetch_secs: None,
         mcp: None,
         backup_remotes: Vec::new(),
         adapters: Vec::new(),
@@ -577,6 +594,8 @@ fn cmd_init(
     // Persist config last, once the store + keyring are in place.
     config.save()?;
 
+    git_store::ensure_repo(&store)?;
+
     let fingerprint = sha256_hex(&cert_der);
     tracing::info!(home = %home.display(), store = %store.display(), %vault, "initialized hot_cheese");
     tracing::info!(cert = %cert_path.display(), "TLS certificate written");
@@ -585,7 +604,9 @@ fn cmd_init(
 }
 
 fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
-    let (mut config, mut keyring) = load_config_and_keyring()?;
+    let config = Arc::new(Config::load()?);
+    let git = claimed_store(&config)?;
+    let mut keyring = Keyring::load(&keyring_file(&config))?;
 
     let enrollment = match cmd {
         EnrollCmd::Se { label } => {
@@ -609,8 +630,9 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
         EnrollCmd::Grant => {
             secure_enclave::ensure_grant_key(GRANT_LABEL)?;
             let pinned = hex::encode(secure_enclave::grant_public_key(GRANT_LABEL)?);
-            config.grant_public_key = Some(pinned.clone());
-            config.save()?;
+            let mut pinning = Config::load()?;
+            pinning.grant_public_key = Some(pinned.clone());
+            pinning.save()?;
             tracing::info!(grant_public_key = %pinned, "created the Secure Enclave grant key and pinned it in config.toml");
             return Ok(());
         }
@@ -620,6 +642,7 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
     keyring.add(enrollment);
     keyring.save(&keyring_file(&config))?;
     tracing::info!(enrollment = %id, "added enrollment");
+    git.after_mutation()?;
     Ok(())
 }
 
@@ -635,7 +658,8 @@ fn cmd_add(
     key_use: KeyUse,
     unlock: Option<UnlockMethod>,
 ) -> Result<(), CliErr> {
-    let config = Config::load()?;
+    let config = Arc::new(Config::load()?);
+    let git = claimed_store(&config)?;
     if !is_valid_string_name(name) {
         tracing::error!(%name, "invalid key name: only a-z, A-Z, 0-9, _ are allowed");
         return Err(CliErr::ApiBackend(hc_daemon::ApiBackendErr::KeyExists));
@@ -649,14 +673,14 @@ fn cmd_add(
     // Read + decode the secret, then zeroize the decoded bytes after encryption.
     let mut secret = read_secret(kind)?;
 
-    let backend = open_backend(&config, unlock)?;
+    let (backend, _) = backend_for(&config, unlock)?;
     let dek = backend.unlock_dek(&format!("Unlock \"{}\" for import key", name), None)?;
     let result = encrypt_file(&backend.store_path(), name, &dek, key_use, &secret);
     secret.zeroize();
     result?;
     tracing::info!(%name, %key_use, "imported key");
 
-    best_effort_backup_push(&config);
+    git.after_mutation()?;
     Ok(())
 }
 
@@ -667,26 +691,34 @@ fn cmd_generate(
     unlock: Option<UnlockMethod>,
 ) -> Result<(), CliErr> {
     let config = Arc::new(Config::load()?);
-    let backend = open_backend(&config, unlock)?;
+    let git = claimed_store(&config)?;
+    let (backend, _) = backend_for(&config, unlock)?;
     let api = HotApi::new(Box::new(backend), config.clone());
     match chain {
-        Chain::Evm => api.generate(&cli_context(name, Operation::EvmGenerate), key_use)?,
-        Chain::Solana => {
-            api.generate_solana(&cli_context(name, Operation::SolanaGenerate), key_use)?
-        }
+        Chain::Evm => api.generate(
+            &OpContext::local(name.to_string(), Operation::EvmGenerate),
+            key_use,
+        )?,
+        Chain::Solana => api.generate_solana(
+            &OpContext::local(name.to_string(), Operation::SolanaGenerate),
+            key_use,
+        )?,
     }
     tracing::info!(%name, ?chain, %key_use, "generated key");
-    best_effort_backup_push(&config);
+    git.after_mutation()?;
     Ok(())
 }
 
 fn cmd_address(chain: Chain, name: &str, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     let config = Arc::new(Config::load()?);
-    let backend = open_backend(&config, unlock)?;
+    let (backend, _) = backend_for(&config, unlock)?;
     let api = HotApi::new(Box::new(backend), config);
     let addr = match chain {
-        Chain::Evm => api.address(&cli_context(name, Operation::EvmAddress))?,
-        Chain::Solana => api.address_solana(&cli_context(name, Operation::SolanaAddress))?,
+        Chain::Evm => api.address(&OpContext::local(name.to_string(), Operation::EvmAddress))?,
+        Chain::Solana => api.address_solana(&OpContext::local(
+            name.to_string(),
+            Operation::SolanaAddress,
+        ))?,
     };
     tracing::info!(%name, %addr, "address");
     Ok(())
@@ -704,33 +736,18 @@ fn read_input(file: Option<&Path>) -> Result<Vec<u8>, std::io::Error> {
 }
 
 /// THE local signing path. Policy, the manifest-free CLI provenance, the pinned grant key, the
-/// single biometric and the zeroizing decrypt all live behind [`HotApi::sign_intent`]; `sign`
-/// and `bundle sign` differ only in where the intent came from and where the answer goes, so
-/// neither one may grow a second route to a key.
+/// single biometric and the zeroizing decrypt all live behind [`HotApi::sign_typed`], so
+/// `bundle sign` cannot grow a second route to a key.
 fn sign_intent_locally(
-    intent: &hc_sign::intent::SafeTxIntent,
+    intent: hc_sign::intent::SafeTxIntent,
     unlock: Option<UnlockMethod>,
 ) -> Result<hc_sign::SignResponse, CliErr> {
     let config = Arc::new(Config::load()?);
-    let body = serde_json::to_vec(&hc_sign::intent::Intent::SafeTx(intent.clone()))?;
-    let backend = open_backend(&config, unlock)?;
+    let (backend, gate) = backend_for(&config, unlock)?;
     let api = HotApi::new(Box::new(backend), config);
-    let out = api.sign_intent(
-        &cli_context(&intent.key, Operation::Sign),
-        &body,
-        &hc_daemon::approval::ServeApprover,
-    )?;
-    Ok(serde_json::from_slice(&out)?)
-}
-
-/// Read a JSON SafeTx intent (from `--file` or stdin), then run the policy-checked,
-/// single-Touch-ID sign flow and print the JSON response.
-fn cmd_sign(file: Option<PathBuf>, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
-    let hc_sign::intent::Intent::SafeTx(intent) =
-        serde_json::from_slice(&read_input(file.as_deref())?)?;
-    let response = sign_intent_locally(&intent, unlock)?;
-    println!("{}", serde_json::to_string(&response)?);
-    Ok(())
+    let approver = Approver::new(gate, Arc::new(Headless::detect()));
+    let ctx = OpContext::local(intent.key.clone(), Operation::Sign);
+    Ok(api.sign_typed(&ctx, intent, &approver)?)
 }
 
 fn cmd_list() -> Result<(), CliErr> {
@@ -842,7 +859,8 @@ fn cmd_seal(
     key_use: KeyUse,
     unlock: Option<UnlockMethod>,
 ) -> Result<(), CliErr> {
-    let config = Config::load()?;
+    let config = Arc::new(Config::load()?);
+    let git = claimed_store(&config)?;
     let store = config.store_path();
     let names = match (all, name) {
         (true, _) => keystore_names(&store)?,
@@ -874,7 +892,7 @@ fn cmd_seal(
         return Ok(());
     }
 
-    let backend = open_backend(&config, unlock)?;
+    let (backend, _) = backend_for(&config, unlock)?;
     let dek = backend.unlock_dek(
         &format!(
             "Unlock the hot_cheese DEK to seal {} keystore(s)",
@@ -893,7 +911,7 @@ fn cmd_seal(
         tracing::info!(%name, %key_use, "sealed");
     }
 
-    best_effort_backup_push(&config);
+    git.after_mutation()?;
     Ok(())
 }
 
@@ -905,6 +923,7 @@ fn cmd_serve(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     if unlock == Some(UnlockMethod::Passphrase) {
         return Err(CliErr::ServeRefusesPassphraseUnlock);
     }
+    let store = flock::store_claim()?;
     let config = Config::load()?;
 
     let Some(pinned) = &config.grant_public_key else {
@@ -924,62 +943,114 @@ fn cmd_serve(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
         });
     }
 
-    // Bootstrap-from-backup: if the store is empty and a remote is configured, pull first. With
-    // no local keyring there is no vault id to ask for, so `pull_vault` adopts the remote's only
-    // vault and refuses to guess between several.
-    if backup::store_absent(&config.store_path()) {
-        if let Some(remote) = config.backup_remotes.first() {
-            let vault = backup::pull_vault(&config, remote, None)?;
-            tracing::info!(host = %remote.host, vault = ?vault, "store empty; pulling from backup remote");
-            backup::pull(&config, remote, vault.as_ref())?;
-        }
-    }
+    git_store::clone_if_absent(&config)?;
 
-    let backend = open_backend(&config, unlock)?;
-    Ok(run_server(Box::new(backend), config)?)
+    let (backend, _) = backend_for(&config, unlock)?;
+    Ok(hc_daemon::serve(config, Box::new(backend), store)?)
+}
+
+/// The one remote every reading verb uses. Push is the only verb that fans out.
+fn first_remote(config: &Config) -> Result<&BackupRemote, CliErr> {
+    Ok(config
+        .backup_remotes
+        .first()
+        .ok_or(git_store::GitErr::NoBackupRemote)?)
+}
+
+/// Open the store's repository for a subcommand that is about to write to it. `status` and
+/// `list` deliberately do not come through here: neither writes, and an operator must be able
+/// to ask "is my backup healthy?" while a console holds the claim.
+fn claimed_store(config: &Arc<Config>) -> Result<GitStore, CliErr> {
+    let git = GitStore::cli(config.clone(), flock::store_claim()?)?;
+    git.open()?;
+    Ok(git)
 }
 
 fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
-    let config = Config::load()?;
+    let config = Arc::new(Config::load()?);
     match cmd {
-        BackupCmd::Push => {
-            backup::push_all(&config)?;
-            tracing::info!("pushed store to all remotes");
+        BackupCmd::Status => {
+            let state = git_store::GitState::local(&config)?;
+            tracing::info!(
+                vault = ?state.vault,
+                head = ?state.head,
+                remotes = state.remotes.len(),
+                "backup status"
+            );
+            for remote in &state.remotes {
+                tracing::info!(host = %remote.host, folder = %remote.folder, relation = %remote.relation, "  remote");
+            }
         }
-        BackupCmd::Pull { vault } => {
-            let remote = config
-                .backup_remotes
-                .first()
-                .ok_or(CliErr::NoBackupRemote)?;
-            let vault = backup::pull_vault(&config, remote, vault)?;
-            backup::pull(&config, remote, vault.as_ref())?;
-            tracing::info!(host = %remote.host, vault = ?vault, "pulled store from remote");
+        BackupCmd::Push => {
+            let git = claimed_store(&config)?;
+            git.push_every(&config)?;
+            tracing::info!(remotes = config.backup_remotes.len(), "pushed the store");
+        }
+        BackupCmd::Fetch => {
+            let git = claimed_store(&config)?;
+            git.fetch_every(&config)?;
+            let state = git.status().snapshot();
+            for remote in &state.remotes {
+                tracing::info!(host = %remote.host, relation = %remote.relation, remote_head = ?remote.remote_head, "  remote");
+            }
+            if let Some((host, local, remote)) = diverged(&state) {
+                return Err(git_store::GitErr::Diverged {
+                    host,
+                    local,
+                    remote,
+                }
+                .into());
+            }
+        }
+        BackupCmd::Pull { vault, force } => {
+            let git = claimed_store(&config)?;
+            let remote = first_remote(&config)?;
+            let vault = git_store::pull_vault(&config, remote, vault)?;
+            let doomed = git.pull_preview(remote, &vault)?;
+            tracing::warn!(
+                host = %remote.host,
+                %vault,
+                keystores = doomed.tracked.len(),
+                untracked = doomed.untracked.len(),
+                "a forced pull DELETES everything this machine has that the remote does not"
+            );
+            for name in doomed.tracked.iter().chain(&doomed.untracked) {
+                tracing::warn!(file = %name, "  deleted by the pull");
+            }
+            if !force {
+                return Err(CliErr::PullNeedsForce);
+            }
+            git.pull_apply(&doomed)?;
+            tracing::info!(host = %remote.host, %vault, head = %doomed.remote_head, "pulled the store from the remote");
         }
         BackupCmd::List => {
-            let remote = config
-                .backup_remotes
-                .first()
-                .ok_or(CliErr::NoBackupRemote)?;
-            let mine = backup::local_vault(&config.store_path())?;
-            let vaults = backup::list_vaults(remote)?;
-            tracing::info!(host = %remote.host, folder = %remote.folder, count = vaults.len(), "vaults on remote");
-            for v in &vaults {
+            let remote = first_remote(&config)?;
+            let mine = git_store::local_vault(&config.store_path())?;
+            let found = git_store::list_vaults(remote)?;
+            tracing::info!(host = %remote.host, folder = %remote.folder, count = found.git.len(), "vaults on remote");
+            for v in &found.git {
                 tracing::info!(vault = %v, this_install = mine.id() == Some(v), "  vault");
             }
-        }
-        BackupCmd::Adopt => {
-            let path = keyring_file(&config);
-            let mut keyring = Keyring::load(&path)?;
-            if let Some(vault) = keyring.vault_id {
-                return Err(CliErr::VaultAlreadyAdopted { vault });
+            for v in &found.legacy {
+                tracing::warn!(vault = %v, "  pre-git backup directory, no longer written to");
             }
-            let vault = VaultId::random();
-            keyring.vault_id = Some(vault.clone());
-            keyring.save(&path)?;
-            tracing::info!(%vault, "adopted vault id; backups now land under <folder>/<vault>");
         }
     }
     Ok(())
+}
+
+/// The first remote a fetch found a fork against, if any. A fork is a state the status carries,
+/// so only the operator-driven verbs turn it into a failure.
+fn diverged(
+    state: &git_store::GitState,
+) -> Option<(String, git_store::CommitId, git_store::CommitId)> {
+    let local = state.head?;
+    for remote in &state.remotes {
+        if remote.relation == git_store::Relation::Diverged {
+            return Some((remote.host.clone(), local, remote.remote_head?));
+        }
+    }
+    None
 }
 
 fn cmd_migrate(
@@ -989,6 +1060,8 @@ fn cmd_migrate(
     unlock: Option<UnlockMethod>,
 ) -> Result<(), CliErr> {
     let (config, keyring) = load_config_and_keyring()?;
+    let config = Arc::new(config);
+    let git = claimed_store(&config)?;
 
     // The legacy master lives in the login Keychain behind Touch ID.
     if !authorize_with_touch_id("read the legacy hot_cheese Keychain master for migrate") {
@@ -1017,27 +1090,8 @@ fn cmd_migrate(
     for k in &migrated {
         tracing::info!(name = %k.name, identity = %k.identity, key_use = %k.key_use, "  migrated");
     }
-    best_effort_backup_push(&config);
+    git.after_mutation()?;
     Ok(())
-}
-
-/// Name a locally-invoked operation for the biometric prompt.
-fn cli_context(name: &str, op: Operation) -> OpContext {
-    OpContext {
-        key: name.to_string(),
-        op,
-        peer: Peer::Cli,
-    }
-}
-
-/// Push to backups if any remote is configured, logging but not failing on error.
-fn best_effort_backup_push(config: &Config) {
-    if config.backup_remotes.is_empty() {
-        return;
-    }
-    if let Err(e) = backup::push_all(config) {
-        tracing::warn!(error = %e, "backup push failed (continuing)");
-    }
 }
 
 /// Read a secret from a hidden prompt and decode it per `kind`. Output is the raw
@@ -1234,7 +1288,8 @@ mod tests {
 
     /// Disaster recovery types the vault id in by hand, so the value parser has to turn
     /// `v_<hex>` into a real [`VaultId`] and reject anything that is not one; omitting
-    /// `--vault` must stay `None` so the pull falls back to this install's own id.
+    /// `--vault` must stay `None` so the pull falls back to this install's own id. A bare
+    /// `pull` must also stay un-forced, because the forced one deletes keystores.
     #[test]
     fn backup_pull_takes_a_typed_vault_id() {
         let cli = Cli::try_parse_from([
@@ -1243,19 +1298,23 @@ mod tests {
             "pull",
             "--vault",
             "v_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "--force",
         ])
         .expect("backup pull --vault parses");
         let expected: VaultId = "v_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
             .parse()
             .expect("fixture id parses");
         assert!(
-            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault })) if vault == Some(expected))
+            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force })) if vault == Some(expected) && force)
         );
 
         let cli = Cli::try_parse_from(["hot_cheese", "backup", "pull"]).expect("bare pull parses");
         assert!(matches!(
             cli.command,
-            Some(Commands::Backup(BackupCmd::Pull { vault: None }))
+            Some(Commands::Backup(BackupCmd::Pull {
+                vault: None,
+                force: false
+            }))
         ));
 
         assert!(
@@ -1344,7 +1403,7 @@ mod tests {
         .expect("trailing --unlock parses");
         assert_eq!(cli.unlock, Some(UnlockMethod::Passphrase));
 
-        let cli = Cli::try_parse_from(["hot_cheese", "--unlock", "se", "sign"])
+        let cli = Cli::try_parse_from(["hot_cheese", "--unlock", "se", "list"])
             .expect("leading --unlock parses");
         assert_eq!(cli.unlock, Some(UnlockMethod::Se));
 

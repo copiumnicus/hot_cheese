@@ -267,7 +267,10 @@ mod tests {
         let (kind, scanned) = reassemble(&set).expect("scan the frames back");
         assert_eq!(kind, QrKind::SafeTxRequest);
         let Intent::SafeTx(parsed) =
-            serde_json::from_slice(&scanned).expect("the scanned bytes are an intent");
+            serde_json::from_slice(&scanned).expect("the scanned bytes are an intent")
+        else {
+            panic!("a framed SafeTx must scan back as a SafeTx");
+        };
 
         assert_eq!(safe_tx_hash(&parsed), sent);
         assert_eq!(

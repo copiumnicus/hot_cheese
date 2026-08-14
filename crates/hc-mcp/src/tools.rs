@@ -2,8 +2,12 @@
 //!
 //! The exposed surface is not a transaction encoder. The two transaction tools take
 //! [`Erc20Transfer`] — seven fields, `deny_unknown_fields` — and the SERVER builds the calldata
-//! from them with the same alloy `sol!` declaration [`adapter::summary`] decodes against, so what
-//! is proposed and what the operator reads can never disagree. Everything else in the Safe
+//! from them, with its own one-function `sol!` declaration below. The signer no longer shares
+//! that declaration: it decodes against the canonical signature the OPERATOR declared in the
+//! key's policy. What keeps the two from disagreeing is stronger than sharing a type — a
+//! mismatch is a REFUSAL. Bytes this server encodes that the policy does not declare as
+//! `transfer(address,uint256)` never admit at all, and bytes that admit re-encode to exactly
+//! what was proposed or `EncodingNotCanonical` refuses them. Everything else in the Safe
 //! transaction is fixed here: `to` is the token, `value` is zero, the operation is a plain
 //! [`Operation::Call`], and all five gas-refund fields are zero.
 //!
@@ -22,17 +26,23 @@
 //! would put the whole surface back.
 use crate::proposal::{slot_held, Proposal};
 use crate::McpErr;
-use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
-use alloy_sol_types::SolCall;
+use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_sol_types::{sol, SolCall};
 use err_mac::create_err_with_impls;
 use hc_bundle::sync::SyncMode;
 use hc_bundle::Safes;
 use hc_core::config::Config;
-use hc_sign::adapter::{self, Known};
+use hc_sign::adapter;
 use hc_sign::intent::{Operation, SafeTxIntent};
 use hc_sign::policy::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+sol! {
+    interface Erc20 {
+        function transfer(address to, uint256 amount);
+    }
+}
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -93,7 +103,7 @@ impl Tool {
             }),
             Tool::ListSigningKeys => json!({
                 "name": "list_signing_keys",
-                "description": "Every local signing key and the policy that bounds it: the Safe and chain it is pinned to, the destinations and 4-byte selectors it may call, the native-value ceiling per rule, whether owner/threshold rotation is permitted, and whether gas refunds are opted in. Key addresses are deliberately NOT returned: deriving one decrypts a keystore and prompts the operator for Touch ID. Owner addresses come from list_safes. Read-only.",
+                "description": "Every local signing key and the policy that bounds it: the Safe and chain it is pinned to, the destinations and the full canonical signatures it may call there, the native-value ceiling per rule, whether owner/threshold rotation is permitted, the EIP-712 schemas it may sign, and whether gas refunds are opted in. Key addresses are deliberately NOT returned: deriving one decrypts a keystore and prompts the operator for Touch ID. Owner addresses come from list_safes. Read-only.",
                 "inputSchema": no_arguments(),
             }),
             Tool::ListBundles => json!({
@@ -216,7 +226,7 @@ impl Erc20Transfer {
         if !hc_core::is_valid_string_name(&self.key) {
             return Err(McpErr::InvalidKeyName { key: self.key });
         }
-        let data = Known::transferCall {
+        let data = Erc20::transferCall {
             to: self.recipient,
             amount: self.amount,
         }
@@ -254,17 +264,18 @@ struct SafeView {
 #[derive(Serialize)]
 struct RuleView {
     to: Address,
-    selectors: Vec<FixedBytes<4>>,
+    /// The canonical signatures permitted here, which is also what the daemon decodes against.
+    signatures: Vec<String>,
     #[serde(with = "hc_core::wire::u256")]
     max_value: U256,
     operation: Operation,
 }
 
-/// Whether the key may rotate its Safe's owners, and with which selectors.
+/// Whether the key may rotate its Safe's owners, and with which calls.
 #[derive(Serialize)]
 struct OwnerMgmtView {
     allow: bool,
-    selectors: Vec<FixedBytes<4>>,
+    signatures: Vec<String>,
 }
 
 /// One key's policy, and never its address: deriving one decrypts a keystore.
@@ -277,6 +288,8 @@ struct KeyView {
     chain_id: U256,
     allow: Vec<RuleView>,
     owner_management: OwnerMgmtView,
+    /// EIP-712 message schemas this key may sign, by name.
+    typed_data: Vec<String>,
     /// Whether the policy opts in to Safe gas refunds at all.
     refunds_configured: bool,
 }
@@ -313,12 +326,24 @@ struct HashArg {
     hash: B256,
 }
 
+/// The approval text of a stored proposal, or the fact that there is none: a bundle only has a
+/// summary if it still admits under the policy in force, and a policy edited after it was filed
+/// can take that away.
+#[derive(Serialize)]
+#[serde(tag = "summary", rename_all = "snake_case")]
+enum SummaryView {
+    /// The decoded text the operator reads before approving.
+    Decoded { text: String },
+    /// The policy in force refuses this proposal, so there is nothing to approve and nothing to
+    /// read. `preview_erc20_transfer` reports the typed refusal for a transfer you can re-file.
+    Refused,
+}
+
 /// The merged view of one bundle, in the words the approval prompt will use.
 #[derive(Serialize)]
 struct StatusView {
     hash: B256,
-    /// The decoded text the operator reads before approving.
-    summary: String,
+    summary: SummaryView,
     intent: SafeTxIntent,
     signers: Vec<Address>,
     threshold: u8,
@@ -347,7 +372,7 @@ enum Verdict {
 struct PreviewView {
     /// The EIP-712 digest every owner would sign, rebuilt from the intent the server built.
     safe_tx_hash: B256,
-    summary: String,
+    summary: SummaryView,
     policy: Verdict,
     /// Whether `safes.toml` describes this (Safe, chain); an unknown one cannot be filed.
     safe_known: bool,
@@ -360,6 +385,16 @@ struct PreviewView {
 struct ProposedView {
     hash: B256,
     summary: String,
+}
+
+/// The canonical signatures of one destination's rules, which is the text an operator writes
+/// into the policy file and the text the daemon decodes against.
+fn signatures(rules: &[hc_sign::schema::CallRule]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        out.push(rule.signature.canonical().to_string());
+    }
+    out
 }
 
 fn list_safes() -> Result<Value, McpErr> {
@@ -405,7 +440,7 @@ fn list_signing_keys() -> Result<Value, McpErr> {
         for rule in policy.allow {
             allow.push(RuleView {
                 to: rule.to,
-                selectors: rule.selectors,
+                signatures: signatures(&rule.call),
                 max_value: rule.max_value,
                 operation: rule.operation,
             });
@@ -417,8 +452,9 @@ fn list_signing_keys() -> Result<Value, McpErr> {
             allow,
             owner_management: OwnerMgmtView {
                 allow: policy.owner_management.allow,
-                selectors: policy.owner_management.selectors,
+                signatures: signatures(&policy.owner_management.call),
             },
+            typed_data: policy.typed_data.iter().map(|s| s.schema.clone()).collect(),
             refunds_configured: policy.refunds.is_some(),
         });
     }
@@ -457,9 +493,13 @@ fn bundle_status(arg: HashArg) -> Result<Value, McpErr> {
     for sig in &status.bundle.signatures {
         signers.push(sig.signer);
     }
+    let summary = match Policy::load(&config.store_path(), &status.bundle.intent.key) {
+        Ok(loaded) => summary_of(status.bundle.intent.clone(), &loaded, &config),
+        Err(_) => SummaryView::Refused,
+    };
     Ok(serde_json::to_value(StatusView {
         hash: status.hash,
-        summary: adapter::summary(&status.bundle.intent, &config),
+        summary,
         signers,
         threshold: status.bundle.threshold,
         safes_threshold: status.safes_threshold,
@@ -472,6 +512,20 @@ fn bundle_status(arg: HashArg) -> Result<Value, McpErr> {
     })?)
 }
 
+/// The approval text of one intent under one policy, which exists only if the policy admits it.
+/// It comes out of the signer's own `prepare`, so the text here is the text the operator will
+/// read — there is no second renderer that could disagree with it.
+fn summary_of(
+    intent: SafeTxIntent,
+    policy: &hc_sign::policy::LoadedPolicy,
+    config: &Config,
+) -> SummaryView {
+    match hc_sign::sign::prepare(intent, policy, None, B256::ZERO, config) {
+        Ok((_approved, text)) => SummaryView::Decoded { text },
+        Err(_) => SummaryView::Refused,
+    }
+}
+
 /// Judge a transfer and store nothing. The verdict runs the signer's own `prepare`, so it is the
 /// same answer `propose_erc20_transfer` will get; a policy file that will not load is itself a
 /// denial, because a policy that cannot be read has authorized nothing.
@@ -479,20 +533,28 @@ fn preview_erc20_transfer(transfer: Erc20Transfer) -> Result<Value, McpErr> {
     let intent = transfer.intent()?;
     let config = Config::load()?;
     let safe_known = Safes::load()?.find(intent.safe, intent.chain_id).is_ok();
-    let policy = match Policy::load(&config.store_path(), &intent.key) {
-        Ok(loaded) => match hc_sign::sign::prepare(intent.clone(), &loaded, B256::ZERO, &config) {
-            Ok(_) => Verdict::Allowed,
-            Err(e) => Verdict::Denied {
+    let (policy, summary) = match Policy::load(&config.store_path(), &intent.key) {
+        Ok(loaded) => {
+            match hc_sign::sign::prepare(intent.clone(), &loaded, None, B256::ZERO, &config) {
+                Ok((_approved, text)) => (Verdict::Allowed, SummaryView::Decoded { text }),
+                Err(e) => (
+                    Verdict::Denied {
+                        denial: e.to_string(),
+                    },
+                    SummaryView::Refused,
+                ),
+            }
+        }
+        Err(e) => (
+            Verdict::Denied {
                 denial: e.to_string(),
             },
-        },
-        Err(e) => Verdict::Denied {
-            denial: e.to_string(),
-        },
+            SummaryView::Refused,
+        ),
     };
     Ok(serde_json::to_value(PreviewView {
         safe_tx_hash: adapter::safe_tx_hash(&intent),
-        summary: adapter::summary(&intent, &config),
+        summary,
         policy,
         safe_known,
         slot_taken: slot_held(&intent)?,

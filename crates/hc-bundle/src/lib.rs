@@ -19,13 +19,14 @@
 //! [`collect`] takes the answer back — so the CLI and the console both drive it through
 //! whichever unlock path they already own, and neither one grows a second route to a key.
 pub mod ingest;
+pub mod poll;
 pub mod sync;
 pub mod tailnet;
 
 use crate::sync::SyncMode;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use err_mac::create_err_with_impls;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use hc_core::config::bundles_dir;
 use hc_core::crypto::envelope::atomic_write;
 use hc_sign::bundle::{CollectedSignature, SafeTxBundle};
@@ -303,7 +304,7 @@ fn load_all() -> Result<Vec<Loaded>, BundleErr> {
 }
 
 /// Whatever `scope` covers that actually loads.
-fn loaded(scope: Scope) -> Result<Vec<Loaded>, BundleErr> {
+pub(crate) fn loaded(scope: Scope) -> Result<Vec<Loaded>, BundleErr> {
     let Scope::One(hash) = scope else {
         return load_all();
     };
@@ -582,63 +583,6 @@ pub struct Arrival {
     pub threshold: u8,
     /// Whether that threshold is now covered.
     pub met: bool,
-}
-
-/// Which signers each watched bundle held last time, so a poll can name what just arrived.
-///
-/// The loop belongs to the caller: a terminal wants a sleep, a console wants its own tick, and
-/// neither wants a library owning the process. Nothing here spawns or backgrounds anything.
-pub struct Watch {
-    scope: Scope,
-    seen: HashMap<B256, HashSet<Address>>,
-}
-
-impl Watch {
-    /// Prime from what is already on this disk, without syncing, so the first poll reports
-    /// what ARRIVED rather than everything that was already there.
-    pub fn start(scope: Scope) -> Result<Self, BundleErr> {
-        let mut watch = Watch {
-            scope,
-            seen: HashMap::new(),
-        };
-        watch.take_stock(loaded(scope)?);
-        Ok(watch)
-    }
-
-    /// How many bundles are being watched.
-    pub fn watching(&self) -> usize {
-        self.seen.len()
-    }
-
-    /// Pull, judge what landed, and report every signature that was not there last time.
-    pub fn poll(&mut self, sync: SyncMode) -> Result<Vec<Arrival>, BundleErr> {
-        sync.pull(self.scope);
-        let mut arrivals = Vec::new();
-        for one in loaded(self.scope)? {
-            let seen = self.seen.entry(one.hash).or_default();
-            for sig in &one.bundle.signatures {
-                if seen.insert(sig.signer) {
-                    arrivals.push(Arrival {
-                        hash: one.hash,
-                        signer: sig.signer,
-                        have: one.bundle.signatures.len(),
-                        threshold: one.bundle.threshold,
-                        met: one.bundle.met(),
-                    });
-                }
-            }
-        }
-        Ok(arrivals)
-    }
-
-    fn take_stock(&mut self, bundles: Vec<Loaded>) {
-        for one in bundles {
-            let seen = self.seen.entry(one.hash).or_default();
-            for sig in &one.bundle.signatures {
-                seen.insert(sig.signer);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

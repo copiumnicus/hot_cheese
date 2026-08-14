@@ -4,10 +4,17 @@
 //! the console's. It sits here rather than in `hc-sign` because a phone links that crate to run
 //! the policy and the digest, and a phone has no terminal to draw on.
 pub mod approval;
-pub mod backup;
+pub mod bundle_poll;
+pub mod exposure;
+pub mod flock;
+pub mod git_store;
+pub mod live;
 pub mod qr_term;
+pub mod renderer;
+pub mod runtime;
 pub mod socket;
 
+use crate::approval::Approver;
 use alloy_primitives::B256;
 use df_share::error::Unspecified;
 use df_share::{to_hex_str, ClientReq, EphemeralServer};
@@ -20,8 +27,9 @@ use hc_core::mac::local_auth::LaContext;
 use hc_core::mac::BackendImpl;
 use hc_core::unlock::UnlockErr;
 use hc_sign::grant::SignGrant;
+use hc_sign::intent::SafeTxIntent;
 use hc_sign::manifest::LoadedManifest;
-use hc_sign::{SafeSignature, SignErr};
+use hc_sign::{SafeSignature, SignErr, SignResponse};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -30,17 +38,16 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io;
 use std::io::BufReader;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroize;
@@ -59,8 +66,6 @@ create_err_with_impls!(
     #[derive(Debug)]
     pub ServeErr,
     StdIo(io::Error),
-    Manifest(hc_sign::manifest::ManifestErr),
-    Socket(socket::SocketErr),
     Rustls(rustls::Error)
     ;
 );
@@ -78,77 +83,26 @@ pub fn tls_from_home() -> Result<TlsAcceptor, ServeErr> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-/// A signal that ends `serve`.
-#[derive(Clone, Copy, Debug)]
-enum ExitSignal {
-    Interrupt,
-    Terminate,
-    Hangup,
-}
-
-/// `hot_cheese serve`: bind loopback plus one socket per trusted adapter, and unlock on a
-/// blocking thread via the TTY approver. Every manifest is loaded, pin-checked and
-/// intersected with the policies in force BEFORE anything binds, so a manifest that claims
-/// more than its key's policy grants stops the daemon here instead of at an incident.
-///
-/// SIGINT, SIGTERM and SIGHUP end the accept loops and return through here, so the sockets
-/// bound below are unlinked on every ending the process can act on. `SIGKILL` cannot be caught
-/// by anything, and the stale-socket protocol in [`socket`] is what covers the file it strands.
-#[tokio::main]
-pub async fn run_server(backend: Box<dyn BackendImpl>, config: Config) -> Result<(), ServeErr> {
-    let adapters = hc_sign::manifest::load_all(&config)?;
-    let tls = tls_from_home()?;
-    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), config.port());
-    let listener = TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, adapters = adapters.len(), "hot_cheese serving over https");
-
-    let config = Arc::new(config);
-    let approval = Approval::Inline {
-        api: Arc::new(HotApi::new(backend, config.clone())),
-        approver: Arc::new(crate::approval::ServeApprover),
-    };
-    let (shutdown, rx) = watch::channel(false);
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    tokio::spawn(async move {
-        let caught = tokio::select! {
-            _ = interrupt.recv() => ExitSignal::Interrupt,
-            _ = terminate.recv() => ExitSignal::Terminate,
-            _ = hangup.recv() => ExitSignal::Hangup,
-        };
-        tracing::warn!(signal = ?caught, "stopping every listener and unlinking its socket");
-        let _ = shutdown.send(true);
-    });
-
-    let mut sockets = socket::AdapterSockets::bind(adapters)?;
-    for (adapter, bound) in sockets.bound.drain(..) {
-        let config = config.clone();
-        let approval = approval.clone();
-        let rx = rx.clone();
-        tokio::spawn(async move {
-            let id = adapter.manifest.id.clone();
-            if let Err(e) = serve_loop(
-                Listener::Unix(bound),
-                Peer::Adapter(adapter),
-                config,
-                approval,
-                rx,
-            )
-            .await
-            {
-                tracing::error!(adapter = %id, error = ?e, "adapter listener exited");
-            }
-        });
-    }
-    serve_loop(
-        Listener::Tcp(listener, tls),
-        Peer::Loopback,
+/// `hot_cheese serve`: the headless renderer over the one [`runtime::Runtime`]. Every manifest
+/// is loaded, pin-checked and intersected with the policies in force BEFORE anything binds, so a
+/// manifest that claims more than its key's policy grants stops the daemon at startup instead of
+/// at an incident. `store` is the claim `hot_cheese serve` took above its own clone-if-absent.
+pub fn serve(
+    config: Config,
+    backend: Box<dyn BackendImpl>,
+    store: flock::Claim,
+) -> Result<(), runtime::RuntimeErr> {
+    let mut rt = runtime::Runtime::start(
         config,
-        approval,
-        rx,
-    )
-    .await
+        backend,
+        runtime::UnlockGate::Biometric,
+        Arc::new(renderer::Headless::detect()),
+        runtime::BindPort::Configured,
+        store,
+    )?;
+    let result = rt.approve_forever();
+    rt.stop();
+    result
 }
 
 /// How long the accept loop waits after a failed `accept` before trying again.
@@ -209,18 +163,24 @@ impl Listener {
 ///
 /// A connection that has not produced a single request within [`HANDSHAKE_TIMEOUT`] is closed;
 /// once it has, it is served for as long as it takes, because the wait it is in is a human's.
-async fn serve_io<I>(io: TokioIo<I>, config: Arc<Config>, approval: Approval, peer: Peer)
-where
+async fn serve_io<I>(
+    io: TokioIo<I>,
+    git: Arc<git_store::GitStore>,
+    ops: mpsc::Sender<PrivilegedOp>,
+    pending: Arc<live::Pending>,
+    peer: Peer,
+) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let asked = Arc::new(AtomicBool::new(false));
     let requested = asked.clone();
     let service = service_fn(move |req| {
         requested.store(true, Ordering::Relaxed);
-        let config = config.clone();
-        let approval = approval.clone();
+        let git = git.clone();
+        let ops = ops.clone();
+        let pending = pending.clone();
         let peer = peer.clone();
-        async move { service_impl(req, config, approval, peer).await }
+        async move { service_impl(req, git, ops, pending, peer).await }
     });
     let mut builder = Builder::new(TokioExecutor::new());
     builder
@@ -254,8 +214,9 @@ where
 pub async fn serve_loop(
     listener: Listener,
     peer: Peer,
-    config: Arc<Config>,
-    approval: Approval,
+    git: Arc<git_store::GitStore>,
+    ops: mpsc::Sender<PrivilegedOp>,
+    pending: Arc<live::Pending>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServeErr> {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -279,8 +240,9 @@ pub async fn serve_loop(
             );
             continue;
         };
-        let config = config.clone();
-        let approval = approval.clone();
+        let git = git.clone();
+        let ops = ops.clone();
+        let pending = pending.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
             let _slot = slot;
@@ -298,10 +260,10 @@ pub async fn serve_loop(
                             return;
                         }
                     };
-                    serve_io(TokioIo::new(tls_stream), config, approval, peer).await;
+                    serve_io(TokioIo::new(tls_stream), git, ops, pending, peer).await;
                 }
                 Accepted::Unix(stream) => {
-                    serve_io(TokioIo::new(stream), config, approval, peer).await
+                    serve_io(TokioIo::new(stream), git, ops, pending, peer).await
                 }
             }
         });
@@ -388,6 +350,16 @@ pub struct OpContext {
 }
 
 impl OpContext {
+    /// Name an operation the operator invoked at this machine's own keyboard. Nothing outside a
+    /// listener may choose its own provenance.
+    pub fn local(key: String, op: Operation) -> Self {
+        Self {
+            key,
+            op,
+            peer: Peer::Cli,
+        }
+    }
+
     /// The line shown on the Touch ID sheet and in the console's approval prompt.
     pub fn reason(&self) -> String {
         let route = match self.op {
@@ -477,53 +449,54 @@ pub struct PrivilegedOp {
 /// Privileged ops that may queue before the console starts refusing with 503.
 pub const PENDING_OPS: usize = 4;
 
-/// Takes the human decision. It returns a pre-evaluated biometric context when the flow it
-/// approved reuses one; a session whose KEK is the recovery passphrase has no biometric to
-/// reuse, so it approves with `None` and the passphrase unlocker does the unwrapping.
-pub trait Approver: Send + Sync {
-    fn approve(&self, ctx: &OpContext, summary: &str) -> Result<Option<LaContext>, SignErr>;
-}
+/// Hex characters of the request-body digest shown at the prompt: enough that two concurrent
+/// `/read`s for one keystore, which differ in nothing else, are two different lines.
+const DIGEST_CHARS: usize = 16;
 
-/// How a connection task turns a request into a reply.
-#[derive(Clone)]
-pub enum Approval {
-    /// The daemon unlocks on a blocking thread, so a prompt waiting on a human never occupies
-    /// an async worker and `/health` keeps answering while one is up.
-    Inline {
-        api: Arc<HotApi>,
-        approver: Arc<dyn Approver>,
-    },
-    /// The console keeps the backend on its main thread; workers only shuttle ciphertext.
-    Console(mpsc::Sender<PrivilegedOp>),
-}
-
-/// Run one operation against the backend. Callers must already own the approval thread.
+/// Run one operation against the backend. Callers must already own the approval thread. Every
+/// arm reaches `approver`, because every one of them is a request that arrived over the network
+/// surface and each costs the key owner something.
 ///
-/// The export permit is minted here, from the target's cleartext header, before `read` is
-/// reachable at all: a key that is not sealed shareable is refused without unlocking anything,
-/// and a remote caller may only ever mint itself a [`KeyUse::SignOnly`] key.
+/// The export permit is minted BEFORE the prompt, from the target's cleartext header: a key that
+/// is not sealed shareable is refused without unlocking anything and without costing an
+/// approval, and a remote caller may only ever mint itself a [`KeyUse::SignOnly`] key. `Sign`
+/// prompts inside [`HotApi::sign_intent`], after the policy and the manifest have run, for the
+/// same reason.
 pub fn execute(
     api: &HotApi,
-    approver: &dyn Approver,
+    approver: &Approver,
     ctx: &OpContext,
     body: &[u8],
 ) -> Result<Vec<u8>, OpErr> {
     match ctx.op {
         Operation::Read => {
             let permit = api.export_permit(ctx)?;
+            let digest = hex::encode(Sha256::digest(body));
+            approver.approve(
+                ctx,
+                &format!("request body sha256 {}", &digest[..DIGEST_CHARS]),
+            )?;
             Ok(api.read(ctx, body, permit)?)
         }
         Operation::Sign => Ok(api.sign_intent(ctx, body, approver)?),
         Operation::EvmGenerate => {
+            approver.approve(ctx, "")?;
             api.generate(ctx, KeyUse::SignOnly)?;
             Ok(b"success".to_vec())
         }
         Operation::SolanaGenerate => {
+            approver.approve(ctx, "")?;
             api.generate_solana(ctx, KeyUse::SignOnly)?;
             Ok(b"success".to_vec())
         }
-        Operation::EvmAddress => Ok(api.address(ctx)?.into_bytes()),
-        Operation::SolanaAddress => Ok(api.address_solana(ctx)?.into_bytes()),
+        Operation::EvmAddress => {
+            approver.approve(ctx, "")?;
+            Ok(api.address(ctx)?.into_bytes())
+        }
+        Operation::SolanaAddress => {
+            approver.approve(ctx, "")?;
+            Ok(api.address_solana(ctx)?.into_bytes())
+        }
     }
 }
 
@@ -532,20 +505,24 @@ create_err_with_impls!(
     pub(crate) DelegateErr,
     Overloaded,
     ConsoleGone,
-    Op(OpErr),
-    Join(tokio::task::JoinError)
+    Op(OpErr)
     ;
 );
 
-/// Hand the op to the console's main thread and await its ciphertext. The queue bounds memory
-/// only — a freed slot refills at once — so the flood bound is the console's per-pass approval
-/// cap, not this depth.
+/// Hand the op to the thread that owns the runtime and await its ciphertext. The queue bounds
+/// memory only — a freed slot refills at once — so the flood bound is the terminal renderer's
+/// per-pass approval cap, not this depth.
+///
+/// The gauge slot is taken BEFORE the send, so there is no instant in which an op is queued and
+/// uncounted; a refused send drops it on the `return`, which nets to zero.
 async fn delegate(
     tx: &mpsc::Sender<PrivilegedOp>,
+    pending: &Arc<live::Pending>,
     ctx: OpContext,
     body: Bytes,
 ) -> Result<Vec<u8>, DelegateErr> {
     let (reply, answer) = oneshot::channel();
+    let _outstanding = live::Outstanding::new(pending.clone());
     if let Err(e) = tx.try_send(PrivilegedOp { ctx, body, reply }) {
         return Err(match e {
             mpsc::error::TrySendError::Full(_) => DelegateErr::Overloaded,
@@ -731,37 +708,46 @@ impl HotApi {
         hc_sign::sign::sign_with_grant(self.inner.as_ref(), &ctx.key, &ctx.reason(), auth, grant)
     }
 
-    /// Enforce the per-key policy and — for a request that arrived on an adapter's socket —
-    /// that adapter's manifest on top of it, take the single biometric approval, mint and verify
-    /// the grant that signing demands, sign, and return the JSON [`hc_sign::SignResponse`]. The
-    /// manifest is an intersection, never a union: both it and the policy must pass, and the
-    /// grant carries its digest so a hardware approval is bound to the exact adapter build that
-    /// asked. Everything that can refuse the request — the name, the intent, the policy, the
-    /// manifest, the pin — runs BEFORE the prompt, so a refusal costs the owner no biometric;
-    /// after it only the enclave grant signature and the enclave ECDH of [`HotApi::sign`]
-    /// remain, which is what keeps both inside one Touch ID.
-    ///
-    /// What is daemon-specific stays here: the route's key name, the request body, the
-    /// provenance the listener stamped, and the pinned grant key from this machine's config.
-    /// The rest is [`hc_sign::sign::prepare`] and [`hc_sign::sign::finish`], with the human's
-    /// decision — a printed summary and Touch ID here, a sheet and Face ID on a phone — taken
-    /// between them.
+    /// The wire form of [`HotApi::sign_typed`] and [`HotApi::sign_typed_data`]: an untrusted body
+    /// is parsed before anything privileged runs, its `kind` selects which of the two it is, and
+    /// the typed answer goes back out as JSON. `#[serde(deny_unknown_fields)]` on each variant's
+    /// struct makes the parsed value a faithful view of the bytes rather than a lossy one — which
+    /// is what makes a typed-data body carrying its own `types`, `primaryType` or `domain` a
+    /// parse failure here instead of a shape to compare against.
     pub fn sign_intent(
         &self,
         ctx: &OpContext,
         body: &[u8],
-        approver: &dyn Approver,
+        approver: &Approver,
     ) -> Result<Vec<u8>, SignErr> {
+        let response = match serde_json::from_slice(body)? {
+            hc_sign::intent::Intent::SafeTx(intent) => self.sign_typed(ctx, intent, approver)?,
+            hc_sign::intent::Intent::TypedData(intent) => {
+                self.sign_typed_data(ctx, intent, approver)?
+            }
+        };
+        Ok(serde_json::to_vec(&response)?)
+    }
+
+    /// The same flow for an EIP-712 message. The shape is the POLICY's `[[typed_data]]` block,
+    /// never the request's: an adapter needs `typed_data` in its `intent_kinds` and the schema
+    /// name in its own grant to reach one at all, and everything that can refuse still runs
+    /// before the prompt.
+    pub fn sign_typed_data(
+        &self,
+        ctx: &OpContext,
+        intent: hc_sign::intent::TypedDataIntent,
+        approver: &Approver,
+    ) -> Result<SignResponse, SignErr> {
         if !is_valid_string_name(&ctx.key) {
             return Err(SignErr::InvalidName);
         }
-        let hc_sign::intent::Intent::SafeTx(intent) = serde_json::from_slice(body)?;
         if intent.key != ctx.key {
             return Err(SignErr::IntentKeyMismatch);
         }
         let manifest_digest = match &ctx.peer {
             Peer::Adapter(adapter) => {
-                hc_sign::manifest::evaluate(&intent, &adapter.manifest)?;
+                hc_sign::manifest::evaluate_typed(&intent, &adapter.manifest)?;
                 adapter.digest
             }
             Peer::Cli | Peer::Loopback | Peer::Unattributed { .. } => B256::ZERO,
@@ -774,37 +760,74 @@ impl HotApi {
             .ok_or(hc_sign::grant::GrantErr::NoPinnedGrantKey)?;
 
         let (approved, summary) =
-            hc_sign::sign::prepare(intent, &loaded, manifest_digest, &self.config)?;
+            hc_sign::sign::prepare_typed_data(intent, &loaded, manifest_digest, &self.config)?;
         let auth = approver.approve(ctx, &summary)?;
-        let response = hc_sign::sign::finish(
+        hc_sign::sign::finish(
             approved,
             self.inner.as_ref(),
             pinned,
             auth.as_ref(),
             &ctx.reason(),
-        )?;
-        Ok(serde_json::to_vec(&response)?)
+        )
     }
-}
 
-/// Best-effort backup push after a mutating HTTP request (key generation), offloaded to a
-/// blocking task so rsync never blocks the async handler. No-op without configured remotes.
-fn backup_after_mutation(cfg: &Arc<Config>) {
-    if cfg.backup_remotes.is_empty() {
-        return;
-    }
-    let cfg = cfg.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = backup::push_all(&cfg) {
-            tracing::warn!(error = %e, "post-generate backup push failed");
+    /// Enforce the per-key policy and — for a request that arrived on an adapter's socket —
+    /// that adapter's manifest on top of it, take the single biometric approval, mint and verify
+    /// the grant that signing demands, and sign. The manifest is an intersection, never a union:
+    /// both it and the policy must pass, and the grant carries its digest so a hardware approval
+    /// is bound to the exact adapter build that asked. Everything that can refuse the request —
+    /// the name, the intent, the policy, the manifest, the pin — runs BEFORE the prompt, so a
+    /// refusal costs the owner no biometric; after it only the enclave grant signature and the
+    /// enclave ECDH of [`HotApi::sign`] remain, which is what keeps both inside one Touch ID.
+    ///
+    /// What is daemon-specific stays here: the route's key name, the intent, the provenance the
+    /// listener stamped, and the pinned grant key from this machine's config. The rest is
+    /// [`hc_sign::sign::prepare`] and [`hc_sign::sign::finish`], with the human's decision — a
+    /// printed summary and Touch ID here, a sheet and Face ID on a phone — taken between them.
+    pub fn sign_typed(
+        &self,
+        ctx: &OpContext,
+        intent: SafeTxIntent,
+        approver: &Approver,
+    ) -> Result<SignResponse, SignErr> {
+        if !is_valid_string_name(&ctx.key) {
+            return Err(SignErr::InvalidName);
         }
-    });
+        if intent.key != ctx.key {
+            return Err(SignErr::IntentKeyMismatch);
+        }
+        let (grant, manifest_digest) = match &ctx.peer {
+            Peer::Adapter(adapter) => (
+                Some(hc_sign::manifest::evaluate(&intent, &adapter.manifest)?),
+                adapter.digest,
+            ),
+            Peer::Cli | Peer::Loopback | Peer::Unattributed { .. } => (None, B256::ZERO),
+        };
+        let loaded = hc_sign::policy::Policy::load(&self.inner.store_path(), &ctx.key)?;
+        let pinned = self
+            .config
+            .grant_public_key
+            .as_deref()
+            .ok_or(hc_sign::grant::GrantErr::NoPinnedGrantKey)?;
+
+        let (approved, summary) =
+            hc_sign::sign::prepare(intent, &loaded, grant, manifest_digest, &self.config)?;
+        let auth = approver.approve(ctx, &summary)?;
+        hc_sign::sign::finish(
+            approved,
+            self.inner.as_ref(),
+            pinned,
+            auth.as_ref(),
+            &ctx.reason(),
+        )
+    }
 }
 
 async fn service_impl(
     req: Request<Incoming>,
-    config: Arc<Config>,
-    approval: Approval,
+    git: Arc<git_store::GitStore>,
+    ops: mpsc::Sender<PrivilegedOp>,
+    pending: Arc<live::Pending>,
     peer: Peer,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let mut response = Response::new(Full::default());
@@ -836,23 +859,15 @@ async fn service_impl(
     }
 
     let ctx = OpContext { key, op, peer };
-    let outcome = match approval {
-        Approval::Inline { api, approver } => {
-            let unlock =
-                tokio::task::spawn_blocking(move || execute(&api, approver.as_ref(), &ctx, &body));
-            match unlock.await {
-                Ok(Ok(answer)) => Ok(answer),
-                Ok(Err(e)) => Err(e.into()),
-                Err(e) => Err(e.into()),
-            }
-        }
-        Approval::Console(tx) => delegate(&tx, ctx, body).await,
-    };
-    match outcome {
+    match delegate(&ops, &pending, ctx, body).await {
         Ok(out) => {
             *response.body_mut() = out.into();
             if matches!(op, Operation::EvmGenerate | Operation::SolanaGenerate) {
-                backup_after_mutation(&config);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = git.after_mutation() {
+                        tracing::warn!(error = %e, "recording a store mutation failed");
+                    }
+                });
             }
         }
         Err(DelegateErr::Op(e)) => {
@@ -870,7 +885,7 @@ async fn service_impl(
 #[cfg(test)]
 mod test {
     use super::*;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, U256};
     use hc_core::crypto::envelope::{Dek, EnvErr};
 
     struct TestBackend {
@@ -886,11 +901,7 @@ mod test {
     }
 
     fn ctx(key: &str, op: Operation) -> OpContext {
-        OpContext {
-            key: key.to_string(),
-            op,
-            peer: Peer::Cli,
-        }
+        OpContext::local(key.to_string(), op)
     }
 
     #[test]
@@ -979,10 +990,10 @@ mod test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Name validation is centralized in `sign_intent`, so the CLI path (which forwards an
-    /// unvalidated intent key) is rejected before any body parse, policy load, or unlock.
+    /// Name validation is centralized in `sign_typed`, so a local caller forwarding an
+    /// unvalidated key name is rejected before any policy load or unlock.
     #[test]
-    fn sign_intent_rejects_invalid_name() {
+    fn sign_typed_rejects_invalid_name() {
         let api = HotApi {
             inner: Box::new(TestBackend {
                 store: "/nonexistent".to_string(),
@@ -990,16 +1001,50 @@ mod test {
             config: Config::for_test("/nonexistent"),
         };
         assert!(matches!(
-            api.sign_intent(&ctx("bad name!", Operation::Sign), b"{}", &DenyAll),
+            api.sign_typed(
+                &ctx("bad name!", Operation::Sign),
+                SafeTxIntent {
+                    key: "bad name!".to_string(),
+                    safe: Address::ZERO,
+                    chain_id: U256::from(1),
+                    to: Address::ZERO,
+                    value: U256::ZERO,
+                    data: alloy_primitives::Bytes::new(),
+                    operation: hc_sign::intent::Operation::Call,
+                    safe_tx_gas: U256::ZERO,
+                    base_gas: U256::ZERO,
+                    gas_price: U256::ZERO,
+                    gas_token: Address::ZERO,
+                    refund_receiver: Address::ZERO,
+                    nonce: U256::ZERO,
+                },
+                &recording(renderer::Decision::Deny).1
+            ),
             Err(SignErr::InvalidName)
         ));
     }
 
-    struct DenyAll;
-    impl Approver for DenyAll {
-        fn approve(&self, _ctx: &OpContext, _summary: &str) -> Result<Option<LaContext>, SignErr> {
-            Err(SignErr::ApprovalDenied)
+    /// Records every prompt it was shown and answers all of them the same way.
+    struct Recorder {
+        answer: renderer::Decision,
+        seen: parking_lot::Mutex<Vec<(u64, Operation)>>,
+    }
+
+    impl renderer::Renderer for Recorder {
+        fn ask(&self, seq: u64, ctx: &OpContext, _summary: &str) -> renderer::Decision {
+            self.seen.lock().push((seq, ctx.op));
+            self.answer
         }
+        fn restore(&self) {}
+    }
+
+    fn recording(answer: renderer::Decision) -> (Arc<Recorder>, Approver) {
+        let recorder = Arc::new(Recorder {
+            answer,
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let approver = Approver::new(runtime::UnlockGate::Biometric, recorder.clone());
+        (recorder, approver)
     }
 
     /// Every unlock fails, so any error other than the unlock error proves the DEK was never
@@ -1039,20 +1084,133 @@ mod test {
         let (req, _decryptor) = df_share::EphemeralClient::new().unwrap().sendable();
         let body = serde_json::to_vec(&req).unwrap();
 
+        let (recorder, approver) = recording(renderer::Decision::Approve);
         assert!(matches!(
-            execute(&api, &DenyAll, &ctx("LOCKED", Operation::Read), &body),
+            execute(&api, &approver, &ctx("LOCKED", Operation::Read), &body),
             Err(OpErr::ApiBackend(ApiBackendErr::Envelope(
                 EnvErr::ExportRefused {
                     key_use: KeyUse::SignOnly
                 }
             )))
         ));
+        assert!(
+            recorder.seen.lock().is_empty(),
+            "a structural refusal must cost no prompt"
+        );
         assert!(matches!(
-            execute(&api, &DenyAll, &ctx("OPEN", Operation::Read), &body),
+            execute(&api, &approver, &ctx("OPEN", Operation::Read), &body),
             Err(OpErr::ApiBackend(ApiBackendErr::Unlock(
                 UnlockErr::NoMatchingEnrollment
             )))
         ));
+        assert_eq!(
+            recorder.seen.lock().len(),
+            1,
+            "the shareable key is prompted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const EVERY_OP_POLICY: &str = concat!(
+        "safe = \"0x1111111111111111111111111111111111111111\"\n",
+        "chain_id = 1\n",
+        "\n",
+        "[[allow]]\n",
+        "to = \"0x2222222222222222222222222222222222222222\"\n",
+        "max_value = \"0\"\n",
+        "operation = \"call\"\n",
+        "\n",
+        "  [[allow.call]]\n",
+        "  signature = \"transfer(address,uint256)\"\n",
+        "\n",
+        "    [[allow.call.arg]]\n",
+        "    at = 0\n",
+        "    name = \"to\"\n",
+        "    rule = \"unbounded\"\n",
+        "\n",
+        "    [[allow.call.arg]]\n",
+        "    at = 1\n",
+        "    name = \"amount\"\n",
+        "    rule = \"unbounded\"\n",
+        "\n",
+        "[[typed_data]]\n",
+        "schema = \"permit2_usdc\"\n",
+        "primary_type = \"Note\"\n",
+        "\n",
+        "  [typed_data.domain]\n",
+        "  chain_id = 1\n",
+        "  verifying_contract = \"0x2222222222222222222222222222222222222222\"\n",
+        "\n",
+        "  [[typed_data.types]]\n",
+        "  name = \"Note\"\n",
+        "\n",
+        "    [[typed_data.types.field]]\n",
+        "    name = \"text\"\n",
+        "    type = \"string\"\n",
+        "    rule = { enum = { one_of = [\"hello\"] } }\n",
+    );
+
+    const TRANSFER_DATA: &str = "0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a";
+
+    const EVERY_OP_INTENT: &str = concat!(
+        "{\"kind\":\"safe_tx\",\"key\":\"EVERY_OP\",",
+        "\"safe\":\"0x1111111111111111111111111111111111111111\",",
+        "\"chain_id\":1,\"to\":\"0x2222222222222222222222222222222222222222\",",
+        "\"value\":\"0\",\"data\":\"0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a\",\"operation\":\"call\",\"nonce\":0}"
+    );
+
+    /// Every privileged route is a request the key owner answers, so a renderer that denies
+    /// everything must turn all six into `ApprovalDenied`. An unlock error from any of them
+    /// would mean that route reached the DEK without a human, and an arm added later without a
+    /// prompt fails here rather than in production.
+    #[test]
+    fn every_privileged_operation_reaches_the_approver() {
+        let dir = std::env::temp_dir().join("hot_cheese_every_op_prompts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("policies")).unwrap();
+        std::fs::write(dir.join("policies").join("EVERY_OP.toml"), EVERY_OP_POLICY).unwrap();
+        encrypt_file(
+            &dir,
+            "EVERY_OP",
+            &Dek::from_bytes([42u8; 32]),
+            KeyUse::Shareable,
+            &[0x33u8; 32],
+        )
+        .unwrap();
+
+        let store = dir.to_string_lossy().to_string();
+        let api = HotApi {
+            inner: Box::new(NeverUnlocks {
+                store: store.clone(),
+            }),
+            config: Config::for_test(&store),
+        };
+        let (recorder, approver) = recording(renderer::Decision::Deny);
+
+        let every = [
+            Operation::Read,
+            Operation::Sign,
+            Operation::EvmGenerate,
+            Operation::SolanaGenerate,
+            Operation::EvmAddress,
+            Operation::SolanaAddress,
+        ];
+        for op in every {
+            let body: &[u8] = match op {
+                Operation::Sign => EVERY_OP_INTENT.as_bytes(),
+                _ => b"{}",
+            };
+            assert!(
+                matches!(
+                    execute(&api, &approver, &ctx("EVERY_OP", op), body),
+                    Err(OpErr::Sign(SignErr::ApprovalDenied))
+                ),
+                "{op:?} must be refused at the prompt, before the backend"
+            );
+        }
+        let seen: Vec<Operation> = recorder.seen.lock().iter().map(|(_, op)| *op).collect();
+        assert_eq!(seen, every, "every route must have reached the renderer");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1141,6 +1299,123 @@ mod test {
             ),
             Err(BodyErr::Malformed(_))
         ));
+
+        // A typed-data request may not describe its own shape: the digest and the words a human
+        // reads come from the POLICY's schema, so a body carrying `types`, `primaryType` or
+        // `domain` has no field to land in and dies here, at the boundary, before any approval.
+        const TYPED: &str = concat!(
+            "{\"kind\":\"typed_data\",\"key\":\"TRADER\",\"schema\":\"permit2\",",
+            "\"chain_id\":1,",
+            "\"verifying_contract\":\"0x2222222222222222222222222222222222222222\",",
+            "\"message\":{\"amount\":\"1\"}"
+        );
+        assert!(check_body(Operation::Sign, format!("{TYPED}}}").as_bytes()).is_ok());
+        for smuggled in [
+            "\"types\":{\"Permit\":[]}",
+            "\"primaryType\":\"Permit\"",
+            "\"domain\":{\"name\":\"Permit2\"}",
+        ] {
+            assert!(
+                matches!(
+                    check_body(Operation::Sign, format!("{TYPED},{smuggled}}}").as_bytes()),
+                    Err(BodyErr::Malformed(_))
+                ),
+                "a typed-data body must not be able to state {smuggled}"
+            );
+            assert!(
+                matches!(
+                    check_body(Operation::Sign, format!("{INTENT},{smuggled}}}").as_bytes()),
+                    Err(BodyErr::Malformed(_))
+                ),
+                "nor may a safe_tx body carry {smuggled}"
+            );
+        }
+        assert!(
+            check_body(
+                Operation::Sign,
+                format!("{TYPED},\"message\":{{\"types\":{{}}}}}}").as_bytes()
+            )
+            .is_ok(),
+            "a `types` key INSIDE the message parses, and is refused by the schema walk instead"
+        );
+    }
+
+    /// The ordering invariant this whole stage rests on: every typed refusal happens before the
+    /// approver is reached, so no refusal ever costs the owner a Touch ID. Five different
+    /// refusals — a destination outside the policy, a payload that will not decode against the
+    /// declared signature, an argument outside its rule, a typed-data schema the policy never
+    /// declared, and a typed-data message with a field the schema does not name — must all come
+    /// back as different typed errors with the approver never asked once.
+    #[test]
+    fn a_refusal_never_reaches_the_approver() {
+        let dir = std::env::temp_dir().join("hot_cheese_refusal_before_prompt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("policies")).unwrap();
+        std::fs::write(dir.join("policies").join("EVERY_OP.toml"), EVERY_OP_POLICY).unwrap();
+        let store = dir.to_string_lossy().to_string();
+        let api = HotApi {
+            inner: Box::new(NeverUnlocks {
+                store: store.clone(),
+            }),
+            config: Config::for_test(&store),
+        };
+        let (recorder, approver) = recording(renderer::Decision::Approve);
+
+        let body = |to: &str, data: &str| {
+            format!(
+                "{{\"kind\":\"safe_tx\",\"key\":\"EVERY_OP\",\
+                 \"safe\":\"0x1111111111111111111111111111111111111111\",\
+                 \"chain_id\":1,\"to\":\"{to}\",\"value\":\"0\",\"data\":\"{data}\",\
+                 \"operation\":\"call\",\"nonce\":0}}"
+            )
+        };
+        let typed = |schema: &str, message: &str| {
+            format!(
+                "{{\"kind\":\"typed_data\",\"key\":\"EVERY_OP\",\"schema\":\"{schema}\",\
+                 \"chain_id\":1,\
+                 \"verifying_contract\":\"0x2222222222222222222222222222222222222222\",\
+                 \"message\":{message}}}"
+            )
+        };
+        let truncated = &TRANSFER_DATA[..TRANSFER_DATA.len() - 16];
+        let dirty = format!("0xa9059cbbff{}", &TRANSFER_DATA[12..]);
+
+        for (what, body) in [
+            (
+                "a destination the policy never allowed",
+                body("0x9999999999999999999999999999999999999999", TRANSFER_DATA),
+            ),
+            (
+                "a payload that does not decode against the declared signature",
+                body("0x2222222222222222222222222222222222222222", truncated),
+            ),
+            (
+                "a payload that decodes but does not re-encode to the submitted bytes",
+                body("0x2222222222222222222222222222222222222222", &dirty),
+            ),
+            (
+                "a schema the policy never declared",
+                typed("nothing_declared", "{}"),
+            ),
+            (
+                "a message field the schema does not name",
+                typed("permit2_usdc", "{\"ghost\":\"1\"}"),
+            ),
+        ] {
+            let refused = execute(
+                &api,
+                &approver,
+                &ctx("EVERY_OP", Operation::Sign),
+                body.as_bytes(),
+            );
+            assert!(refused.is_err(), "{what} must be refused");
+            assert!(
+                recorder.seen.lock().is_empty(),
+                "{what} reached the approver"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A privileged op crosses from a connection worker to the thread that owns Touch ID, so

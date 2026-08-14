@@ -14,11 +14,12 @@
 //! name; it grants no authority, because there is nothing to grant authority TO.
 //!
 //! Every reachable peer is therefore an untrusted writer, and every pull is followed by
-//! [`crate::ingest::validate`] before anything reads what arrived.
-use crate::ingest::{self, Verdict, MAX_FILE_BYTES};
+//! [`crate::ingest::Ingest::validate`] before anything reads what arrived.
+use crate::ingest::{Ingest, Verdict, MAX_FILE_BYTES};
 use crate::tailnet::{self, Node, TailnetErr};
 use crate::Scope;
 use err_mac::create_err_with_impls;
+use hashbrown::HashSet;
 use hc_core::config::{bundles_dir, BundlePeer, Config};
 use std::path::Path;
 use std::process::Command;
@@ -274,6 +275,10 @@ fn each_peer(pull: bool, scope: Scope) -> Report {
 
 /// Pull `scope` from every enrolled peer, then judge everything that landed. Best-effort in
 /// both halves: an unreachable peer is a warning, and so is a validator that could not run.
+///
+/// The [`Ingest`] is thrown away, so this is always a full pass — the right thing for a one-shot
+/// CLI process, which has no earlier pass to be incremental against. A long-lived caller keeps
+/// its own and gets the incremental one.
 pub fn pull(scope: Scope) -> Report {
     let local = bundles_dir();
     if let Err(e) = std::fs::create_dir_all(&local) {
@@ -284,7 +289,7 @@ pub fn pull(scope: Scope) -> Report {
     if report.peers.is_empty() {
         return report;
     }
-    match ingest::validate(scope) {
+    match Ingest::new().and_then(|mut ingest| ingest.validate(scope, &HashSet::new())) {
         Ok(verdict) => report.verdict = verdict,
         Err(e) => tracing::warn!(error = %e, "could not validate what the pull wrote"),
     }
@@ -294,6 +299,20 @@ pub fn pull(scope: Scope) -> Report {
 /// Push `scope` to every enrolled peer.
 pub fn push(scope: Scope) -> Report {
     each_peer(false, scope)
+}
+
+/// Pull `scope` from ONE peer, without judging what landed. The caller that drives peers one at a
+/// time owns its own [`Ingest`] and judges after each, which is what makes a quarantined file
+/// attributable to the machine that sent it.
+pub fn pull_from(peer: &BundlePeer, scope: Scope) -> Result<(), SyncErr> {
+    let local = bundles_dir();
+    std::fs::create_dir_all(&local)?;
+    run_rsync(&rsync_pull_args(&local, peer, scope))
+}
+
+/// Push `scope` to ONE peer.
+pub fn push_to(peer: &BundlePeer, scope: Scope) -> Result<(), SyncErr> {
+    run_rsync(&rsync_push_args(&bundles_dir(), peer, scope))
 }
 
 /// Both directions, for the explicit `bundle sync`. Pull first so what we send already

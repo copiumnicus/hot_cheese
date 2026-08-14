@@ -108,7 +108,10 @@ mod tests {
         assert!(shown.contains(&VENDOR.to_string()));
         assert_eq!(shown, format!("{VENDOR} (Vendor payouts)"));
 
-        assert_eq!(address(VENDOR, U256::from(10u64), &labelled), VENDOR.to_string());
+        assert_eq!(
+            address(VENDOR, U256::from(10u64), &labelled),
+            VENDOR.to_string()
+        );
         assert_eq!(address(TOKEN, chain, &labelled), TOKEN.to_string());
         assert_eq!(address(VENDOR, chain, &config("")), VENDOR.to_string());
     }
@@ -134,17 +137,29 @@ mod tests {
         assert!(wrong.contains("(1000000)"), "{wrong}");
         assert_eq!(wrong, "0.000000000001000000 USDC (1000000)");
 
-        assert_eq!(amount(U256::from(11u64), TOKEN, chain, &usdc(1)), "1.1 USDC (11)");
+        assert_eq!(
+            amount(U256::from(11u64), TOKEN, chain, &usdc(1)),
+            "1.1 USDC (11)"
+        );
         assert_eq!(
             amount(U256::from(110u64), TOKEN, chain, &usdc(2)),
             "1.10 USDC (110)"
         );
-        assert_eq!(amount(U256::ZERO, TOKEN, chain, &usdc(6)), "0.000000 USDC (0)");
-        assert_eq!(amount(raw, TOKEN, chain, &usdc(0)), "1000000 USDC (1000000)");
+        assert_eq!(
+            amount(U256::ZERO, TOKEN, chain, &usdc(6)),
+            "0.000000 USDC (0)"
+        );
+        assert_eq!(
+            amount(raw, TOKEN, chain, &usdc(0)),
+            "1000000 USDC (1000000)"
+        );
 
         let unlimited = amount(U256::MAX, TOKEN, chain, &usdc(6));
         assert!(unlimited.contains(&U256::MAX.to_string()));
         assert!(unlimited.ends_with(" \u{26a0} UNLIMITED (2^256-1)"));
-        assert_eq!(count(U256::MAX), amount(U256::MAX, TOKEN, chain, &config("")));
+        assert_eq!(
+            count(U256::MAX),
+            amount(U256::MAX, TOKEN, chain, &config(""))
+        );
     }
 }

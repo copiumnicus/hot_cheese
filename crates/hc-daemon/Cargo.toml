@@ -5,12 +5,14 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+hc-bundle.workspace = true
 hc-core.workspace = true
 hc-sign.workspace = true
 
 alloy-primitives.workspace = true
 df-share.workspace = true
 err_mac.workspace = true
+hashbrown.workspace = true
 hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -25,6 +27,7 @@ rand.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 solana-keypair.workspace = true
 solana-signer.workspace = true
 tokio.workspace = true
@@ -35,5 +38,4 @@ zeroize.workspace = true
 [dev-dependencies]
 hc-core = { workspace = true, features = ["test-util"] }
 hc-sign = { workspace = true, features = ["test-util"] }
-sha2.workspace = true
 ureq.workspace = true

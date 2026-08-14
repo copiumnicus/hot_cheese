@@ -59,6 +59,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "alloy-dyn-abi"
+version = "0.8.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf69d3061e2e908a4370bda5d8d6529d5080232776975489eec0b49ce971027e"
+dependencies = [
+ "alloy-json-abi",
+ "alloy-primitives",
+ "alloy-sol-type-parser",
+ "alloy-sol-types",
+ "const-hex",
+ "derive_more",
+ "itoa",
+ "serde",
+ "serde_json",
+ "winnow 0.7.15",
+]
+
+[[package]]
 name = "alloy-json-abi"
 version = "0.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1533,6 +1551,7 @@ dependencies = [
  "hc-core",
  "hc-sign",
  "k256",
+ "parking_lot",
  "serde",
  "serde_json",
  "toml",
@@ -1640,6 +1659,8 @@ dependencies = [
  "alloy-primitives",
  "df-share",
  "err_mac",
+ "hashbrown 0.15.5",
+ "hc-bundle",
  "hc-core",
  "hc-sign",
  "hex",
@@ -1686,6 +1707,8 @@ dependencies = [
 name = "hc-sign"
 version = "0.1.1"
 dependencies = [
+ "alloy-dyn-abi",
+ "alloy-json-abi",
  "alloy-primitives",
  "alloy-sol-types",
  "err_mac",

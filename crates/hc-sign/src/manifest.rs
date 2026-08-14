@@ -1,7 +1,7 @@
 //! Adapter manifests: what one out-of-process adapter may ask this daemon to sign.
 //!
 //! A manifest lives at `<home>/adapters/<id>.toml` — the HOME dir, never the store. The store
-//! is rsynced to backup hosts and replicated by `bootstrap-from`; adapter trust is per-machine
+//! is pushed to backup hosts and replicated by `bootstrap-from`; adapter trust is per-machine
 //! local config and must not travel, so a bootstrapped machine starts with NO adapters, which
 //! is the correct fail-closed default.
 //!
@@ -11,12 +11,13 @@
 //! not a silent intersection. At request time both [`evaluate`] and `policy::evaluate` run
 //! before any prompt: both must pass, there is no union and no override.
 use crate::grant::IntentKind;
-use crate::intent::{Operation, SafeTxIntent};
+use crate::intent::{Operation, SafeTxIntent, TypedDataIntent};
 use crate::policy::{
     match_call, match_refunds, no_duplicate_rules, AllowRule, CallDenied, Policy, RefundDenied,
     RefundPolicy,
 };
-use alloy_primitives::{Address, FixedBytes, B256, U256};
+use crate::schema::{CallRule, FieldRule, Site};
+use alloy_primitives::{Address, B256, U256};
 use err_mac::create_err_with_impls;
 use hc_core::config::{adapter_socket, AdapterPin, Config};
 use hc_core::is_valid_string_name;
@@ -57,6 +58,9 @@ pub struct Grant {
     /// Destinations, in the same rule language `policies/<KEY>.toml` uses.
     #[serde(default)]
     pub calls: Vec<AllowRule>,
+    /// EIP-712 schema names it may name, each of which the policy must already declare.
+    #[serde(default)]
+    pub typed_data: Vec<String>,
     /// Gas-refund allowance, which may only narrow the policy's; absent means no refunds.
     #[serde(default)]
     pub refunds: Option<RefundPolicy>,
@@ -70,7 +74,9 @@ create_err_with_impls!(
     Safe { safe: Address },
     Chain { chain_id: U256 },
     Call { to: Address, operation: Operation },
-    Selector { to: Address, selector: FixedBytes<4> },
+    Signature { to: Address, signature: String },
+    Arg { to: Address, signature: String, at: usize },
+    Schema { schema: String },
     MaxValue { to: Address, max_value: U256 },
     OwnerManagement { safe: Address },
     GasToken { gas_token: Address },
@@ -90,6 +96,7 @@ create_err_with_impls!(
     IntentKindNotGranted { kind: IntentKind },
     SafeNotGranted { safe: Address },
     ChainNotGranted { chain_id: U256 },
+    SchemaNotGranted { schema: String },
     OwnerManagementNotDelegable { safe: Address }
 );
 
@@ -248,18 +255,28 @@ pub fn narrows(grant: &Grant, policy: &Policy) -> Result<(), Widened> {
                 to: rule.to,
                 operation: rule.operation,
             })?;
-        for selector in &rule.selectors {
-            if !allowed.selectors.contains(selector) {
-                return Err(Widened::Selector {
+        for call in &rule.call {
+            let permitted = allowed
+                .call
+                .iter()
+                .find(|c| c.signature.canonical() == call.signature.canonical())
+                .ok_or_else(|| Widened::Signature {
                     to: rule.to,
-                    selector: *selector,
-                });
-            }
+                    signature: call.signature.canonical().to_string(),
+                })?;
+            narrows_args(rule.to, call, permitted)?;
         }
         if rule.max_value > allowed.max_value {
             return Err(Widened::MaxValue {
                 to: rule.to,
                 max_value: rule.max_value,
+            });
+        }
+    }
+    for schema in &grant.typed_data {
+        if !policy.typed_data.iter().any(|s| &s.schema == schema) {
+            return Err(Widened::Schema {
+                schema: schema.clone(),
             });
         }
     }
@@ -301,9 +318,70 @@ pub fn narrows(grant: &Grant, policy: &Policy) -> Result<(), Widened> {
     Ok(())
 }
 
+/// Every argument the grant bounds must be bounded at least as tightly as the policy bounds it.
+/// The load check already proved both rules cover every declared position exactly once, so the
+/// positions line up; what is checked here is the bound itself.
+fn narrows_args(to: Address, grant: &CallRule, policy: &CallRule) -> Result<(), Widened> {
+    for arg in &grant.arg {
+        let Some(ceiling) = policy.arg.iter().find(|c| c.at == arg.at) else {
+            return Err(Widened::Arg {
+                to,
+                signature: grant.signature.canonical().to_string(),
+                at: arg.at,
+            });
+        };
+        if !no_wider(&arg.rule, &ceiling.rule) {
+            return Err(Widened::Arg {
+                to,
+                signature: grant.signature.canonical().to_string(),
+                at: arg.at,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `grant` permits nothing `policy` does not. The clause that matters is the last one:
+/// anything is narrower than a policy `Unbounded`, and `Unbounded` is narrower than nothing
+/// else — an adapter must not be able to unbind an argument the policy bound.
+fn no_wider(grant: &FieldRule, policy: &FieldRule) -> bool {
+    if matches!(policy, FieldRule::Unbounded) {
+        return true;
+    }
+    match (grant, policy) {
+        (FieldRule::OneOf { addresses }, FieldRule::OneOf { addresses: ceiling }) => {
+            addresses.iter().all(|a| ceiling.contains(a))
+        }
+        (FieldRule::Max { max, .. }, FieldRule::Max { max: ceiling, .. }) => max <= ceiling,
+        (FieldRule::Eq { eq }, FieldRule::Max { max: ceiling, .. }) => eq <= ceiling,
+        (FieldRule::Eq { eq }, FieldRule::Eq { eq: ceiling }) => eq == ceiling,
+        (FieldRule::BoolEq { eq }, FieldRule::BoolEq { eq: ceiling }) => eq == ceiling,
+        (FieldRule::BytesEq { eq }, FieldRule::BytesEq { eq: ceiling }) => eq == ceiling,
+        (
+            FieldRule::Deadline { within_secs },
+            FieldRule::Deadline {
+                within_secs: ceiling,
+            },
+        ) => within_secs <= ceiling,
+        (FieldRule::Enum { one_of }, FieldRule::Enum { one_of: ceiling }) => {
+            one_of.iter().all(|s| ceiling.contains(s))
+        }
+        (
+            FieldRule::Each { max_len, of },
+            FieldRule::Each {
+                max_len: ceiling,
+                of: under,
+            },
+        ) => max_len <= ceiling && no_wider(of, under),
+        (FieldRule::Struct, FieldRule::Struct) | (FieldRule::Batch, FieldRule::Batch) => true,
+        _ => false,
+    }
+}
+
 /// The request-time check, run only for a request that arrived on an adapter's own socket and
-/// only after `policy::evaluate` has already passed.
-pub fn evaluate(i: &SafeTxIntent, manifest: &Manifest) -> Result<(), ManifestDenied> {
+/// only after `policy::evaluate` has already passed. It returns the grant it checked against, so
+/// the same one bounds every entry of a `multiSend` without a second lookup.
+pub fn evaluate<'m>(i: &SafeTxIntent, manifest: &'m Manifest) -> Result<&'m Grant, ManifestDenied> {
     let grant = manifest
         .grants
         .iter()
@@ -326,19 +404,49 @@ pub fn evaluate(i: &SafeTxIntent, manifest: &Manifest) -> Result<(), ManifestDen
         return Err(ManifestDenied::OwnerManagementNotDelegable { safe: i.safe });
     }
     match_refunds(grant.refunds.as_ref(), i)?;
-    Ok(match_call(&grant.calls, i)?)
+    match_call(&grant.calls, &Site::own(i))?;
+    Ok(grant)
+}
+
+/// The same request-time check for an EIP-712 message: the adapter must hold the key, be granted
+/// the typed-data shape at all, be granted the chain, and have named this schema in its own
+/// manifest. The schema's contents are the POLICY's — a grant can only ever pick from them.
+pub fn evaluate_typed(i: &TypedDataIntent, manifest: &Manifest) -> Result<(), ManifestDenied> {
+    let grant = manifest
+        .grants
+        .iter()
+        .find(|g| g.key == i.key)
+        .ok_or_else(|| ManifestDenied::KeyNotGranted { key: i.key.clone() })?;
+    if !grant.intent_kinds.contains(&IntentKind::TypedData) {
+        return Err(ManifestDenied::IntentKindNotGranted {
+            kind: IntentKind::TypedData,
+        });
+    }
+    if !grant.chain_ids.contains(&i.chain_id) {
+        return Err(ManifestDenied::ChainNotGranted {
+            chain_id: i.chain_id,
+        });
+    }
+    if !grant.typed_data.contains(&i.schema) {
+        return Err(ManifestDenied::SchemaNotGranted {
+            schema: i.schema.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::OwnerMgmt;
+    use crate::schema::{unbounded_call, ArgRule, OWNER_MGMT};
     use alloy_primitives::Bytes;
 
     const SAFE: [u8; 20] = [0x11; 20];
     const TOKEN: [u8; 20] = [0x22; 20];
     const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-    const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+    const VENDOR: Address = Address::new([0x33u8; 20]);
+    const STRANGER: Address = Address::new([0x99u8; 20]);
 
     const MANIFEST: &str = concat!(
         "schema = \"hotcheese.adapter/v1\"\n",
@@ -352,13 +460,48 @@ mod tests {
         "\n",
         "[[grants.calls]]\n",
         "to = \"0x2222222222222222222222222222222222222222\"\n",
-        "selectors = [\"0xa9059cbb\"]\n",
         "max_value = \"0\"\n",
         "operation = \"call\"\n",
+        "\n",
+        "  [[grants.calls.call]]\n",
+        "  signature = \"transfer(address,uint256)\"\n",
+        "\n",
+        "    [[grants.calls.call.arg]]\n",
+        "    at = 0\n",
+        "    name = \"to\"\n",
+        "    rule = { one_of = { addresses = [\"0x3333333333333333333333333333333333333333\"] } }\n",
+        "\n",
+        "    [[grants.calls.call.arg]]\n",
+        "    at = 1\n",
+        "    name = \"amount\"\n",
+        "    rule = { max = { max = \"1000\", amount_of = \
+         \"0x2222222222222222222222222222222222222222\" } }\n",
     );
 
     fn manifest() -> Manifest {
         toml::from_str(MANIFEST).expect("the documented manifest must load")
+    }
+
+    fn bounded_transfer(recipients: Vec<Address>, max: u64) -> CallRule {
+        let mut call = unbounded_call("transfer(address,uint256)");
+        call.arg = vec![
+            ArgRule {
+                at: 0,
+                name: "to".to_string(),
+                rule: FieldRule::OneOf {
+                    addresses: recipients,
+                },
+            },
+            ArgRule {
+                at: 1,
+                name: "amount".to_string(),
+                rule: FieldRule::Max {
+                    max: U256::from(max),
+                    amount_of: Address::from(TOKEN),
+                },
+            },
+        ];
+        call
     }
 
     fn policy() -> Policy {
@@ -367,15 +510,20 @@ mod tests {
             chain_id: U256::from(1u64),
             allow: vec![AllowRule {
                 to: Address::from(TOKEN),
-                selectors: vec![FixedBytes::from(TRANSFER), FixedBytes::from(APPROVE)],
+                call: vec![
+                    bounded_transfer(vec![VENDOR], 1_000),
+                    unbounded_call("approve(address,uint256)"),
+                ],
                 max_value: U256::from(100u64),
                 operation: Operation::Call,
             }],
             owner_management: OwnerMgmt {
                 allow: true,
-                selectors: vec![FixedBytes::from(crate::adapter::OWNER_MGMT[0])],
+                call: vec![unbounded_call(OWNER_MGMT[0])],
+                max_value: U256::ZERO,
             },
             refunds: None,
+            typed_data: Vec::new(),
         }
     }
 
@@ -439,11 +587,54 @@ mod tests {
 
         let mut wider = grant();
         wider.calls[0]
-            .selectors
-            .push(FixedBytes::from([0xde, 0xad, 0xbe, 0xef]));
+            .call
+            .push(unbounded_call("increaseAllowance(address,uint256)"));
         assert!(matches!(
             narrows(&wider, &policy()),
-            Err(Widened::Selector { .. })
+            Err(Widened::Signature { .. })
+        ));
+
+        // The comparison is on CANONICAL TEXT and not on the four bytes, because two different
+        // signatures can be ground to share a selector and a manifest is the lower-trust file:
+        // comparing selectors would let it declare a different call under a permitted one.
+        let mut collided = grant();
+        collided.calls[0].call[0].signature =
+            crate::schema::Signature::try_from("gasprice_bit_ether(int128)".to_string())
+                .expect("a canonical signature parses");
+        assert!(matches!(
+            narrows(&collided, &policy()),
+            Err(Widened::Signature { .. })
+        ));
+
+        // An adapter may not unbind an argument the policy bound, in any dimension.
+        for loosened in [
+            FieldRule::Unbounded,
+            FieldRule::OneOf {
+                addresses: vec![VENDOR, STRANGER],
+            },
+        ] {
+            let mut wider = grant();
+            wider.calls[0].call[0].arg[0].rule = loosened;
+            assert!(matches!(
+                narrows(&wider, &policy()),
+                Err(Widened::Arg { at: 0, .. })
+            ));
+        }
+        let mut wider = grant();
+        wider.calls[0].call[0].arg[1].rule = FieldRule::Max {
+            max: U256::from(1_001u64),
+            amount_of: Address::from(TOKEN),
+        };
+        assert!(matches!(
+            narrows(&wider, &policy()),
+            Err(Widened::Arg { at: 1, .. })
+        ));
+
+        let mut schema = grant();
+        schema.typed_data.push("permit2_usdc".to_string());
+        assert!(matches!(
+            narrows(&schema, &policy()),
+            Err(Widened::Schema { .. })
         ));
 
         let mut wider = grant();
@@ -621,9 +812,10 @@ mod tests {
                 "refunds = { gas_tokens = [], refund_receivers = [], unmetered = true }\n",
             ),
             (
-                "selectors = [\"0xa9059cbb\"]\n",
-                "required = \"anything\"\n",
+                "  signature = \"transfer(address,uint256)\"\n",
+                "  required = \"anything\"\n",
             ),
+            ("    name = \"to\"\n", "    optional = true\n"),
         ] {
             let smuggled = MANIFEST.replace(extra.0, &format!("{}{}", extra.0, extra.1));
             assert_ne!(smuggled, MANIFEST, "the fixture must contain {}", extra.0);
@@ -665,7 +857,7 @@ mod tests {
 
         let mut rotation = intent();
         rotation.to = rotation.safe;
-        rotation.data = Bytes::from(crate::adapter::OWNER_MGMT[0].to_vec());
+        rotation.data = Bytes::from(unbounded_call(OWNER_MGMT[0]).signature.selector().to_vec());
         assert!(matches!(
             evaluate(&rotation, &m),
             Err(ManifestDenied::OwnerManagementNotDelegable { .. })

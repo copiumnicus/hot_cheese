@@ -27,9 +27,13 @@ backup.
 - **§5 — every key your services fetch over `/read` MUST be migrated `--shareable`.**
   Anything you do not name becomes `sign_only`, and `/read` then refuses it permanently.
   See the one-way-door warning in §5.
-- **§6 — every signing key needs a policy file with `chain_id`** before `sign` will work.
+- **§6 — every signing key needs a policy file with `chain_id`** before `bundle sign` will work.
   A policy `[[allow]]` rule carrying a term this build does not implement now fails to load
   (= every signature denied) instead of dropping the term silently.
+- **§6 — `selectors = [...]` is GONE and every policy file carrying it fails to load.** A rule
+  now declares the full canonical signature and the daemon derives the selector from it, and
+  every declared argument must carry its own bound. Nothing is auto-converted; §6c has the
+  conversion table and the reasons. Convert every policy file **before** you restart `serve`.
 - **§6b — adapters are optional and additive.** Nothing changes for the loopback client or
   the CLI if you configure none. If you do configure one, `serve` refuses to start when its
   manifest does not match its pin, or claims more than §6's policy grants.
@@ -292,9 +296,10 @@ only then written atomically — a failed verification leaves the old file untou
   requested use is skipped, and `sign_only → shareable` is refused with
   `SealCannotLoosen { name, from, to }` — it is the one-way door, not a permission check.
 
-## 6. Write a signing policy for every key you will `sign` with
+## 6. Write a signing policy for every key you will `bundle sign` with
 
-`sign` is fail-closed: it loads `<store>/policies/<NAME>.toml` and **denies every signature**
+Signing is fail-closed: every signature — `bundle sign` at your terminal, `/sign/<NAME>` over
+loopback, an adapter socket — loads `<store>/policies/<NAME>.toml` and **denies the signature**
 if that file is missing or does not parse. `chain_id` is **required** — a policy without it
 fails to load, which reads as "every signature denied", not as a warning.
 
@@ -306,17 +311,48 @@ chain_id = 1
 
 [[allow]]
 to = "0xContractYouCall"
-selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
+
+  [[allow.call]]
+  signature = "transfer(address,uint256)"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["0xWhoMayBePaid"] } }
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "1000000000", amount_of = "0xContractYouCall" } }
 POLICY
 ```
 
 - `safe` and `chain_id` pin the Safe and the chain; an intent for any other Safe or chain
   is denied (this is the cross-chain replay guard).
-- Each `[[allow]]` rule permits one destination: only the listed 4-byte `selectors`, up to
-  `max_value`, and only with the listed `operation` (`call` unless you write `delegatecall`).
-  A destination with no rule is denied.
+- Each `[[allow]]` rule permits one destination, up to `max_value`, and only with the listed
+  `operation` (`call` unless you write `delegatecall`). A destination with no rule is denied.
+- Each `[[allow.call]]` permits **one call shape at that destination**, named by its full
+  canonical signature. The daemon derives the 4-byte selector from that text and decodes the
+  calldata against exactly that shape, so a call the policy permits is decodable by
+  construction — and a payload that does not decode, or that decodes but does not re-encode to
+  the submitted bytes, is refused instead of being rendered as hex.
+  `signature` must be the canonical spelling: no argument names, no `function` keyword, no
+  `uint` alias for `uint256`, no `returns` clause. Anything else is refused at load with the
+  text to write instead.
+- Each `[[allow.call.arg]]` bounds **one argument**, by position (`at`), under the label the
+  human will read (`name`). **Every declared position must carry a rule**: an argument you
+  forget is a load failure, not an unbounded permit. The only way to say "no bound" is to type
+  `rule = "unbounded"`, and then every approval leads with `⚠ UNBOUNDED FIELD [name]`.
+  The rules are `one_of`, `max`, `eq`, `bool_eq`, `bytes_eq`, `deadline`, `enum`, `each`,
+  `"struct"`, `"batch"` and `"unbounded"`; README's
+  "Typed-only admission" section has the table of which applies to which Solidity type.
+- **`multiSend` is no longer a hole.** Its `bytes` argument takes `rule = "batch"`, and every
+  entry inside is then matched against the policy in its own right — its own destination, its
+  own operation, its own native value, its own signature and its own argument bounds. A batch
+  touching a destination your policy does not cover now refuses the whole transaction, so
+  after conversion **add a rule for every destination your batches touch**.
 - Gas-refund fields are **opt-in**: with no `[refunds]` table, an intent carrying any
   non-zero `gasPrice` / `gasToken` / `refundReceiver` is denied outright. Add the table only
   if you genuinely use refunds, and cap it:
@@ -331,9 +367,17 @@ max_safe_tx_gas = "0"
 ```
 
 - Owner/threshold rotations (a call from the Safe to itself) are denied unless
-  `[owner_management]` sets `allow = true` and lists the selectors.
+  `[owner_management]` sets `allow = true` and lists the calls in the same
+  `[[owner_management.call]]` form. It also carries `max_value`, which **defaults to zero**:
+  a rotation has no need to move native value, and before this build no ceiling reached these
+  calls at all. Set it explicitly if you genuinely need otherwise.
+- A `[[typed_data]]` block makes an **EIP-712 message** signable with this key. The policy
+  declares the domain and the complete struct schema; a request names the schema and supplies
+  field values only. This is new authority in a file you already have — adding a block grants
+  off-chain signing power that did not previously exist on this machine. README's
+  "EIP-712 typed data" section has the shape.
 
-Policies live inside the store, so they travel with the rsync backup.
+Policies live inside the store, so they travel with the git backup.
 
 The file is re-read for **every** signature, and its SHA-256 goes into the grant the approval
 mints — so the human approves an intent *under a named policy*, and a policy edited between
@@ -368,9 +412,21 @@ safes = ["0xYourSafeAddress"]
 
 [[grants.calls]]
 to = "0xContractYouCall"
-selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
+
+  [[grants.calls.call]]
+  signature = "transfer(address,uint256)"
+
+    [[grants.calls.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["0xWhoMayBePaid"] } }
+
+    [[grants.calls.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "1000000", amount_of = "0xContractYouCall" } }
 MANIFEST
 shasum -a 256 ~/.config/hot_cheese/adapters/safe_treasury_bot.toml
 ```
@@ -391,12 +447,18 @@ is a refusal to load rather than a silently ignored line. Note that this now app
 loading, which reads as "every signature denied".
 
 **The manifest can only NARROW §6's policy.** At `serve` startup every grant is intersected
-with `<store>/policies/<NAME>.toml`: `safes` and `chain_ids` must be the policy's, and every
-`calls` rule must be matched by a policy `allow` rule with the same `to` and `operation`, a
-superset of its selectors, and a `max_value` at least as large. If anything is broader,
-`serve` **refuses to start** with an error naming the adapter, the key and the offending rule
-(`Widens { adapter, key, source }`). That is deliberate: a manifest broader than policy means
-you believe something the policy does not grant, and you should find that out now.
+with `<store>/policies/<NAME>.toml`: `safes` and `chain_ids` must be the policy's; every
+`calls` rule must be matched by a policy `allow` rule with the same `to` and `operation` and a
+`max_value` at least as large; every declared `signature` must appear **verbatim** in that
+policy rule; every argument bound must be no wider than the policy's at that position (an
+adapter may not unbind an argument the policy bound); and every name in `grants.typed_data`
+must be a schema the policy declares. If anything is broader, `serve` **refuses to start** with
+an error naming the adapter, the key and the offending rule (`Widens { adapter, key, source }`).
+That is deliberate: a manifest broader than policy means you believe something the policy does
+not grant, and you should find that out now.
+
+The signature comparison is on the canonical **text**, not on the four bytes: two different
+signatures can be ground to share a selector, and a manifest is the lower-trust file.
 
 Two things a manifest may never do: grant **owner/threshold rotation** (a `calls` rule naming
 the Safe itself is refused at startup, and such an intent is denied at request time even when
@@ -424,6 +486,75 @@ Operational notes:
 - hot_cheese does not spawn or supervise adapters. Run them as launchd jobs; see the
   `sandbox-exec` note in [README.md](./README.md#signing-adapters), including why confinement
   buys the adapter more than it buys hot_cheese.
+
+## 6c. Convert a policy file written before typed-only admission
+
+**Every policy or manifest still carrying `selectors = [...]` refuses to load.** `AllowRule` is
+`deny_unknown_fields` and has no such field, so `toml::from_str` fails with an unknown-key error
+naming `selectors` and its line and column, wrapped as `PolicyErr::Toml`. Nothing is
+auto-converted, and that is on purpose: a 4-byte selector is a keccak image with no preimage, so
+a conversion could only work from a fixed table and would silently fail to convert every
+selector outside it — producing a policy narrower than the file says. Silent narrowing under
+cover of a migration is worse than a refusal.
+
+This reaches startup. `serve` loads every policy named by an adapter grant before it binds
+anything, so on a machine with a pinned adapter the daemon **will not start** until every such
+policy is converted. Convert first, restart second.
+
+**Conversion table.** These are the nineteen signatures the previous decoder knew, which are the
+selectors a policy written against an earlier build could usefully hold. Each row is pinned
+in-tree by a test that recomputes the selector from the signature, so the table cannot drift.
+
+| Old `selectors` entry | `signature` to declare |
+| --- | --- |
+| `0xe318b52b` | `swapOwner(address,address,address)` |
+| `0x0d582f13` | `addOwnerWithThreshold(address,uint256)` |
+| `0xf8dc5dd9` | `removeOwner(address,address,uint256)` |
+| `0x694e80c3` | `changeThreshold(uint256)` |
+| `0xa9059cbb` | `transfer(address,uint256)` |
+| `0x095ea7b3` | `approve(address,uint256)` |
+| `0x23b872dd` | `transferFrom(address,address,uint256)` |
+| `0x39509351` | `increaseAllowance(address,uint256)` |
+| `0xa457c2d7` | `decreaseAllowance(address,uint256)` |
+| `0xa22cb465` | `setApprovalForAll(address,bool)` |
+| `0xd505accf` | `permit(address,address,uint256,uint256,uint8,bytes32,bytes32)` |
+| `0x610b5925` | `enableModule(address)` |
+| `0xe009cfde` | `disableModule(address,address)` |
+| `0xe19a9dd9` | `setGuard(address)` |
+| `0xf08a0323` | `setFallbackHandler(address)` |
+| `0xd4d9bdcd` | `approveHash(bytes32)` |
+| `0x42842e0e` | `safeTransferFrom(address,address,uint256)` |
+| `0xb88d4fde` | `safeTransferFrom(address,address,uint256,bytes)` |
+| `0x8d80ff0a` | `multiSend(bytes)` |
+
+Any selector you wrote that is **not** in this table names a call the daemon has never been able
+to decode. It signed anyway, rendered as `UNDECODED CALL 0x…` for a human to eyeball — that hole
+is what this change closes. Take the real signature from the contract's ABI and the call becomes
+both decodable and constrainable.
+
+Then bound every argument. The conversion is not mechanical, because a rule that used to say
+only "these four bytes" now has to say what the arguments may hold, and **an argument with no
+rule does not parse**. Write `rule = "unbounded"` where you genuinely mean it and the approval
+sheet will lead with `⚠ UNBOUNDED FIELD` every time.
+
+**What stops being signable after conversion**, so you can plan for it:
+
+- every call whose selector you allow-listed but whose signature you have not declared;
+- any payload whose arguments do not decode against the declared signature, or that decodes but
+  re-encodes differently (padding, trailing bytes, dirty address upper bits, a `bool` word
+  holding `2`);
+- any argument outside its declared rule;
+- **any `multiSend` whose entries are not each individually permitted** — this is the biggest
+  item. A policy that allow-listed only the MultiSend library for `delegatecall` will refuse
+  every batch until you add a rule per destination the batch touches. `bundle status` shows the
+  typed refusal for any bundle you already hold, which is the dry run;
+- a `multiSend` payload that is malformed, over 32 entries in the tree, or nested past depth 2;
+- a `multiSend` entry with empty calldata, or one carrying native value past its rule's ceiling;
+- an owner-management self-call carrying native value, unless `[owner_management].max_value`
+  says otherwise.
+
+**What becomes signable:** any function whose ABI you have, and EIP-712 typed messages under a
+declared `[[typed_data]]` schema.
 
 ## 7. Run and verify
 
@@ -465,7 +596,7 @@ the sheet names the key (`Unlock "<NAME>" for read key`) — do not script or sp
 
 ## 8. Back up what the store backup does NOT cover
 
-The rsync backup replicates **only the store dir** — which includes `keyring.json` (the
+The git backup replicates **only the store dir** — which includes `keyring.json` (the
 **wrapped DEK**) — so the remote never sees plaintext or the DEK. It does **not** include
 the TLS cert/key or `config.toml` (those live under the home dir). Separately back up
 
@@ -474,7 +605,7 @@ the TLS cert/key or `config.toml` (those live under the home dir). Separately ba
 ```
 
 to a **secure** location — plus `~/.config/hot_cheese/adapters/` if you configured any (§6b).
-Do **not** rsync the TLS private key to untrusted backup hosts. To provision a fresh machine
+Do **not** push the TLS private key to untrusted backup hosts. To provision a fresh machine
 from an authority host over SSH instead, use `hot_cheese bootstrap-from user@host` (transfers
 the DEK + store).
 
@@ -494,18 +625,23 @@ rewrite it could lower a threshold.
 ### Vault ids: one backup folder, several installs
 
 `init` mints a **vault id** (`v_<32 hex>`) next to the DEK and stores it in cleartext in
-`keyring.json`. Backups are namespaced by it:
+`keyring.json`. Each vault owns its own bare repository on the remote:
 
 ```
-rsync -az <store>/ <host>:~/<folder>/<vault_id>/
+git push <host>:<folder>/<vault_id>.git refs/heads/main:refs/heads/main
 ```
 
-Because the id is cleartext, a push reads it **without unlocking anything** — no Touch ID,
-no passphrase. Several installs with **different DEKs** (a desktop and a laptop holding
-different multisig signer keys, on purpose) can therefore share one `host` + `folder`
-without overwriting each other. `bootstrap-from` hands machine B the **same** DEK, so B is
-the same vault: A's id travels in the bootstrap `OFFER` and B records it, and both push to
-the same subtree.
+The remote host needs **`git`**, not `rsync`; the repository is created on the first push,
+with `receive.denyNonFastForwards` and `receive.denyDeletes` set on it so no push can rewrite
+or delete the backup. Because the id is cleartext, a push reads it **without unlocking
+anything** — no Touch ID, no passphrase. Several installs with **different DEKs** (a desktop
+and a laptop holding different multisig signer keys, on purpose) can therefore share one
+`host` + `folder` without overwriting each other.
+
+`bootstrap-from` hands machine B the **same** DEK, so B is the same vault — and under git the
+two machines start unrelated histories, so B's first push is refused as a non-fast-forward.
+Resolve that once, by hand, with `hot_cheese backup pull --force` on whichever machine's store
+is stale.
 
 Recovery on a bare machine, where all you have is the recovery passphrase and the remote.
 The store must be **empty** first: `init` writes the `config.toml` you need, but it also
@@ -515,26 +651,33 @@ mints a throwaway DEK and vault id that the restore must not inherit.
 hot_cheese init                          # config.toml + TLS cert (and a throwaway vault)
 $EDITOR ~/.config/hot_cheese/config.toml # add the [[backup_remotes]] entry
 rm -rf ~/.config/hot_cheese/store        # drop the just-minted keyring: different vault
-hot_cheese backup list                   # vault ids under <folder>, flagging this install's
-hot_cheese backup pull --vault v_…       # pull exactly that one
+hot_cheese backup list                      # vault ids under <folder>, flagging this install's
+hot_cheese backup pull --force --vault v_…  # take exactly that one
 ```
 
 Only run that `rm -rf` where the store holds nothing you need — at that point it contains
 one keyring that encrypts nothing. Then unlock with the recovery passphrase.
 
-Without `--vault`, a pull uses this install's own id. A pull is refused outright if the
-local store already belongs to a **different** vault, and again afterwards if the pulled
-`keyring.json` is not the vault that was asked for (the failure names both ids). `rsync -az`
-carries no `--delete`, so a mixed pull would merge and leave keystores the local DEK cannot
-open; refusing is safer than deleting, and `--delete` is never added. `serve`'s auto-pull
-follows the same rule, and on a machine with no store at all it adopts the remote's vault
-only when there is exactly one — with several it refuses and lists them.
+Without `--vault`, a pull uses this install's own id. A pull is refused before anything is
+fetched if the local store already belongs to a **different** vault, and the **remote's**
+`keyring.json` is then read straight out of the fetched objects and checked before a single
+file in the worktree is touched — so a wrong-vault remote can never land on disk at all.
+`serve`'s clone follows the same rule, and on a machine with no keyring at all it takes the
+remote's vault only when there is exactly one — with several it refuses and lists them.
 
-**Migrating an existing install:** a `keyring.json` written before vault ids has none and
-keeps pushing and pulling the un-namespaced `<host>:~/<folder>/`, exactly as before. Nothing
-mints an id on load — that would silently move where your backups point. Run
-`hot_cheese backup adopt` when you want one; afterwards backups go to `<folder>/<vault_id>/`
-and the previous un-namespaced copy stays untouched at the folder root.
+**`backup pull --force` deletes local-only keystores.** It resets the worktree to the remote's
+commit, so a key generated here and never pushed is gone. It names every such file and its
+count first, and without `--force` it prints that list and stops.
+
+**Migrating an existing install:** a `keyring.json` written before vault ids gets one
+**automatically** the first time this version opens the store, and the store becomes a git
+repository in the same pass — commit #1 contains everything already there, and nothing is
+rewritten except the file modes, which are tightened to `0600`. The old rsync directory at
+`<folder>/<vault_id>/` is a **different path** from the new `<folder>/<vault_id>.git`, so it
+is left untouched beside it and becomes stale from the first push. Delete it yourself once you
+are satisfied. While a fleet is half upgraded the two paths mean the machines stop seeing each
+other's keys; `backup list` flags a plain `<vault_id>` directory beside our repository for
+exactly that reason.
 
 ---
 
@@ -583,8 +726,8 @@ owners = [
 ```
 
 This is **not** `policy.toml` and does not replace §6 — the policy remains the signing ceiling
-for each key, and `bundle sign` is subject to it exactly as `sign` is. A term this build does
-not implement fails to load rather than being dropped silently.
+for each key, and `bundle sign` is subject to it exactly as `/sign/<NAME>` is. A term this build
+does not implement fails to load rather than being dropped silently.
 
 `owners` is a **local mirror of on-chain state**. hot_cheese has no RPC client, so it cannot
 notice a rotation: a stale list makes `bundle export` produce a blob that reverts on-chain.
@@ -611,11 +754,12 @@ hot_cheese bundle export <hash>                          # execTransaction field
 machines produce the identical digest and the identical directory name.
 
 **Transport is `rsync` over `ssh`, outbound only, woven into the verbs.** `status`, `export`,
-`list`, `watch` and `sign` pull first; `new`, `sign`, `merge` and `add-sig` push after; `rm`
+`list` and `sign` pull first; `new`, `sign`, `merge` and `add-sig` push after; `rm`
 never syncs, because a pull would resurrect what you just retired. A verb naming a hash moves
 only that directory. It is **best-effort**: an asleep MacBook is a warning, never a failed
 signature on the desktop, and `--no-sync` turns it off for one command. `bundle sync` forces
-both directions and `bundle watch <hash>` polls until the threshold is met.
+both directions, and a running `hot_cheese` or `hot_cheese serve` polls every peer on its own
+timer, so waiting on a co-signer needs no command at all.
 
 Peers come from `tailscale status --json` — MagicDNS **names**, never addresses, so nothing
 needs maintaining when the tailnet re-addresses. `[[bundle_peers]]` is a separate config key
@@ -672,7 +816,7 @@ command failed error=ApiBackend(Unlock(SeKeyUnavailableTryUnlockPassphrase))
 ```
 
 The escape hatch is the global `--unlock <se|passphrase>` flag, accepted by every command
-that unlocks the DEK (`address`, `add`, `generate`, `sign`, `seal`, `enroll`, `migrate`),
+that unlocks the DEK (`address`, `add`, `generate`, `bundle sign`, `seal`, `enroll`, `migrate`),
 either before or after the subcommand:
 
 ```

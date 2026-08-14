@@ -32,6 +32,8 @@ GAS_TOKEN_ADDR="0x4444444444444444444444444444444444444444"
 ATTACKER_ADDR="0x5555555555555555555555555555555555555555"
 ZERO_ADDR="0x0000000000000000000000000000000000000000"
 TRANSFER_DATA="0xa9059cbb0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a"
+TRANSFER_TO_ATTACKER="0xa9059cbb0000000000000000000000005555555555555555555555555555555555555555000000000000000000000000000000000000000000000000000000000000000a"
+UNDECLARED_DATA="0xdeadbeef0000000000000000000000003333333333333333333333333333333333333333000000000000000000000000000000000000000000000000000000000000000a"
 
 FOREIGN_GRANT_PUB="046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
 EXAMPLE_FOLDER="hot_cheese_store"
@@ -70,6 +72,7 @@ CFG_STORE=""
 CFG_GRANT_PUB=""
 LEGACY_FIXTURE=""
 PIN_CERT_MANIFEST=""
+BUNDLE_HASH=""
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -205,6 +208,16 @@ assert_cmd_fails_with() {
     pass "$tag: exited $RUN_RC as expected"
   fi
   assert_contains "$tag: error names $needle" "$needle" "$RUN_LOG"
+}
+
+bundle_new() {
+  local tag="$1" file="$2"
+  run_cmd "$tag" "$BIN" bundle new --no-sync --file "$file"
+  BUNDLE_HASH="$(grep -o '0x[0-9a-f]\{64\}' "$RUN_LOG" 2>/dev/null | head -1 || true)"
+  if [[ "$RUN_RC" -ne 0 || -z "$BUNDLE_HASH" ]]; then
+    fatal "$tag: bundle new exited $RUN_RC without reporting a safeTxHash"
+  fi
+  pass "$tag: filed $file as bundle $BUNDLE_HASH"
 }
 
 field_value() {
@@ -345,7 +358,7 @@ echo "    phase 4  0            (enroll grant prompts NOTHING: no Touch ID, no p
 echo "    phase 5  1 Touch ID   (the allowed sign; all six refusals cost 0)"
 echo "    phase 6  1 Touch ID   (the shareable /read; the sign-only /read costs 0)"
 echo "    phase 7  1 passphrase (the recovery escape hatch, SE blob moved aside)"
-echo "    phase 8  0            (vault-aware backup, read locally, no ssh and no rsync)"
+echo "    phase 8  0            (vault-aware git backup, read locally, no ssh and no network)"
 echo "    phase 9  0"
 echo "  with RUN_MIGRATE=1 add phase M: 2 Touch ID + 1 login-keychain access dialog"
 echo "    (budget up to 4 taps in case macOS re-prompts)"
@@ -839,16 +852,23 @@ assert_taps "the entire grant phase cost ZERO biometrics" "0" "$BIO_PHASE"
 echo "  note  'serve succeeds once the grant key is enrolled' is phase 6; that the pinned key"
 echo "  note  actually VERIFIES an enclave grant is phase 5, which cannot sign without one."
 
-phase "PHASE 5 — scoped signing (1 Touch ID; every denial costs 0)"
+phase "PHASE 5 — scoped signing through a bundle (1 Touch ID; every denial costs 0)"
 
-echo "Policy load and evaluation, and the grant pin lookup, all run BEFORE the approval sheet,"
-echo "so the six refusals below cost no biometric at all."
+echo "Signing has exactly one human entry point: a transaction is filed as a bundle, then"
+echo "'bundle sign' takes it through the policy, the typed deconstruction, the grant pin and"
+echo "one approval. Policy load and evaluation, the argument bounds and the grant pin lookup"
+echo "all run BEFORE the approval sheet, so every refusal below costs no biometric at all."
 POLICY_DIR="$CFG_STORE/policies"
 POLICY_FILE="$POLICY_DIR/$EVM_KEY.toml"
+BUNDLE_DIR="$HOT_CHEESE_HOME/bundles"
+APPROVAL_BANNER="=== hot_cheese Sign request #"
 INTENT_OK="$OUT_DIR/intent_ok.json"
 INTENT_DRAIN="$OUT_DIR/intent_drain.json"
 INTENT_BAD_TO="$OUT_DIR/intent_bad_to.json"
 INTENT_BAD_CHAIN="$OUT_DIR/intent_bad_chain.json"
+INTENT_BAD_ARG="$OUT_DIR/intent_bad_arg.json"
+INTENT_UNDECLARED="$OUT_DIR/intent_undeclared.json"
+INTENT_TYPED="$OUT_DIR/intent_typed.json"
 
 cat > "$INTENT_OK" <<JSON
 {
@@ -884,7 +904,7 @@ cat > "$INTENT_DRAIN" <<JSON
   "gas_price": "1",
   "gas_token": "$GAS_TOKEN_ADDR",
   "refund_receiver": "$ATTACKER_ADDR",
-  "nonce": "0"
+  "nonce": "1"
 }
 JSON
 
@@ -903,7 +923,7 @@ cat > "$INTENT_BAD_TO" <<JSON
   "gas_price": "0",
   "gas_token": "$ZERO_ADDR",
   "refund_receiver": "$ZERO_ADDR",
-  "nonce": "0"
+  "nonce": "2"
 }
 JSON
 
@@ -922,9 +942,90 @@ cat > "$INTENT_BAD_CHAIN" <<JSON
   "gas_price": "0",
   "gas_token": "$ZERO_ADDR",
   "refund_receiver": "$ZERO_ADDR",
-  "nonce": "0"
+  "nonce": "3"
 }
 JSON
+
+cat > "$INTENT_BAD_ARG" <<JSON
+{
+  "kind": "safe_tx",
+  "key": "$EVM_KEY",
+  "safe": "$SAFE_ADDR",
+  "chain_id": "1",
+  "to": "$TOKEN_ADDR",
+  "value": "0",
+  "data": "$TRANSFER_TO_ATTACKER",
+  "operation": "call",
+  "safe_tx_gas": "0",
+  "base_gas": "0",
+  "gas_price": "0",
+  "gas_token": "$ZERO_ADDR",
+  "refund_receiver": "$ZERO_ADDR",
+  "nonce": "4"
+}
+JSON
+
+cat > "$INTENT_UNDECLARED" <<JSON
+{
+  "kind": "safe_tx",
+  "key": "$EVM_KEY",
+  "safe": "$SAFE_ADDR",
+  "chain_id": "1",
+  "to": "$TOKEN_ADDR",
+  "value": "0",
+  "data": "$UNDECLARED_DATA",
+  "operation": "call",
+  "safe_tx_gas": "0",
+  "base_gas": "0",
+  "gas_price": "0",
+  "gas_token": "$ZERO_ADDR",
+  "refund_receiver": "$ZERO_ADDR",
+  "nonce": "5"
+}
+JSON
+
+cat > "$INTENT_TYPED" <<JSON
+{
+  "kind": "typed_data",
+  "key": "$EVM_KEY",
+  "schema": "nothing_declared",
+  "chain_id": "1",
+  "verifying_contract": "$SAFE_ADDR",
+  "message": {}
+}
+JSON
+
+echo
+echo "==> 5 setup: name the Safe this machine collects for, on both chains the fixtures use,"
+echo "    then file all four transactions. bundle new takes no unlocker and reaches no key,"
+echo "    so every one of these costs zero biometrics."
+mkdir -p "$BUNDLE_DIR"
+cat > "$BUNDLE_DIR/safes.toml" <<SAFES
+[[safe]]
+address = "$SAFE_ADDR"
+chain_id = 1
+threshold = 1
+owners = ["$ADDR_SE"]
+
+[[safe]]
+address = "$SAFE_ADDR"
+chain_id = 137
+threshold = 1
+owners = ["$ADDR_SE"]
+SAFES
+
+bundle_new p5_new_ok "$INTENT_OK"
+HASH_OK="$BUNDLE_HASH"
+bundle_new p5_new_drain "$INTENT_DRAIN"
+HASH_DRAIN="$BUNDLE_HASH"
+bundle_new p5_new_bad_to "$INTENT_BAD_TO"
+HASH_BAD_TO="$BUNDLE_HASH"
+bundle_new p5_new_bad_chain "$INTENT_BAD_CHAIN"
+HASH_BAD_CHAIN="$BUNDLE_HASH"
+bundle_new p5_new_bad_arg "$INTENT_BAD_ARG"
+HASH_BAD_ARG="$BUNDLE_HASH"
+bundle_new p5_new_undeclared "$INTENT_UNDECLARED"
+HASH_UNDECLARED="$BUNDLE_HASH"
 
 echo
 echo "==> 5a: no policy file at all. Deny by default: a perfectly valid intent must still fail."
@@ -932,8 +1033,8 @@ BIO_PHASE="$(bio_window_start)"
 if [[ -e "$POLICY_FILE" ]]; then
   fail "a policy file already exists at $POLICY_FILE"
 fi
-assert_cmd_fails_with p5a_no_policy "Policy(Io(" "$BIN" sign --file "$INTENT_OK"
-assert_not_contains "5a showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5a_no_policy "Policy(Io(" "$BIN" bundle sign "$HASH_OK" --key "$EVM_KEY" --no-sync
+assert_not_contains "5a showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 
 echo
 echo "==> 5b: a policy WITHOUT chain_id must fail to LOAD. This is exactly what a stale"
@@ -944,15 +1045,29 @@ safe = "$SAFE_ADDR"
 
 [[allow]]
 to = "$TOKEN_ADDR"
-selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
+
+  [[allow.call]]
+  signature = "transfer(address,uint256)"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = "unbounded"
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = "unbounded"
 TOML
-assert_cmd_fails_with p5b_no_chain_id "Policy(Toml(" "$BIN" sign --file "$INTENT_OK"
-assert_not_contains "5b showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5b_no_chain_id "Policy(Toml(" "$BIN" bundle sign "$HASH_OK" --key "$EVM_KEY" --no-sync
+assert_not_contains "5b showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 
 echo
-echo "==> 5c: the good policy, then the allowed transfer."
+echo "==> 5b2: a policy still written in the retired selectors language. A 4-byte selector"
+echo "    cannot be inverted into a signature, so nothing is auto-converted: the file refuses"
+echo "    to load and the refusal names the term the operator has to replace."
 cat > "$POLICY_FILE" <<TOML
 safe = "$SAFE_ADDR"
 chain_id = 1
@@ -963,18 +1078,50 @@ selectors = ["0xa9059cbb"]
 max_value = "0"
 operation = "call"
 TOML
+assert_cmd_fails_with p5b2_selectors "Policy(Toml(" "$BIN" bundle sign "$HASH_OK" --key "$EVM_KEY" --no-sync
+assert_contains "the refusal names the retired term" "selectors" "$RUN_LOG"
+assert_not_contains "5b2 showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
+
+echo
+echo "==> 5c: the good policy, then the allowed transfer. The rule declares the FULL canonical"
+echo "    signature, so the selector is derived from it and every argument carries its own"
+echo "    bound: a recipient allow-list and a ceiling on the amount."
+cat > "$POLICY_FILE" <<TOML
+safe = "$SAFE_ADDR"
+chain_id = 1
+
+[[allow]]
+to = "$TOKEN_ADDR"
+max_value = "0"
+operation = "call"
+
+  [[allow.call]]
+  signature = "transfer(address,uint256)"
+
+    [[allow.call.arg]]
+    at = 0
+    name = "to"
+    rule = { one_of = { addresses = ["$OTHER_ADDR"] } }
+
+    [[allow.call.arg]]
+    at = 1
+    name = "amount"
+    rule = { max = { max = "10", amount_of = "$TOKEN_ADDR" } }
+TOML
 echo "    Read the decoded summary, then type y and press Enter. ONE Touch ID sheet follows,"
 echo "    and that single biometric does THREE enclave things: it mints the per-payload grant,"
-echo "    it lets the grant verify, and it unlocks the key. Only {r,s,v} comes back."
+echo "    it lets the grant verify, and it unlocks the key. Only {r,s,v} is filed."
 TAPS_EXPECTED=$((TAPS_EXPECTED + 1))
 BIO_START="$(bio_window_start)"
-run_tty p5c_sign_ok "$BIN" sign --file "$INTENT_OK"
-assert_eq "sign exit code" "0" "$RUN_RC"
-assert_contains "policy reported ALLOWED" "policy: ALLOWED" "$RUN_LOG"
-assert_matches "safe_tx_hash is 0x + 64 hex" '"safe_tx_hash":"0x[0-9a-f]{64}"' "$RUN_LOG"
-assert_matches "signature is 0x + 130 hex" '"signature":"0x[0-9a-f]{130}"' "$RUN_LOG"
-SIGNER="$(grep -o '"signer":"0x[0-9a-fA-F]*"' "$RUN_LOG" | head -1 | cut -d'"' -f4 || true)"
+run_tty p5c_sign_ok "$BIN" bundle sign "$HASH_OK" --key "$EVM_KEY" --no-sync
+assert_eq "bundle sign exit code" "0" "$RUN_RC"
+assert_contains "the approval prompt was reached" "$APPROVAL_BANNER" "$RUN_LOG"
+assert_contains "the signature was filed into the bundle" "collected signature" "$RUN_LOG"
+SIG_FILE="$BUNDLE_DIR/$HASH_OK/$ADDR_SE.json"
+assert_matches "the filed signature is 0x + 130 hex" '"signature": ?"0x[0-9a-f]{130}"' "$SIG_FILE"
+SIGNER="$(field_value "$RUN_LOG" signer)"
 assert_eq "the signer is $EVM_KEY's address" "$ADDR_SE" "$(lower "$SIGNER")"
+assert_contains "the bundle's threshold of 1 is met" "met=true" "$RUN_LOG"
 echo "  note  a signature exists at all only because the enclave grant verified under the"
 echo "  note  pinned public key: sign takes the verified grant BY VALUE and cannot be reached"
 echo "  note  without one, so this is the hardware proof phase 4 could not take on its own."
@@ -985,29 +1132,48 @@ assert_taps "one sign, one sheet: the grant signature AND the key unlock reused 
 echo
 echo "==> 5d: the gas-refund DRAIN. Allowed 'to', allowed selector, value 0 — and it still"
 echo "    drains the Safe through the refund fields. Fail-closed without a [refunds] opt-in."
-assert_cmd_fails_with p5d_drain "RefundNotAllowed" "$BIN" sign --file "$INTENT_DRAIN"
-assert_not_contains "5d showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5d_drain "RefundNotAllowed" "$BIN" bundle sign "$HASH_DRAIN" --key "$EVM_KEY" --no-sync
+assert_not_contains "5d showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 
 echo
 echo "==> 5e: a destination outside the allow-list."
-assert_cmd_fails_with p5e_bad_to "ToNotAllowed" "$BIN" sign --file "$INTENT_BAD_TO"
-assert_not_contains "5e showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5e_bad_to "ToNotAllowed" "$BIN" bundle sign "$HASH_BAD_TO" --key "$EVM_KEY" --no-sync
+assert_not_contains "5e showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 
 echo
 echo "==> 5f: the right Safe on the wrong chain."
-assert_cmd_fails_with p5f_bad_chain "ChainMismatch" "$BIN" sign --file "$INTENT_BAD_CHAIN"
-assert_not_contains "5f showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5f_bad_chain "ChainMismatch" "$BIN" bundle sign "$HASH_BAD_CHAIN" --key "$EVM_KEY" --no-sync
+assert_not_contains "5f showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 
 echo
 echo "==> 5g: the same allowed intent with the grant pin removed from config.toml. There is"
 echo "    nothing left to verify an approval against, so it must die BEFORE the human is asked."
 write_config "$CFG_SERVICE" "$CFG_ACCOUNT" ""
-assert_cmd_fails_with p5g_no_pin "NoPinnedGrantKey" "$BIN" sign --file "$INTENT_OK"
-assert_not_contains "5g showed no approval banner" "policy: ALLOWED" "$RUN_LOG"
+assert_cmd_fails_with p5g_no_pin "NoPinnedGrantKey" "$BIN" bundle sign "$HASH_OK" --key "$EVM_KEY" --no-sync
+assert_not_contains "5g showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
 write_config "$CFG_SERVICE" "$CFG_ACCOUNT" "$CFG_GRANT_PUB"
 assert_eq "the honest pin is back in config.toml" "$CFG_GRANT_PUB" "$(toml_value "$CFG_FILE" grant_public_key)"
 
-assert_taps "the whole of phase 5 cost one sheet: all six refusals cost no biometric" \
+echo
+echo "==> 5h: the allowed destination, the allowed signature, a recipient the rule does not"
+echo "    list. Before typed admission an argument was bounded by nothing at all."
+assert_cmd_fails_with p5h_bad_arg "AddressNotAllowed" "$BIN" bundle sign "$HASH_BAD_ARG" --key "$EVM_KEY" --no-sync
+assert_contains "the refusal names the recipient it refused" "$ATTACKER_ADDR" "$RUN_LOG"
+assert_not_contains "5h showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
+
+echo
+echo "==> 5i: four bytes the policy declares no signature for. There is no undecoded"
+echo "    representation left, so this cannot be rendered as hex for a human to eyeball."
+assert_cmd_fails_with p5i_undeclared "SignatureNotAllowed" "$BIN" bundle sign "$HASH_UNDECLARED" --key "$EVM_KEY" --no-sync
+assert_not_contains "5i showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
+
+echo
+echo "==> 5j: an EIP-712 typed-data intent. It is a first-class intent kind, but its shape is"
+echo "    the POLICY's and there is no multi-device collection for it, so a bundle refuses it."
+assert_cmd_fails_with p5j_typed "NotBundleable" "$BIN" bundle new --no-sync --file "$INTENT_TYPED"
+assert_not_contains "5j showed no approval banner" "$APPROVAL_BANNER" "$RUN_LOG"
+
+assert_taps "the whole of phase 5 cost one sheet: every refusal cost no biometric" \
   "1" "$BIO_PHASE"
 
 if [[ -n "$SKIP_SERVE" ]]; then
@@ -1026,6 +1192,10 @@ else
   echo "     HOT_CHEESE_HOME=\"$HOT_CHEESE_HOME\" NO_COLOR=1 \"$BIN\" serve 2>&1 | tee \"$SERVE_LOG\""
   echo
   echo "  3. Wait for the 'hot_cheese serving over https' line."
+  echo
+  echo "  Every request over the network surface now asks terminal B for an approval BEFORE"
+  echo "  any Touch ID sheet: the daemon prints the request and waits for a y there. Keep that"
+  echo "  terminal in front of you for the rest of this phase."
   ANSWER="$(ask_tty "Press Enter here once serve is running in terminal B.")"
 
   PORT_PIDS="$(port_pids)"
@@ -1051,8 +1221,9 @@ else
 
   echo
   echo "==> the assertion this whole feature exists for: /read of a SIGN-ONLY key. The permit"
-  echo "    is minted from the cleartext header before anything unlocks, so the refusal is"
-  echo "    structural and FREE. Nobody's finger is spent telling an attacker no."
+  echo "    is minted from the cleartext header BEFORE the approval prompt and before anything"
+  echo "    unlocks, so the refusal is structural and FREE: terminal B is not asked anything,"
+  echo "    and nobody's finger is spent telling an attacker no."
   BIO_START="$(bio_window_start)"
   run_cmd p6_read_signonly cargo run --release --manifest-path "$PIN_CERT_MANIFEST" \
     --example pin_cert -- "https://127.0.0.1:$DRY_PORT" "$EVM_KEY"
@@ -1068,9 +1239,10 @@ else
   assert_taps "THE EXPORT REFUSAL COST ZERO TOUCH ID SHEETS" "0" "$BIO_START"
 
   echo
-  echo "==> now the same read against the key that DECLARED itself shareable. ONE Touch ID"
-  echo "    sheet, raised by the daemon in terminal B. The key is encrypted end-to-end to the"
-  echo "    client process: the client prints only its length and digest, never the bytes."
+  echo "==> now the same read against the key that DECLARED itself shareable. Terminal B will"
+  echo "    print the request and stop at 'Approve request #N? [y/N]'. ANSWER IT WITH y THERE."
+  echo "    Only then does the ONE Touch ID sheet appear. The key is encrypted end-to-end to"
+  echo "    the client process: the client prints only its length and digest, never the bytes."
   TAPS_EXPECTED=$((TAPS_EXPECTED + 1))
   BIO_START="$(bio_window_start)"
   run_cmd p6_pin_cert cargo run --release --manifest-path "$PIN_CERT_MANIFEST" \
@@ -1159,13 +1331,15 @@ mv "$SE_BLOB_ASIDE" "$SE_BLOB"
 BLOB_SHA_AFTER="$(shasum -a 256 "$SE_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
 assert_eq "the restored SE blob is byte-identical" "$BLOB_SHA_BEFORE" "$BLOB_SHA_AFTER"
 
-phase "PHASE 8 — vault-namespaced backup, read entirely locally (0 prompts, no ssh, no rsync)"
+phase "PHASE 8 — the store is a git repository, read entirely locally (0 prompts, no network)"
 
-echo "Backups are namespaced per install: a push lands in <folder>/<vault_id>/, so two Macs"
-echo "with DIFFERENT DEKs can share one backup host without overwriting each other. The vault"
-echo "id is cleartext in keyring.json, which is why a push never has to unlock anything."
-echo "This phase touches NO network: it reads the id three independent ways and checks the"
-echo "commands that would reach a remote refuse outright when none is configured."
+echo "The store is a git repository and every mutation commits it. Backups are namespaced per"
+echo "install: a push lands in <folder>/<vault_id>.git, so two Macs with DIFFERENT DEKs can"
+echo "share one backup host without overwriting each other. The vault id is cleartext in"
+echo "keyring.json, which is why a push never has to unlock anything. This phase touches NO"
+echo "network: it reads the id three independent ways, checks that every earlier phase left the"
+echo "store committed, and checks the commands that would reach a remote refuse outright when"
+echo "none is configured."
 BIO_PHASE="$(bio_window_start)"
 
 assert_matches "keyring.json carries a v_<32 hex> vault id, in cleartext" \
@@ -1174,8 +1348,27 @@ VAULT_KEYRING="$(grep -oE 'v_[0-9a-f]{32}' "$KEYRING_FILE" | head -1 || true)"
 assert_eq "the vault id on disk is the one init minted, unchanged by every command since" \
   "$VAULT_INIT" "$VAULT_KEYRING"
 
-assert_cmd_fails_with p8_adopt "VaultAlreadyAdopted" "$BIN" backup adopt
-assert_contains "the refusal names this install's own vault id" "$VAULT_KEYRING" "$RUN_LOG"
+if [[ -d "$CFG_STORE/.git" ]]; then
+  pass "the store is a git repository"
+else
+  fail "the store has no .git after every earlier phase [$CFG_STORE]"
+fi
+STORE_STATUS="$(git -C "$CFG_STORE" status --porcelain 2>&1 || true)"
+if [[ -z "$STORE_STATUS" ]]; then
+  pass "every mutation so far committed itself: the store is clean and unmodified"
+else
+  fail "the store has uncommitted changes after every earlier phase [$STORE_STATUS]"
+fi
+run_cmd p8_log git -C "$CFG_STORE" log --oneline
+assert_contains "the commit messages name this install's vault and nothing else" \
+  "hot_cheese $VAULT_KEYRING" "$RUN_LOG"
+run_cmd p8_author git -C "$CFG_STORE" log -1 --format=%an%ae
+assert_contains "the committer identity is pinned, so no hostname or operator email is recorded" \
+  "hot_cheesehot_cheese@localhost" "$RUN_LOG"
+
+run_cmd p8_status "$BIN" backup status
+assert_eq "backup status reads the local state with no remote configured" "0" "$RUN_RC"
+assert_contains "backup status names this install's vault" "$VAULT_KEYRING" "$RUN_LOG"
 
 echo
 echo "==> with backup_remotes = [] there is nothing to talk to, and both remote-reading"
@@ -1183,15 +1376,15 @@ echo "    subcommands must say so instead of guessing a host."
 assert_cmd_fails_with p8_list "NoBackupRemote" "$BIN" backup list
 assert_cmd_fails_with p8_pull "NoBackupRemote" "$BIN" backup pull
 
-PUSH_TARGET="$EXAMPLE_FOLDER/$VAULT_KEYRING/"
+PUSH_TARGET="$EXAMPLE_FOLDER/$VAULT_KEYRING.git"
 echo
 echo "  note  no remote is configured here, so nothing is pushed anywhere. With a remote whose"
-echo "  note  folder is '$EXAMPLE_FOLDER', THIS install's store would replicate into:"
-echo "  note      <host>:~/$PUSH_TARGET"
-if [[ "$PUSH_TARGET" =~ ^[A-Za-z0-9_.-]+/v_[0-9a-f]{32}/$ ]]; then
-  pass "a push target composed from this config + this keyring is <folder>/<vault_id>/"
+echo "  note  folder is '$EXAMPLE_FOLDER', THIS install's store would push to:"
+echo "  note      <host>:$PUSH_TARGET"
+if [[ "$PUSH_TARGET" =~ ^[A-Za-z0-9_.-]+/v_[0-9a-f]{32}\.git$ ]]; then
+  pass "a push target composed from this config + this keyring is <folder>/<vault_id>.git"
 else
-  fail "the composed push target is not <folder>/<vault_id>/ [got='$PUSH_TARGET']"
+  fail "the composed push target is not <folder>/<vault_id>.git [got='$PUSH_TARGET']"
 fi
 assert_taps "the whole backup phase cost zero biometrics" "0" "$BIO_PHASE"
 

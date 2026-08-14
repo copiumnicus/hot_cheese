@@ -22,6 +22,7 @@ pub mod intent;
 pub mod manifest;
 pub mod policy;
 pub mod qr;
+pub mod schema;
 pub mod sign;
 
 use alloy_primitives::{Address, Bytes, B256};
@@ -42,6 +43,7 @@ create_err_with_impls!(
     PolicyDenied(policy::PolicyDenied),
     ManifestDenied(manifest::ManifestDenied),
     Adapter(adapter::AdapterErr),
+    Typed(adapter::typed::TypedDenied),
     Grant(grant::GrantErr),
     Unlock(hc_core::unlock::UnlockErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
