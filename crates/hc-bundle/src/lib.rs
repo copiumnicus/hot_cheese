@@ -7,9 +7,11 @@
 //!
 //! Every device writes its OWN file, `0x<signer>.json`, holding a complete bundle carrying only
 //! that device's signature. That is the whole concurrency design: two Macs signing the same
-//! transaction at the same moment write two differently-named files, so there is no lock to
-//! take, no last-writer-wins, and no conflict to resolve — whoever reads takes the union in
-//! memory. The union is [`SafeTxBundle::merge`], which recomputes both digests and refuses a
+//! transaction at the same moment write two differently-named files, so there is no
+//! last-writer-wins conflict to resolve — whoever reads takes the union in memory. A small
+//! local lock now serialises validation and multi-step check/write sequences, but correctness
+//! across machines still comes from the per-writer layout rather than that local lock. The
+//! union is [`SafeTxBundle::merge`], which recomputes both digests and refuses a
 //! file belonging to another transaction, so a misfiled drop-in cannot be absorbed silently.
 //! It is also what makes [`sync`] correct: `rsync` without `--delete` over a per-writer layout
 //! IS that union, so pulling and pushing in both directions converges with nothing to resolve.
@@ -19,22 +21,32 @@
 //! [`collect`] takes the answer back — so the CLI and the console both drive it through
 //! whichever unlock path they already own, and neither one grows a second route to a key.
 pub mod ingest;
+pub(crate) mod local;
+#[doc(hidden)]
+pub mod lock;
 pub mod poll;
 pub mod sync;
 pub mod tailnet;
 
+use crate::ingest::{
+    MAX_BUNDLE_DIRS, MAX_ENUMERATED_ENTRIES, MAX_FILES_PER_BUNDLE, MAX_FILE_BYTES,
+};
 use crate::sync::SyncMode;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use err_mac::create_err_with_impls;
 use hashbrown::HashMap;
 use hc_core::config::bundles_dir;
-use hc_core::crypto::envelope::atomic_write;
-use hc_sign::bundle::{CollectedSignature, SafeTxBundle};
+use hc_core::crypto::envelope::atomic_write_new;
+use hc_sign::bundle::{CollectedSignature, Quorum, SafeTxBundle};
 use hc_sign::grant::now_ms;
 use hc_sign::intent::{Intent, SafeTxIntent};
 use hc_sign::qr::{frames, QrKind};
 use hc_sign::SignResponse;
 use serde::{Deserialize, Serialize};
+use std::ffi::{CString, OsStr};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// The bundle a device writes before it holds any signature.
@@ -42,6 +54,9 @@ pub const SEED_FILE: &str = "unsigned.json";
 
 /// Suffix every file in a bundle directory carries.
 pub const BUNDLE_SUFFIX: &str = ".json";
+pub const MAX_SAFES_BYTES: u64 = 64 * 1024;
+pub const MAX_SAFES: usize = 256;
+pub const MAX_SAFE_OWNERS: usize = 64;
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -52,7 +67,9 @@ create_err_with_impls!(
     Envelope(hc_core::crypto::envelope::EnvErr),
     Verify(hc_sign::bundle::BundleErr),
     Qr(hc_sign::qr::QrErr),
-    Grant(hc_sign::grant::GrantErr)
+    Grant(hc_sign::grant::GrantErr),
+    Lock(lock::LockErr),
+    Ingest(ingest::IngestErr)
     ;
     NoSafesFile { path: PathBuf },
     UnknownSafe { safe: Address, chain_id: U256 },
@@ -61,8 +78,43 @@ create_err_with_impls!(
     EmptyBundle { dir: PathBuf },
     NotItsDigest { dir: PathBuf, digest: B256 },
     ForeignDigest { ours: B256, theirs: B256 },
-    ThresholdNotMet { have: usize, threshold: u8 }
+    ThresholdNotMet { have: usize, threshold: u8 },
+    TooManyBundleFiles { dir: PathBuf, found: usize, max: usize },
+    TooManyDirectoryEntries { dir: PathBuf, max: usize },
+    TooManySafes { found: usize, max: usize },
+    InvalidSafeThreshold { safe: Address, threshold: u8, owners: usize },
+    TooManySafeOwners { safe: Address, found: usize, max: usize },
+    DuplicateSafeOwner { safe: Address, owner: Address },
+    DuplicateSafe { safe: Address, chain_id: U256 },
+    BundleFileTooLarge { size: usize, max: u64 },
+    BundleFileConflict { path: PathBuf },
+    InvalidBundleFileName { path: PathBuf },
+    MisfiledBundle { path: PathBuf }
 );
+
+/// An exclusive, cross-process claim on the local bundle tree. MCP keeps one from its final
+/// queue/slot check through creation, closing the check-then-file race; ordinary operations take
+/// the same claim internally.
+pub struct Mutation {
+    _lock: lock::Lock,
+}
+
+impl Mutation {
+    pub fn take() -> Result<Self, BundleErr> {
+        Ok(Self {
+            _lock: lock::Lock::take()?,
+        })
+    }
+
+    /// Create one bundle while consuming this claim. The claim is deliberately dropped before
+    /// the network push, so an asleep peer cannot block local readers and writers for a minute.
+    pub fn new(self, sync: SyncMode, intent: SafeTxIntent) -> Result<B256, BundleErr> {
+        let hash = new_local(intent)?;
+        drop(self);
+        sync.push(Scope::One(hash));
+        Ok(hash)
+    }
+}
 
 /// How much of the bundle tree an operation touches. Naming one bundle keeps a sync to the
 /// directory the operator is actually working in, which is what makes weaving it into every
@@ -76,7 +128,7 @@ pub enum Scope {
 }
 
 /// One Safe this machine collects for.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeEntry {
     /// The Safe contract.
@@ -103,11 +155,64 @@ pub struct Safes {
 
 impl Safes {
     pub fn load() -> Result<Self, BundleErr> {
-        let path = bundles_dir().join("safes.toml");
+        let root = bundles_dir();
+        let path = root.join("safes.toml");
+        if !owned_directory_exists(&root)? {
+            return Err(BundleErr::NoSafesFile { path });
+        }
         if !path.exists() {
             return Err(BundleErr::NoSafesFile { path });
         }
-        Ok(toml::from_str(&std::fs::read_to_string(&path)?)?)
+        let bytes = hc_core::read_regular_file_bounded(&path, MAX_SAFES_BYTES)?;
+        let safes: Self = toml::from_str(
+            std::str::from_utf8(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        )?;
+        safes.validate()?;
+        Ok(safes)
+    }
+
+    fn validate(&self) -> Result<(), BundleErr> {
+        if self.safe.len() > MAX_SAFES {
+            return Err(BundleErr::TooManySafes {
+                found: self.safe.len(),
+                max: MAX_SAFES,
+            });
+        }
+        for (at, entry) in self.safe.iter().enumerate() {
+            if entry.threshold == 0 || usize::from(entry.threshold) > entry.owners.len() {
+                return Err(BundleErr::InvalidSafeThreshold {
+                    safe: entry.address,
+                    threshold: entry.threshold,
+                    owners: entry.owners.len(),
+                });
+            }
+            if entry.owners.len() > MAX_SAFE_OWNERS {
+                return Err(BundleErr::TooManySafeOwners {
+                    safe: entry.address,
+                    found: entry.owners.len(),
+                    max: MAX_SAFE_OWNERS,
+                });
+            }
+            for (owner_at, owner) in entry.owners.iter().enumerate() {
+                if entry.owners[owner_at + 1..].contains(owner) {
+                    return Err(BundleErr::DuplicateSafeOwner {
+                        safe: entry.address,
+                        owner: *owner,
+                    });
+                }
+            }
+            if self.safe[at + 1..]
+                .iter()
+                .any(|other| other.address == entry.address && other.chain_id == entry.chain_id)
+            {
+                return Err(BundleErr::DuplicateSafe {
+                    safe: entry.address,
+                    chain_id: entry.chain_id,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The entry for a (Safe, chain) pair. An unknown Safe is a refusal: the threshold and the
@@ -129,6 +234,8 @@ pub struct Loaded {
     pub hash: B256,
     /// The union of every per-signer file in that directory.
     pub bundle: SafeTxBundle,
+    /// What it holds against what the LOCAL `safes.toml` requires today.
+    pub quorum: Quorum,
 }
 
 /// What a bundle competes for. A Safe executes each nonce exactly once, so two different
@@ -156,16 +263,16 @@ pub struct BundleStatus {
     pub hash: B256,
     /// The union of every per-signer file.
     pub bundle: SafeTxBundle,
-    /// The threshold `safes.toml` states today; a bundle records the one in force when it was
-    /// created, so a difference means the Safe was changed underneath it.
-    pub safes_threshold: u8,
-    /// Collected signers `safes.toml` does not list as owners; each one reverts on-chain.
-    pub not_owners: Vec<Address>,
+    /// What it holds against what the LOCAL `safes.toml` requires today, carrying the threshold
+    /// the file itself states when the two disagree.
+    pub quorum: Quorum,
     /// Owners with no signature yet.
     pub missing: Vec<Address>,
     /// Other digests competing for the same (Safe, chain, nonce).
     pub rivals: Vec<B256>,
-    /// Milliseconds since the bundle was created.
+    /// Milliseconds since this machine's kernel stamped the bundle directory. `created_at_ms` is
+    /// a peer's wall clock and a future one would render as brand new for ever, so age is taken
+    /// from the local clock instead.
     pub age_ms: u64,
 }
 
@@ -175,6 +282,8 @@ pub struct Merged {
     pub added: Vec<Address>,
     /// The union afterwards.
     pub union: SafeTxBundle,
+    /// What that union holds against what the LOCAL `safes.toml` requires today.
+    pub quorum: Quorum,
 }
 
 /// The `execTransaction` call the operator broadcasts with their own tooling. hot_cheese has no
@@ -231,39 +340,179 @@ pub fn bundle_dir(hash: B256) -> PathBuf {
     bundles_dir().join(hash.to_string())
 }
 
+/// Parse only the one spelling this crate creates and the transport admits. `B256::from_str`
+/// also accepts upper-case and prefixless hex; treating those aliases as bundle directories
+/// would let two paths occupy one in-memory hash slot and make incremental ingestion account for
+/// whichever alias happened to sort last.
+pub(crate) fn canonical_bundle_hash(name: &OsStr) -> Option<B256> {
+    let text = name.to_str()?;
+    let hash = text.parse::<B256>().ok()?;
+    (text == hash.to_string()).then_some(hash)
+}
+
+pub(crate) fn canonical_bundle_file_name(name: &OsStr) -> bool {
+    let Some(text) = name.to_str() else {
+        return false;
+    };
+    text == SEED_FILE
+        || text
+            .strip_suffix(BUNDLE_SUFFIX)
+            .and_then(|stem| stem.parse::<Address>().ok())
+            .is_some_and(|address| text == format!("{address:#x}{BUNDLE_SUFFIX}"))
+}
+
+/// Open a final-component directory without following a symlink and require that this uid owns
+/// it. Bundle paths are later used for writes and recursive retirement, so a directory-looking
+/// symlink is not equivalent to a directory here.
+pub(crate) fn owned_directory_exists(path: &Path) -> std::io::Result<bool> {
+    let directory = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = directory.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and changes no process state.
+    let ours = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_dir() || metadata.uid() != ours {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "bundle directory must be a real directory owned by this user: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// Create an owner-only directory if absent, then validate it through an `O_NOFOLLOW` descriptor.
+pub(crate) fn ensure_owned_directory(path: &Path) -> std::io::Result<()> {
+    if !owned_directory_exists(path)? {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and changes no process state.
+    let ours = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_dir() || metadata.uid() != ours {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bundle directory is not owner-controlled",
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// The Safe a bundle names, as the LOCAL `safes.toml` states it. Who may sign and how many must
+/// are read here and nowhere else: both sit outside `safeTxHash`, so the copy in a bundle file is
+/// whatever the device that wrote it chose, and the file that won a directory-creation race must
+/// not get to state them for every peer. A Safe this machine does not describe is a refusal, since
+/// there is then nothing to judge a signature against.
+fn safe_of(intent: &SafeTxIntent) -> Result<SafeEntry, BundleErr> {
+    Ok(Safes::load()?.find(intent.safe, intent.chain_id)?.clone())
+}
+
+/// What a bundle holds against what `safes.toml` requires today.
+pub fn quorum(bundle: &SafeTxBundle) -> Result<Quorum, BundleErr> {
+    Ok(bundle.quorum(safe_of(&bundle.intent)?.threshold))
+}
+
 /// The union of every file in `dir`, bound to the digest the directory is named for. Files are
 /// merged in name order only so that a failure is reproducible; the merge itself is
 /// commutative, so the result does not depend on it.
+///
+/// `threshold` and `created_at_ms` are not covered by `safeTxHash`, so they are neither evidence
+/// nor grounds for refusal: every file is normalised onto the reference file's pair before the
+/// merge, and a signature that is valid for the digest and made by an owner is taken whatever
+/// coordination its file happened to carry. What the bundle is judged BY is [`safe_of`].
+///
+/// The structural check runs before the recovery, as ingestion does it: that a name binds its
+/// contents costs a comparison, where recovering the signature it names costs an ecrecover.
 fn load_dir(dir: &Path, hash: B256) -> Result<SafeTxBundle, BundleErr> {
-    if !dir.is_dir() {
+    if !owned_directory_exists(dir)? {
         return Err(BundleErr::NoSuchBundle {
             dir: dir.to_path_buf(),
         });
     }
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for (at, entry) in std::fs::read_dir(dir)?.enumerate() {
+        if at >= MAX_ENUMERATED_ENTRIES {
+            return Err(BundleErr::TooManyDirectoryEntries {
+                dir: dir.to_path_buf(),
+                max: MAX_ENUMERATED_ENTRIES,
+            });
+        }
         let entry = entry?;
         if entry.file_type()?.is_file()
             && entry.file_name().to_string_lossy().ends_with(BUNDLE_SUFFIX)
         {
+            let name = entry.file_name();
+            if !canonical_bundle_file_name(&name) {
+                return Err(BundleErr::InvalidBundleFileName { path: entry.path() });
+            }
+            if files.len() >= MAX_FILES_PER_BUNDLE {
+                return Err(BundleErr::TooManyBundleFiles {
+                    dir: dir.to_path_buf(),
+                    found: files.len() + 1,
+                    max: MAX_FILES_PER_BUNDLE,
+                });
+            }
             files.push(entry.path());
         }
     }
-    files.sort();
-
-    let mut merged: Option<SafeTxBundle> = None;
+    files.sort_by(|a, b| {
+        let a_seed = a.file_name().is_some_and(|name| name == SEED_FILE);
+        let b_seed = b.file_name().is_some_and(|name| name == SEED_FILE);
+        b_seed.cmp(&a_seed).then_with(|| a.cmp(b))
+    });
+    let mut parsed = Vec::with_capacity(files.len());
     for path in &files {
-        let one: SafeTxBundle = serde_json::from_slice(&std::fs::read(path)?)?;
-        match &mut merged {
-            None => merged = Some(one),
-            Some(union) => union.merge(one)?,
+        let bytes = hc_core::read_regular_file_bounded(path, MAX_FILE_BYTES)?;
+        let one: SafeTxBundle = hc_core::wire::strict_json_from_slice(&bytes)?;
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| BundleErr::InvalidBundleFileName { path: path.clone() })?;
+        let filed_correctly = if file == SEED_FILE {
+            one.signatures.is_empty()
+        } else {
+            let owner = file
+                .strip_suffix(BUNDLE_SUFFIX)
+                .and_then(|stem| stem.parse::<Address>().ok());
+            one.signatures.len() == 1 && owner == Some(one.signatures[0].signer)
+        };
+        if !filed_correctly {
+            return Err(BundleErr::MisfiledBundle { path: path.clone() });
         }
+        parsed.push(one);
     }
-    let Some(merged) = merged else {
+    if parsed.is_empty() {
         return Err(BundleErr::EmptyBundle {
             dir: dir.to_path_buf(),
         });
-    };
+    }
+    let mut merged = parsed.remove(0);
+    let safe = safe_of(&merged.intent)?;
+    merged.validate(&safe.owners)?;
+    for mut one in parsed {
+        one.threshold = merged.threshold;
+        one.created_at_ms = merged.created_at_ms;
+        merged.merge(one, &safe.owners)?;
+    }
     let digest = merged.digest();
     if digest != hash {
         return Err(BundleErr::NotItsDigest {
@@ -278,29 +527,61 @@ fn load_dir(dir: &Path, hash: B256) -> Result<SafeTxBundle, BundleErr> {
 /// not a bundle and is skipped; one that will not load is skipped LOUDLY rather than taking
 /// the listing down with it, because a peer can put bytes in this tree and one poisoned
 /// directory must not cost the operator sight of the others.
+///
+/// [`MAX_BUNDLE_DIRS`] bounds the ecrecovers one listing spends, so past it the digest-lowest are
+/// loaded and the overflow is reported: a tree that grew — which only this machine's own writes
+/// can do, since arrivals are capped long before here — must not make every listing, and with it
+/// every poll, fail outright.
 fn load_all() -> Result<Vec<Loaded>, BundleErr> {
     let root = bundles_dir();
-    let mut out = Vec::new();
-    if !root.is_dir() {
-        return Ok(out);
+    if !owned_directory_exists(&root)? {
+        return Ok(Vec::new());
     }
-    for entry in std::fs::read_dir(&root)? {
+    let mut found = Vec::new();
+    for (at, entry) in std::fs::read_dir(&root)?.enumerate() {
+        if at >= MAX_ENUMERATED_ENTRIES {
+            return Err(BundleErr::TooManyDirectoryEntries {
+                dir: root.clone(),
+                max: MAX_ENUMERATED_ENTRIES,
+            });
+        }
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let Ok(hash) = entry.file_name().to_string_lossy().parse::<B256>() else {
-            continue;
-        };
-        match load_dir(&entry.path(), hash) {
-            Ok(bundle) => out.push(Loaded { hash, bundle }),
+        if let Some(hash) = canonical_bundle_hash(&entry.file_name()) {
+            found.push((hash, entry.path()));
+        }
+    }
+    found.sort_by_key(|(hash, _)| *hash);
+    if found.len() > MAX_BUNDLE_DIRS {
+        tracing::warn!(
+            found = found.len(),
+            max = MAX_BUNDLE_DIRS,
+            "more bundle directories than one listing loads; retire the ones this machine is done with"
+        );
+        found.truncate(MAX_BUNDLE_DIRS);
+    }
+    let mut out = Vec::with_capacity(found.len());
+    for (hash, dir) in found {
+        match load_one(&dir, hash) {
+            Ok(one) => out.push(one),
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "skipping a bundle directory that will not load")
             }
         }
     }
-    out.sort_by_key(|one| one.hash);
     Ok(out)
+}
+
+/// One directory's union with the local quorum already counted for it.
+fn load_one(dir: &Path, hash: B256) -> Result<Loaded, BundleErr> {
+    let bundle = load_dir(dir, hash)?;
+    Ok(Loaded {
+        hash,
+        quorum: quorum(&bundle)?,
+        bundle,
+    })
 }
 
 /// Whatever `scope` covers that actually loads.
@@ -309,11 +590,11 @@ pub(crate) fn loaded(scope: Scope) -> Result<Vec<Loaded>, BundleErr> {
         return load_all();
     };
     let dir = bundle_dir(hash);
-    if !dir.is_dir() {
+    if !owned_directory_exists(&dir)? {
         return Ok(Vec::new());
     }
-    match load_dir(&dir, hash) {
-        Ok(bundle) => Ok(vec![Loaded { hash, bundle }]),
+    match load_one(&dir, hash) {
+        Ok(one) => Ok(vec![one]),
         Err(e) => {
             tracing::warn!(%hash, error = %e, "skipping a bundle directory that will not load");
             Ok(Vec::new())
@@ -325,15 +606,32 @@ pub(crate) fn loaded(scope: Scope) -> Result<Vec<Loaded>, BundleErr> {
 /// against a digest recomputed from OUR fields: the one into the union refuses a second,
 /// different signature from a signer who already has one, and the one into the fresh bundle
 /// produces exactly what `0x<signer>.json` holds — that signer's signature and nothing else.
-fn take(held: &SafeTxBundle, sig: CollectedSignature) -> Result<SafeTxBundle, BundleErr> {
+fn take(
+    held: &SafeTxBundle,
+    sig: CollectedSignature,
+    owners: &[Address],
+) -> Result<SafeTxBundle, BundleErr> {
+    held.validate(owners)?;
     let mut union = held.clone();
-    union.add(sig.clone())?;
+    union.add(sig.clone(), owners)?;
     let mut one = SafeTxBundle {
         signatures: Vec::new(),
         ..held.clone()
     };
-    one.add(sig)?;
+    one.add(sig, owners)?;
     Ok(one)
+}
+
+fn serialized_bundle(one: &SafeTxBundle, owners: &[Address]) -> Result<Vec<u8>, BundleErr> {
+    one.validate(owners)?;
+    let bytes = serde_json::to_vec_pretty(one)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(BundleErr::BundleFileTooLarge {
+            size: bytes.len(),
+            max: MAX_FILE_BYTES,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Ingest a `SignResponse`, this machine's own or one another device handed over. The claimed
@@ -343,6 +641,7 @@ fn take(held: &SafeTxBundle, sig: CollectedSignature) -> Result<SafeTxBundle, Bu
 pub fn take_response(
     held: &SafeTxBundle,
     response: SignResponse,
+    owners: &[Address],
 ) -> Result<SafeTxBundle, BundleErr> {
     let ours = held.digest();
     if response.safe_tx_hash != ours {
@@ -357,22 +656,51 @@ pub fn take_response(
             signer: response.signer,
             signature: response.signature,
         },
+        owners,
     )
 }
 
-fn write_one(dir: &Path, signer: Address, one: &SafeTxBundle) -> Result<(), BundleErr> {
-    atomic_write(
-        &dir.join(format!("{signer:#x}{BUNDLE_SUFFIX}")),
-        &serde_json::to_vec_pretty(one)?,
-    )?;
-    Ok(())
+/// Write this signer's own file, once. An existing file holding the same signature over the same
+/// transaction is the same file: coordination metadata is outside the digest and outside local
+/// truth, so a difference there is not a second, conflicting claim under this signer's name.
+fn write_one(
+    dir: &Path,
+    signer: Address,
+    one: &SafeTxBundle,
+    owners: &[Address],
+) -> Result<(), BundleErr> {
+    let path = dir.join(format!("{signer:#x}{BUNDLE_SUFFIX}"));
+    if one.signatures.len() != 1 || one.signatures[0].signer != signer {
+        return Err(BundleErr::MisfiledBundle { path });
+    }
+    let bytes = serialized_bundle(one, owners)?;
+    match atomic_write_new(&path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(hc_core::crypto::envelope::EnvErr::StdIo(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            let held = hc_core::read_regular_file_bounded(&path, MAX_FILE_BYTES)?;
+            let held: SafeTxBundle = hc_core::wire::strict_json_from_slice(&held)?;
+            if held.signatures == one.signatures && held.digest() == one.digest() {
+                Ok(())
+            } else {
+                Err(BundleErr::BundleFileConflict { path })
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Start a bundle from an intent. The threshold comes from `safes.toml`, so a Safe this
 /// machine does not describe cannot be collected for at all. Pushes the new directory to every
 /// enrolled peer, so a co-signer sees it without being told.
 pub fn new(sync: SyncMode, intent: SafeTxIntent) -> Result<B256, BundleErr> {
-    let threshold = Safes::load()?.find(intent.safe, intent.chain_id)?.threshold;
+    Mutation::take()?.new(sync, intent)
+}
+
+fn new_local(intent: SafeTxIntent) -> Result<B256, BundleErr> {
+    let safe = safe_of(&intent)?;
+    let threshold = safe.threshold;
     let bundle = SafeTxBundle {
         v: hc_sign::bundle::V,
         intent,
@@ -380,15 +708,23 @@ pub fn new(sync: SyncMode, intent: SafeTxIntent) -> Result<B256, BundleErr> {
         signatures: Vec::new(),
         created_at_ms: now_ms()?,
     };
+    let bytes = serialized_bundle(&bundle, &safe.owners)?;
     let hash = bundle.digest();
     let dir = bundle_dir(hash);
-    if dir.exists() {
-        return Err(BundleErr::BundleExists { dir });
+    ensure_owned_directory(&bundles_dir())?;
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(BundleErr::BundleExists { dir })
+        }
+        Err(error) => return Err(error.into()),
     }
-    std::fs::create_dir_all(&dir)?;
-    atomic_write(&dir.join(SEED_FILE), &serde_json::to_vec_pretty(&bundle)?)?;
+    if let Err(error) = hc_core::crypto::envelope::atomic_write_new(&dir.join(SEED_FILE), &bytes) {
+        let _ = std::fs::remove_dir(&dir);
+        return Err(error.into());
+    }
+    local::revive(hash)?;
     tracing::info!(%hash, dir = %dir.display(), threshold, "created bundle");
-    sync.push(Scope::One(hash));
     Ok(hash)
 }
 
@@ -398,29 +734,66 @@ pub fn new(sync: SyncMode, intent: SafeTxIntent) -> Result<B256, BundleErr> {
 /// bundle can still be asked to sign it.
 pub fn intent_to_sign(sync: SyncMode, hash: B256, key: &str) -> Result<SafeTxIntent, BundleErr> {
     sync.pull(Scope::One(hash));
+    let _mutation = Mutation::take()?;
     Ok(load_dir(&bundle_dir(hash), hash)?.intent_for(key))
 }
 
 /// Take a response into the bundle on disk, then hand back the union that is actually there
 /// afterwards. Pushes it, so the co-signer's next read already has it.
+///
+/// The response is held on disk BEFORE anything that can fail runs. A biometric was already spent
+/// on it, so a lock this process could not take, or a directory that would not load, must leave
+/// the approval recoverable instead of dropping it: the next collect for this bundle takes
+/// whatever is still held. The file this device writes states the threshold THIS machine knows,
+/// never the coordination a peer put in whichever seed arrived first.
 pub fn collect(
     sync: SyncMode,
     hash: B256,
     response: SignResponse,
 ) -> Result<SafeTxBundle, BundleErr> {
+    local::hold(hash, &response)?;
+    let mutation = Mutation::take()?;
     let dir = bundle_dir(hash);
-    let held = load_dir(&dir, hash)?;
-    let signer = response.signer;
-    write_one(&dir, signer, &take_response(&held, response)?)?;
+    let mut held = load_dir(&dir, hash)?;
+    let safe = safe_of(&held.intent)?;
+    held.threshold = safe.threshold;
+    let mut taken = Vec::new();
+    let mut refused = None;
+    for (path, pending) in local::held(hash)? {
+        let signer = pending.signer;
+        match take_response(&held, pending, &safe.owners)
+            .and_then(|one| write_one(&dir, signer, &one, &safe.owners))
+        {
+            Ok(()) => {
+                local::release(&path)?;
+                taken.push(signer);
+            }
+            Err(error) => {
+                tracing::warn!(%hash, %signer, %error, "a held approval cannot join this bundle");
+                local::release(&path)?;
+                if refused.is_none() {
+                    refused = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = refused {
+        if taken.is_empty() {
+            return Err(error);
+        }
+    }
+    local::revive(hash)?;
     let after = load_dir(&dir, hash)?;
+    let quorum = after.quorum(safe.threshold);
     tracing::info!(
         %hash,
-        %signer,
-        have = after.signatures.len(),
-        threshold = after.threshold,
-        met = after.met(),
+        ?taken,
+        have = quorum.have,
+        threshold = quorum.threshold,
+        met = quorum.met,
         "collected signature"
     );
+    drop(mutation);
     sync.push(Scope::One(hash));
     Ok(after)
 }
@@ -429,16 +802,10 @@ pub fn collect(
 /// nonce. Pulls the bundle's own directory first.
 pub fn status(sync: SyncMode, hash: B256) -> Result<BundleStatus, BundleErr> {
     sync.pull(Scope::One(hash));
-    let held = load_dir(&bundle_dir(hash), hash)?;
-    let safes = Safes::load()?;
-    let entry = safes.find(held.intent.safe, held.intent.chain_id)?;
-
-    let mut not_owners = Vec::new();
-    for sig in &held.signatures {
-        if !entry.owners.contains(&sig.signer) {
-            not_owners.push(sig.signer);
-        }
-    }
+    let _mutation = Mutation::take()?;
+    let dir = bundle_dir(hash);
+    let held = load_dir(&dir, hash)?;
+    let entry = safe_of(&held.intent)?;
     let mut missing = Vec::new();
     for owner in &entry.owners {
         if !held.signatures.iter().any(|sig| &sig.signer == owner) {
@@ -459,10 +826,9 @@ pub fn status(sync: SyncMode, hash: B256) -> Result<BundleStatus, BundleErr> {
     }
     Ok(BundleStatus {
         hash,
-        age_ms: now_ms()?.saturating_sub(held.created_at_ms),
+        age_ms: ingest::local_age_ms(&dir, now_ms()?)?,
+        quorum: held.quorum(entry.threshold),
         bundle: held,
-        safes_threshold: entry.threshold,
-        not_owners,
         missing,
         rivals,
     })
@@ -472,6 +838,12 @@ pub fn status(sync: SyncMode, hash: B256) -> Result<BundleStatus, BundleErr> {
 /// finding out what a co-signer started is the entire point of asking.
 pub fn list(sync: SyncMode) -> Result<Vec<(Slot, Vec<Loaded>)>, BundleErr> {
     sync.pull(Scope::All);
+    let mutation = Mutation::take()?;
+    list_locked(&mutation)
+}
+
+/// Read the grouped queue while a caller-held mutation claim prevents any check/file gap.
+pub fn list_locked(_mutation: &Mutation) -> Result<Vec<(Slot, Vec<Loaded>)>, BundleErr> {
     Ok(slots(load_all()?))
 }
 
@@ -480,48 +852,69 @@ pub fn read_bundle(path: &Path, hash: B256) -> Result<SafeTxBundle, BundleErr> {
     if path.is_dir() {
         return load_dir(path, hash);
     }
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    let bytes = hc_core::read_regular_file_bounded(path, MAX_FILE_BYTES)?;
+    let bundle: SafeTxBundle = hc_core::wire::strict_json_from_slice(&bytes)?;
+    bundle.validate(&safe_of(&bundle.intent)?.owners)?;
+    Ok(bundle)
 }
 
 /// Union an external bundle into the store. Every signature lands in its own file, so an
 /// import is byte-identical to what the signing device would have written, and the result is
 /// pushed to the peers like any other write.
 pub fn merge(sync: SyncMode, hash: B256, incoming: SafeTxBundle) -> Result<Merged, BundleErr> {
+    let mutation = Mutation::take()?;
     let dir = bundle_dir(hash);
     let held = load_dir(&dir, hash)?;
     let theirs = incoming.digest();
     if theirs != hash {
         return Err(BundleErr::ForeignDigest { ours: hash, theirs });
     }
+    let safe = safe_of(&held.intent)?;
+    let mut held = held;
+    held.threshold = safe.threshold;
     let mut union = held.clone();
+    let mut incoming = incoming;
+    incoming.threshold = union.threshold;
+    incoming.created_at_ms = union.created_at_ms;
+    union.merge(incoming.clone(), &safe.owners)?;
     let mut added = Vec::new();
     for sig in incoming.signatures {
         let signer = sig.signer;
-        let before = union.signatures.len();
-        union.add(sig.clone())?;
-        write_one(&dir, signer, &take(&held, sig)?)?;
-        if union.signatures.len() != before {
+        let already_held = held.signatures.iter().any(|held| held.signer == signer);
+        write_one(&dir, signer, &take(&held, sig, &safe.owners)?, &safe.owners)?;
+        if !already_held {
             added.push(signer);
         }
     }
-    tracing::info!(%hash, have = union.signatures.len(), threshold = union.threshold, met = union.met(), "merged");
+    local::revive(hash)?;
+    let quorum = union.quorum(safe.threshold);
+    tracing::info!(%hash, have = quorum.have, threshold = quorum.threshold, met = quorum.met, "merged");
+    drop(mutation);
     sync.push(Scope::One(hash));
-    Ok(Merged { added, union })
+    Ok(Merged {
+        added,
+        union,
+        quorum,
+    })
 }
 
-/// The assembled call. The owner list is checked here because this is the last moment before
-/// gas is spent: a signer `safes.toml` does not list means either the mirror is stale or the
-/// signature is worthless, and both revert on-chain. Pulls first, so the final signer is
-/// assembling from everything that exists rather than everything that reached this disk.
+/// The assembled call. Everything it is judged against is read from `safes.toml` at this moment,
+/// because this is the last one before gas is spent: the owner list through the re-validation the
+/// union already ran under, and the threshold as the count below. The bundle file's own threshold
+/// decides nothing here — a peer wrote it, and letting it disagree would hand any peer a veto over
+/// executing. Pulls first, so the final signer assembles from everything that exists rather than
+/// everything that reached this disk.
 pub fn export(sync: SyncMode, hash: B256) -> Result<Execution, BundleErr> {
     sync.pull(Scope::One(hash));
+    let _mutation = Mutation::take()?;
     let held = load_dir(&bundle_dir(hash), hash)?;
-    let safes = Safes::load()?;
-    held.owners_ok(&safes.find(held.intent.safe, held.intent.chain_id)?.owners)?;
-    if !held.met() {
+    let safe = safe_of(&held.intent)?;
+    held.validate(&safe.owners)?;
+    let quorum = held.quorum(safe.threshold);
+    if !quorum.met {
         return Err(BundleErr::ThresholdNotMet {
-            have: held.signatures.len(),
-            threshold: held.threshold,
+            have: quorum.have,
+            threshold: quorum.threshold,
         });
     }
     let i = &held.intent;
@@ -542,18 +935,104 @@ pub fn export(sync: SyncMode, hash: B256) -> Result<Execution, BundleErr> {
     })
 }
 
+/// Remove only the flat, canonical files a valid bundle owns, through the directory descriptor
+/// that was opened before deletion. Recursive deletion is inappropriate here: an unexpected
+/// nested directory is not bundle state and must never be erased merely because it sits under a
+/// digest-looking pathname.
+fn remove_bundle_directory(dir: &Path) -> Result<(), BundleErr> {
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let identity = directory.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and changes no process state.
+    let ours = unsafe { libc::geteuid() };
+    if !identity.file_type().is_dir() || identity.uid() != ours {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bundle directory is not owner-controlled",
+        )
+        .into());
+    }
+
+    let mut names = Vec::new();
+    for (at, entry) in std::fs::read_dir(dir)?.enumerate() {
+        if at >= MAX_ENUMERATED_ENTRIES {
+            return Err(BundleErr::TooManyDirectoryEntries {
+                dir: dir.to_path_buf(),
+                max: MAX_ENUMERATED_ENTRIES,
+            });
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        if !entry.file_type()?.is_file() || !canonical_bundle_file_name(&name) {
+            return Err(BundleErr::InvalidBundleFileName { path: entry.path() });
+        }
+        if names.len() >= MAX_FILES_PER_BUNDLE {
+            return Err(BundleErr::TooManyBundleFiles {
+                dir: dir.to_path_buf(),
+                found: names.len() + 1,
+                max: MAX_FILES_PER_BUNDLE,
+            });
+        }
+        names.push(name);
+    }
+
+    // Bind the path-based enumeration to the descriptor before mutating the opened directory.
+    let current = std::fs::symlink_metadata(dir)?;
+    if !current.file_type().is_dir()
+        || current.dev() != identity.dev()
+        || current.ino() != identity.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bundle directory changed during retirement",
+        )
+        .into());
+    }
+
+    for name in names {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bundle name contains NUL")
+        })?;
+        // SAFETY: `directory` and the NUL-terminated filename remain live for this call, and a
+        // canonical bundle filename has no slash. flags=0 refuses directories.
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    directory.sync_all()?;
+    drop(directory);
+
+    let current = std::fs::symlink_metadata(dir)?;
+    if !current.file_type().is_dir()
+        || current.dev() != identity.dev()
+        || current.ino() != identity.ino()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bundle directory changed during retirement",
+        )
+        .into());
+    }
+    std::fs::remove_dir(dir)?;
+    Ok(())
+}
+
 /// Retire a bundle, locally and only locally. Manual, and honestly so: with no RPC client this
-/// machine cannot learn the Safe's on-chain nonce. It deliberately does not sync — a pull
-/// would resurrect what was just retired, and a push cannot delete, because no transfer in
-/// this module carries `--delete`.
+/// machine cannot learn the Safe's on-chain nonce. It deliberately does not sync — a push cannot
+/// delete, because no transfer in this module carries `--delete` — so the retirement is recorded
+/// where no peer writes, and the next pull that brings the directory back finds it removed again.
 pub fn rm(hash: B256) -> Result<SafeTxBundle, BundleErr> {
+    let _mutation = Mutation::take()?;
     let dir = bundle_dir(hash);
     let held = load_dir(&dir, hash)?;
-    std::fs::remove_dir_all(&dir)?;
+    local::retire(hash)?;
+    local::discard(hash)?;
+    remove_bundle_directory(&dir)?;
     tracing::info!(
         %hash,
         had = held.signatures.len(),
-        threshold = held.threshold,
         nonce = %held.intent.nonce,
         "retired bundle"
     );
@@ -564,6 +1043,7 @@ pub fn rm(hash: B256) -> Result<SafeTxBundle, BundleErr> {
 /// device rebuilds the digest itself and shows its own decoded summary before its own
 /// biometric — a QR that lied would be caught there, which is why no digest is transmitted.
 pub fn qr_frames(hash: B256) -> Result<Vec<Vec<u8>>, BundleErr> {
+    let _mutation = Mutation::take()?;
     let held = load_dir(&bundle_dir(hash), hash)?;
     Ok(frames(
         QrKind::SafeTxRequest,
@@ -577,12 +1057,8 @@ pub struct Arrival {
     pub hash: B256,
     /// Who signed.
     pub signer: Address,
-    /// Signatures held afterwards.
-    pub have: usize,
-    /// Signatures the Safe requires.
-    pub threshold: u8,
-    /// Whether that threshold is now covered.
-    pub met: bool,
+    /// What the bundle holds afterwards against what the LOCAL `safes.toml` requires.
+    pub quorum: Quorum,
 }
 
 #[cfg(test)]
@@ -590,6 +1066,7 @@ pub(crate) mod tests {
     use super::*;
     use hc_sign::intent::Operation;
     use k256::ecdsa::SigningKey;
+    use std::os::unix::fs::symlink;
 
     pub(crate) fn intent(nonce: u64) -> SafeTxIntent {
         SafeTxIntent {
@@ -619,6 +1096,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// One test at a time owns `HOT_CHEESE_HOME`: it is process-wide, and every path that reads
+    /// local truth reads it through `home_dir()` on every call.
+    pub(crate) static HOME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// The address fixture key `seed` signs as.
+    pub(crate) fn signer_of(seed: u8) -> Address {
+        let sk = SigningKey::from_slice(&[seed; 32]).expect("a fixed non-zero scalar is a key");
+        let point = sk.verifying_key().to_encoded_point(false);
+        Address::from_slice(&hc_core::crypto::keccak256(&point.as_bytes()[1..])[12..])
+    }
+
+    pub(crate) fn owners_of(seeds: impl IntoIterator<Item = u8>) -> Vec<Address> {
+        let mut out = Vec::new();
+        for seed in seeds {
+            out.push(signer_of(seed));
+        }
+        out
+    }
+
     /// What a device hands back after its own biometric: a signature over the digest IT rebuilt.
     pub(crate) fn signed(seed: u8, held: &SafeTxBundle) -> SignResponse {
         let sk = SigningKey::from_slice(&[seed; 32]).expect("a fixed non-zero scalar is a key");
@@ -628,14 +1124,44 @@ pub(crate) mod tests {
             .expect("signing a fixed prehash with a fixed key");
         let mut raw = sig.to_bytes().to_vec();
         raw.push(27 + recid.to_byte());
-        let point = sk.verifying_key().to_encoded_point(false);
         SignResponse {
             safe_tx_hash: digest,
             signature: Bytes::from(raw),
-            signer: Address::from_slice(
-                &hc_core::crypto::keccak256(point.as_bytes()[1..].to_vec())[12..],
-            ),
+            signer: signer_of(seed),
         }
+    }
+
+    /// A throwaway home holding an empty bundle tree and the `safes.toml` every judgement in
+    /// these tests is made against, pointed at by the environment.
+    pub(crate) fn home(name: &str, threshold: u8, seeds: impl IntoIterator<Item = u8>) -> PathBuf {
+        let root = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bundles")).expect("make the test home");
+        std::env::set_var("HOT_CHEESE_HOME", &root);
+        write_safes(&root, threshold, seeds);
+        root
+    }
+
+    /// The `safes.toml` these tests state their local truth in: the fixture Safe, its threshold,
+    /// and the fixture keys that are its owners.
+    pub(crate) fn safes_toml(threshold: u8, seeds: impl IntoIterator<Item = u8>) -> String {
+        let mut listed = Vec::new();
+        for owner in owners_of(seeds) {
+            listed.push(format!("\"{owner:#x}\""));
+        }
+        format!(
+            "[[safe]]\naddress = \"{:#x}\"\nchain_id = 1\nthreshold = {threshold}\nowners = [{}]\n",
+            Address::from([0x11u8; 20]),
+            listed.join(", ")
+        )
+    }
+
+    pub(crate) fn write_safes(root: &Path, threshold: u8, seeds: impl IntoIterator<Item = u8>) {
+        std::fs::write(
+            root.join("bundles").join("safes.toml"),
+            safes_toml(threshold, seeds),
+        )
+        .expect("write safes.toml");
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -645,6 +1171,23 @@ pub(crate) mod tests {
         dir
     }
 
+    #[test]
+    fn bundle_directory_names_have_one_canonical_spelling() {
+        let hash = B256::from([0xabu8; 32]);
+        let canonical = hash.to_string();
+        assert_eq!(canonical_bundle_hash(OsStr::new(&canonical)), Some(hash));
+        assert_eq!(
+            canonical_bundle_hash(OsStr::new(canonical.trim_start_matches("0x"))),
+            None,
+            "the parser accepts prefixless hex, but the bundle namespace must not"
+        );
+        assert_eq!(
+            canonical_bundle_hash(OsStr::new(&canonical.to_uppercase())),
+            None,
+            "case aliases must not collide in the ingestion hash map"
+        );
+    }
+
     /// The whole point of one file per signer: two devices write two names with no lock and no
     /// coordination, and reading takes the union. The threshold is reached by that union alone,
     /// the packed blob is the ascending concatenation `checkNSignatures` demands, and the
@@ -652,16 +1195,21 @@ pub(crate) mod tests {
     /// dropped into it is refused, never absorbed.
     #[test]
     fn two_devices_write_two_files_and_the_union_reaches_the_threshold() {
-        let dir = temp("hot_cheese_bundle_union");
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_union", 2, [0x11, 0x22, 0x33]);
+        let owners = owners_of([0x11, 0x22, 0x33]);
         let seed = bundle(intent(3));
         let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
 
         for device in [0x11u8, 0x22u8] {
             let response = signed(device, &seed);
             let signer = response.signer;
-            let one = take_response(&seed, response).expect("a signature over our own digest");
+            let one =
+                take_response(&seed, response, &owners).expect("a signature over our own digest");
             assert_eq!(one.signatures.len(), 1);
-            write_one(&dir, signer, &one).expect("write the signer's own file");
+            write_one(&dir, signer, &one, &owners).expect("write the signer's own file");
         }
         assert_eq!(
             std::fs::read_dir(&dir).expect("read the dir").count(),
@@ -671,7 +1219,7 @@ pub(crate) mod tests {
 
         let union = load_dir(&dir, hash).expect("the union loads");
         assert_eq!(union.signatures.len(), 2);
-        assert!(union.met());
+        assert!(quorum(&union).expect("the local quorum").met);
         assert_eq!(union.packed().len(), 130);
         let signers: Vec<Address> = union.signatures.iter().map(|s| s.signer).collect();
         let mut ascending = signers.clone();
@@ -681,16 +1229,172 @@ pub(crate) mod tests {
         let elsewhere = bundle(intent(4));
         let stray = signed(0x33, &elsewhere);
         let signer = stray.signer;
-        let one =
-            take_response(&elsewhere, stray).expect("their own bundle takes their own signature");
-        write_one(&dir, signer, &one).expect("misfile it");
+        let one = take_response(&elsewhere, stray, &owners)
+            .expect("their own bundle takes their own signature");
+        write_one(&dir, signer, &one, &owners).expect("misfile it");
         assert!(matches!(
             load_dir(&dir, hash),
             Err(BundleErr::Verify(
                 hc_sign::bundle::BundleErr::DigestMismatch { .. }
             ))
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_writers_enforce_the_ingest_size_ceiling() {
+        let mut oversized = bundle(intent(3));
+        oversized.intent.data = Bytes::from(vec![0u8; MAX_FILE_BYTES as usize]);
+        assert!(matches!(
+            serialized_bundle(&oversized, &[]),
+            Err(BundleErr::BundleFileTooLarge {
+                max: MAX_FILE_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signer_files_are_create_only_and_idempotent() {
+        let dir = temp("hot_cheese_bundle_immutable_signer");
+        let seed = bundle(intent(3));
+        let response = signed(0x11, &seed);
+        let signer = response.signer;
+        let owners = owners_of([0x11]);
+        let one = take_response(&seed, response, &owners).expect("valid signer file");
+        let path = dir.join(format!("{signer:#x}{BUNDLE_SUFFIX}"));
+
+        let compact = serde_json::to_vec(&one).expect("serialize compact fixture");
+        std::fs::write(&path, &compact).expect("seed existing signer file");
+        write_one(&dir, signer, &one, &owners).expect("the same semantic file is idempotent");
+        assert_eq!(std::fs::read(&path).unwrap(), compact);
+
+        let elsewhere = bundle(intent(4));
+        let foreign = signed(0x11, &elsewhere);
+        let foreign = take_response(&elsewhere, foreign, &owners).expect("valid foreign file");
+        let foreign_bytes = serde_json::to_vec(&foreign).expect("serialize foreign fixture");
+        std::fs::write(&path, &foreign_bytes).expect("replace fixture outside the writer");
+        assert!(matches!(
+            write_one(&dir, signer, &one, &owners),
+            Err(BundleErr::BundleFileConflict { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), foreign_bytes);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_bundle_directory_symlink_is_never_traversed() {
+        let target = temp("hot_cheese_bundle_symlink_target");
+        let hash = bundle(intent(3)).digest();
+        let link = std::env::temp_dir().join("hot_cheese_bundle_symlink_link");
+        let _ = std::fs::remove_file(&link);
+        symlink(&target, &link).expect("make a directory-looking symlink");
+
+        assert!(matches!(load_dir(&link, hash), Err(BundleErr::Io(_))));
+
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn retirement_never_recurses_into_an_unexpected_nested_directory() {
+        let dir = temp("hot_cheese_bundle_retire_nested");
+        let seed = bundle(intent(37));
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize seed"),
+        )
+        .unwrap();
+        let nested = dir.join("not-bundle-state");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("KEEP"), b"unrelated").unwrap();
+
+        assert!(matches!(
+            remove_bundle_directory(&dir),
+            Err(BundleErr::InvalidBundleFileName { .. })
+        ));
+        assert_eq!(std::fs::read(nested.join("KEEP")).unwrap(), b"unrelated");
+        assert!(
+            dir.join(SEED_FILE).exists(),
+            "refusal happens before deletion"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `threshold` and `created_at_ms` are outside `safeTxHash`, so whichever device won the race
+    /// to create the directory chose both, and every peer copies them. The union must therefore
+    /// take the LOCAL `safes.toml` threshold, and must take a cryptographically valid signature
+    /// whatever coordination its file claimed — otherwise one peer decides for ever how many
+    /// signatures everyone needs, and every honest signature that disagrees is quarantined.
+    #[test]
+    fn the_local_safes_toml_states_the_threshold_and_a_peer_file_cannot() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_local_threshold", 3, [0x11, 0x22, 0x33]);
+        let seed = bundle(intent(3));
+        let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize the peer's seed"),
+        )
+        .unwrap();
+
+        let response = signed(0x11, &seed);
+        let signer = response.signer;
+        let mut disagreeing = take_response(&seed, response, &owners_of([0x11, 0x22, 0x33]))
+            .expect("a valid signature");
+        disagreeing.threshold = 1;
+        disagreeing.created_at_ms = 1;
+        std::fs::write(
+            dir.join(format!("{signer:#x}{BUNDLE_SUFFIX}")),
+            serde_json::to_vec(&disagreeing).expect("serialize the disagreeing file"),
+        )
+        .unwrap();
+
+        let union = load_dir(&dir, hash).expect("a valid signature is taken whatever it claimed");
+        assert_eq!(union.signatures.len(), 1);
+        let quorum = quorum(&union).expect("the local quorum");
+        assert_eq!(quorum.threshold, 3, "safes.toml states it, not the file");
+        assert!(!quorum.met);
+        assert_eq!(
+            quorum.stated,
+            Some(2),
+            "what a peer file claims is reported, never counted"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A biometric is spent before the local write can run, so an approval that could not land —
+    /// a claim another process held, a directory that would not load — must survive on disk and be
+    /// taken by the next collect. Dropping it spends an operator's Touch ID for nothing.
+    #[test]
+    fn an_approval_held_after_a_failed_collect_lands_at_the_next_one() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_held_approval", 2, [0x11, 0x22]);
+        let seed = bundle(intent(3));
+        let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize the seed"),
+        )
+        .unwrap();
+
+        local::hold(hash, &signed(0x11, &seed)).expect("an approval the write could not take");
+        let after = collect(SyncMode::Off, hash, signed(0x22, &seed)).expect("the next collect");
+        assert_eq!(
+            after.signatures.len(),
+            2,
+            "the approval that was already spent is not lost"
+        );
+        assert!(local::held(hash).expect("the spool").is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A Safe executes each nonce once, so two digests under one (safe, chain_id, nonce) are
@@ -708,6 +1412,7 @@ pub(crate) mod tests {
             let bundle = bundle(i);
             all.push(Loaded {
                 hash: bundle.digest(),
+                quorum: bundle.quorum(2),
                 bundle,
             });
         }
@@ -738,16 +1443,17 @@ pub(crate) mod tests {
         let ours = bundle(intent(3));
         let theirs = bundle(intent(4));
 
-        assert!(take_response(&ours, signed(0x11, &ours)).is_ok());
+        let owners = owners_of([0x11]);
+        assert!(take_response(&ours, signed(0x11, &ours), &owners).is_ok());
         assert!(matches!(
-            take_response(&ours, signed(0x11, &theirs)),
+            take_response(&ours, signed(0x11, &theirs), &owners),
             Err(BundleErr::ForeignDigest { .. })
         ));
 
         let mut lying = signed(0x11, &ours);
         lying.signer = Address::from([0x99u8; 20]);
         assert!(matches!(
-            take_response(&ours, lying),
+            take_response(&ours, lying, &owners),
             Err(BundleErr::Verify(
                 hc_sign::bundle::BundleErr::SignerMismatch { .. }
             ))
@@ -779,5 +1485,22 @@ pub(crate) mod tests {
         ));
 
         assert!(toml::from_str::<Safes>(&format!("{good}quorum = 2\n")).is_err());
+
+        let zero: Safes = toml::from_str(&good.replace("threshold = 2", "threshold = 0"))
+            .expect("the shape parses before semantic validation");
+        assert!(matches!(
+            zero.validate(),
+            Err(BundleErr::InvalidSafeThreshold { threshold: 0, .. })
+        ));
+
+        let duplicate_owner: Safes = toml::from_str(&good.replace(
+            "\"0x3333333333333333333333333333333333333333\"",
+            "\"0x2222222222222222222222222222222222222222\"",
+        ))
+        .expect("the duplicate list parses before semantic validation");
+        assert!(matches!(
+            duplicate_owner.validate(),
+            Err(BundleErr::DuplicateSafeOwner { .. })
+        ));
     }
 }

@@ -1,11 +1,14 @@
 //! The console's own pinned `/read` client, proving the daemon really releases a key over the
 //! same TLS route a remote consumer uses. It must run as a tokio task: on the main thread it
 //! would block waiting for the approval only the main thread can grant.
-use df_share::{EphemeralClient, ServerEncryptedRes};
 use err_mac::create_err_with_impls;
 use hc_core::config::cert_paths;
+use hc_core::share::{EphemeralClient, ServerEncryptedRes, ShareErr};
 use hc_daemon::sk_to_adr;
-use http::{header::HOST, Method, Request};
+use http::{
+    header::{CONTENT_TYPE, HOST},
+    Method, Request,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
@@ -20,7 +23,6 @@ use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
-use zeroize::Zeroize;
 
 /// A 32-byte secret is a secp256k1 key, so its EVM address can be re-derived locally.
 const EVM_SECRET_LEN: usize = 32;
@@ -31,6 +33,8 @@ const PROOF_SALT_LEN: usize = 16;
 
 /// Digest bytes kept for the operator's proof, hex-encoded to twice as many characters.
 const PROOF_DIGEST_LEN: usize = 4;
+const MAX_CERT_PEM_BYTES: u64 = 1024 * 1024;
+const MAX_READ_RESPONSE_BYTES: usize = 256 * 1024;
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -40,11 +44,12 @@ create_err_with_impls!(
     Pem(pki_types::pem::Error),
     Http(http::Error),
     Hyper(hyper::Error),
-    DfShare(df_share::error::Unspecified),
+    Share(ShareErr),
     Address(hc_daemon::ApiBackendErr),
     StdIo(std::io::Error)
     ;
-    BadStatus { status: u16 }
+    BadStatus { status: u16 },
+    ResponseTooLarge { size: usize, max: usize }
 );
 
 /// What one read test proved. The secret itself is zeroized before this is built.
@@ -69,10 +74,11 @@ pub fn spawn(
     runtime.spawn(read_test(addr, key))
 }
 
-/// Run one df-share `/read` against `addr`, pinning the cert `init` wrote.
+/// Run one ephemeral P-256 `/read` against `addr`, pinning the cert `init` wrote.
 async fn read_test(addr: SocketAddr, key: String) -> Result<ReadProof, ReadTestErr> {
     let (cert_path, _key_path) = cert_paths();
-    let pinned = CertificateDer::from_pem_slice(&std::fs::read(cert_path)?)?;
+    let cert = hc_core::read_regular_file_bounded(&cert_path, MAX_CERT_PEM_BYTES)?;
+    let pinned = CertificateDer::from_pem_slice(&cert)?;
     let mut roots = RootCertStore::empty();
     roots.add(pinned)?;
     let tls =
@@ -81,7 +87,7 @@ async fn read_test(addr: SocketAddr, key: String) -> Result<ReadProof, ReadTestE
             .with_root_certificates(roots)
             .with_no_client_auth();
 
-    let (client_req, decryptor) = EphemeralClient::new()?.sendable();
+    let (client_req, decryptor) = EphemeralClient::new().sendable();
     let tcp = TcpStream::connect(addr).await?;
     let stream = TlsConnector::from(Arc::new(tls))
         .connect(ServerName::from(addr.ip()), tcp)
@@ -97,6 +103,7 @@ async fn read_test(addr: SocketAddr, key: String) -> Result<ReadProof, ReadTestE
         .method(Method::POST)
         .uri(format!("/read/{key}"))
         .header(HOST, addr.to_string())
+        .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(serde_json::to_vec(&client_req)?)))?;
     let res = sender.send_request(req).await?;
     let status = res.status();
@@ -105,10 +112,23 @@ async fn read_test(addr: SocketAddr, key: String) -> Result<ReadProof, ReadTestE
             status: status.as_u16(),
         });
     }
-    let body = res.into_body().collect().await?.to_bytes();
+    let mut incoming = res.into_body();
+    let mut body = Vec::new();
+    while let Some(frame) = incoming.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            let size = body.len().saturating_add(data.len());
+            if size > MAX_READ_RESPONSE_BYTES {
+                return Err(ReadTestErr::ResponseTooLarge {
+                    size,
+                    max: MAX_READ_RESPONSE_BYTES,
+                });
+            }
+            body.extend_from_slice(&data);
+        }
+    }
 
-    let encrypted: ServerEncryptedRes = serde_json::from_slice(&body)?;
-    let mut secret = decryptor.decrypt(&encrypted)?;
+    let encrypted: ServerEncryptedRes = hc_core::wire::strict_json_from_slice(&body)?;
+    let secret = decryptor.decrypt(&key, &encrypted)?;
     let secret_len = secret.len();
     let mut salt = [0u8; PROOF_SALT_LEN];
     OsRng.fill_bytes(&mut salt);
@@ -121,8 +141,6 @@ async fn read_test(addr: SocketAddr, key: String) -> Result<ReadProof, ReadTestE
     } else {
         None
     };
-    secret.zeroize();
-
     Ok(ReadProof {
         key,
         secret_len,

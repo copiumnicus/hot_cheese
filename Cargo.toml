@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/err-mac",
     "crates/hc-core",
     "crates/hc-sign",
     "crates/hc-bundle",
@@ -15,6 +16,11 @@ version = "0.1.1"
 edition = "2021"
 publish = false
 
+[profile.release]
+# Security-sensitive size, offset, counter, and cost arithmetic must never silently wrap merely
+# because the optimized profile is in use. Hot paths that intentionally wrap use explicit APIs.
+overflow-checks = true
+
 [workspace.dependencies]
 hc-core = { path = "crates/hc-core" }
 hc-sign = { path = "crates/hc-sign" }
@@ -22,9 +28,10 @@ hc-bundle = { path = "crates/hc-bundle" }
 hc-daemon = { path = "crates/hc-daemon" }
 hc-console = { path = "crates/hc-console" }
 
-err_mac = { git = "https://github.com/copiumnicus/err_mac.git", rev = "08f6335" }
+err_mac = { path = "crates/err-mac" }
 scrypt = { version = "=0.10.0" }
 aes = "=0.8.4"
+aes-gcm = "=0.10.3"
 ctr = "=0.9.2"
 k256 = { version = "=0.13.4", default-features = false, features = [
     "ecdsa",
@@ -32,12 +39,12 @@ k256 = { version = "=0.13.4", default-features = false, features = [
 ] }
 serde = { version = "=1.0.228", features = ["derive"] }
 tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
-rand = "=0.8.5"
+rand = "=0.8.6"
 serde_json = "=1.0.137"
 toml = "=0.8.2"
 zeroize = { version = "=1.8.1", features = ["derive"] }
 
-tokio = { version = "=1.42.0", features = [
+tokio = { version = "=1.52.3", features = [
     "io-std",
     "macros",
     "net",
@@ -45,8 +52,7 @@ tokio = { version = "=1.42.0", features = [
     "signal",
     "sync",
 ] }
-rustls-pemfile = "=2.2.0"
-pki-types = { package = "rustls-pki-types", version = "=1.10.1" }
+pki-types = { package = "rustls-pki-types", version = "=1.14.1" }
 http = "=1.2.0"
 hyper = { version = "=1.10.1", default-features = false, features = [
     "client",
@@ -56,19 +62,15 @@ hyper-util = { version = "=0.1.20", default-features = false, features = [
     "server-auto",
     "tokio",
 ] }
-rustls = { version = "=0.23.20", default-features = false, features = [
+rustls = { version = "=0.23.40", default-features = false, features = [
     "tls12",
     "ring",
 ] }
 http-body-util = "=0.1.2"
-tokio-rustls = { version = "=0.26.1", default-features = false }
+tokio-rustls = { version = "=0.26.4", default-features = false }
 
-objc = "=0.2.7"
-block = "=0.1.6"
-dispatch = "=0.2.0"
-df-share = "=0.1.1"
-solana-keypair = "=2.2.1"
-solana-signer = "=2.2.1"
+ring = "=0.17.14"
+subtle = "=2.6.1"
 bs58 = "=0.5.1"
 
 chacha20poly1305 = "=0.10.1"

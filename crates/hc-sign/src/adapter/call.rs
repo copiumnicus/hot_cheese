@@ -79,7 +79,7 @@ pub(super) fn plain(value: &DynSolValue, chain_id: U256, config: &Config) -> Str
     match value {
         DynSolValue::Address(a) => annotate::address(*a, chain_id, config),
         DynSolValue::Uint(v, _) => annotate::count(*v),
-        DynSolValue::Int(v, _) => v.to_string(),
+        DynSolValue::Int(v, _) => annotate::signed(*v),
         DynSolValue::Bool(b) => b.to_string(),
         DynSolValue::FixedBytes(w, n) => format!("0x{}", hex::encode(&w[..*n])),
         DynSolValue::Function(f) => format!("0x{}", hex::encode(f.as_slice())),

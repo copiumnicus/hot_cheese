@@ -56,13 +56,24 @@ impl SecureEnclaveUnlocker {
     }
 }
 
-/// Classify a Secure Enclave failure: a missing or unloadable key means this KEK source is
-/// gone for good on this machine, which the operator recovers from with `--unlock passphrase`.
-/// Every other SE failure (denied biometric, bad peer point, shim error) keeps its own type.
+/// Classify a Secure Enclave failure: only an absent key is the passphrase fallback, because a
+/// key that is present but unproven or unreadable may be a planted one, and the re-enrollment
+/// that hint leads to is exactly what would wrap this vault's DEK under it.
 fn se_failure(e: secure_enclave::SeErr) -> UnlockErr {
+    use secure_enclave::SeErr;
     match e {
-        secure_enclave::SeErr::KeyNotFound | secure_enclave::SeErr::BadBlob => {
-            UnlockErr::SeKeyUnavailableTryUnlockPassphrase
+        SeErr::KeyNotFound => UnlockErr::SeKeyUnavailableTryUnlockPassphrase,
+        source @ (SeErr::BadBlob
+        | SeErr::UnrecordedEnclaveKey { .. }
+        | SeErr::BlobNotOwnerOnly { .. }
+        | SeErr::BlobNotAKeyFile { .. }) => {
+            tracing::error!(
+                ?source,
+                "a Secure Enclave key is present at this machine's key path but this vault \
+                 cannot prove it is the one it recorded; refusing to unlock and refusing to \
+                 recommend re-enrollment, which would wrap the DEK under it"
+            );
+            UnlockErr::SeKeyPresentButUnprovenDoNotReenroll { source }
         }
         other => UnlockErr::Se(other),
     }
@@ -105,7 +116,11 @@ impl Unlocker for SecureEnclaveUnlocker {
             let shared =
                 secure_enclave::se_ecdh(&self.label, eph_pub, auth, reason).map_err(se_failure)?;
             let kek = derive_kek(&shared, &e.id)?;
-            let mut pt = envelope::open(&kek, e.id.as_bytes(), &e.wrapped_dek)?;
+            let mut pt = match envelope::open(&kek, e.id.as_bytes(), &e.wrapped_dek) {
+                Ok(pt) => pt,
+                Err(envelope::EnvErr::Aead) => continue,
+                Err(e) => return Err(e.into()),
+            };
             if pt.len() != 32 {
                 pt.zeroize();
                 return Err(UnlockErr::BadDekLen);
@@ -220,6 +235,45 @@ mod tests {
     /// HKDF must depend on the salt (enrollment id): the same shared secret under two
     /// different ids yields different KEKs, so a wrapped DEK can't be replayed under a
     /// swapped record.
+    /// Only a genuinely absent enclave key may earn the passphrase hint, because the
+    /// re-enrollment that hint leads to is what would wrap this vault's DEK under a key that is
+    /// present but unproven.
+    #[test]
+    fn only_an_absent_enclave_key_routes_to_the_passphrase_fallback() {
+        use secure_enclave::SeErr;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from("/nonexistent/se_kek_hotcheese.blob");
+        let present_but_unproven = [
+            SeErr::BadBlob,
+            SeErr::UnrecordedEnclaveKey {
+                path: path.clone(),
+                public_key: "04ab".into(),
+            },
+            SeErr::BlobNotOwnerOnly { path: path.clone() },
+            SeErr::BlobNotAKeyFile { path },
+        ];
+        for planted in present_but_unproven {
+            let mapped = se_failure(planted);
+            assert!(
+                matches!(
+                    &mapped,
+                    UnlockErr::SeKeyPresentButUnprovenDoNotReenroll { .. }
+                ),
+                "{mapped:?}"
+            );
+        }
+
+        assert!(matches!(
+            se_failure(SeErr::KeyNotFound),
+            UnlockErr::SeKeyUnavailableTryUnlockPassphrase
+        ));
+        assert!(matches!(
+            se_failure(SeErr::TouchIdDenied),
+            UnlockErr::Se(SeErr::TouchIdDenied)
+        ));
+    }
+
     #[test]
     fn kek_is_salted_by_enrollment_id() {
         let shared = [9u8; 32];

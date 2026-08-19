@@ -22,7 +22,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, enable_raw_mode, Clear, ClearType};
 use err_mac::create_err_with_impls;
 use hc_core::config::home_dir;
-use hc_core::is_valid_string_name;
+use hc_core::is_valid_key_name;
 use hc_core::keyring::{EnrollParams, Keyring};
 use hc_core::mac::MacBackend;
 use hc_daemon::git_store::{CommitId, Relation};
@@ -33,6 +33,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use tracing_subscriber::fmt::MakeWriter;
@@ -46,6 +47,8 @@ const LOG_TAIL: usize = 12;
 
 /// File under the home dir that every console log line is appended to.
 const LOG_FILE: &str = "console.log";
+/// Prevent unattended sessions and repeated remote failures from consuming the filesystem.
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Hex characters of a commit id the panel shows: enough to tell two apart on one line.
 const SHORT_ID: usize = 8;
@@ -89,7 +92,7 @@ impl LogRing {
         if lines.len() == RING_CAPACITY {
             lines.pop_front();
         }
-        lines.push_back(line.to_string());
+        lines.push_back(hc_core::safe_diagnostic_text(line));
     }
 }
 
@@ -102,11 +105,24 @@ pub struct TeeWriter {
 
 impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let text = String::from_utf8_lossy(buf);
+        // A tracing implementation is allowed to hand a writer one arbitrarily large buffer.
+        // Drop the prefix before decoding or splitting it so the file ceiling is also a CPU and
+        // allocation ceiling for an accidentally enormous diagnostic.
+        let kept = if buf.len() as u64 > MAX_LOG_BYTES {
+            &buf[buf.len() - MAX_LOG_BYTES as usize..]
+        } else {
+            buf
+        };
+        let text = String::from_utf8_lossy(kept);
         for line in text.lines() {
             self.ring.push(line);
         }
-        self.file.lock().write_all(buf)?;
+        let mut file = self.file.lock();
+        let current = file.metadata()?.len();
+        if current > MAX_LOG_BYTES.saturating_sub(kept.len() as u64) {
+            file.set_len(0)?;
+        }
+        file.write_all(kept)?;
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -129,7 +145,25 @@ pub fn install_subscriber(home: &Path, level: tracing::Level) -> Result<Arc<LogR
     let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(home.join(LOG_FILE))?;
+    let metadata = file.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and changes no process state.
+    let ours = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file() || metadata.uid() != ours {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "console log must be an owner-controlled regular file",
+        )
+        .into());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    if metadata.len() > MAX_LOG_BYTES {
+        file.set_len(0)?;
+    }
     let writer = TeeWriter {
         ring: ring.clone(),
         file: Arc::new(Mutex::new(file)),
@@ -285,9 +319,9 @@ impl Facts {
     fn read(console: &Console) -> Self {
         let mut keystores = 0usize;
         if let Ok(entries) = std::fs::read_dir(console.rt.config.store_path()) {
-            for entry in entries.flatten() {
+            for entry in entries.take(hc_core::MAX_STORE_ENUM_ENTRIES).flatten() {
                 if entry.file_type().is_ok_and(|t| t.is_file())
-                    && entry.file_name().to_str().is_some_and(is_valid_string_name)
+                    && entry.file_name().to_str().is_some_and(is_valid_key_name)
                 {
                     keystores += 1;
                 }
@@ -563,9 +597,8 @@ fn draw(lines: &[String]) -> Result<(), MenuErr> {
 /// once and [`RawScreen`]'s `Drop` gives it back on every exit — `[q]`, ctrl-c, an early `?` on a
 /// crossterm write, and a panic unwind.
 ///
-/// `[p]` is a FETCH plus a fast-forward-only merge, asked of the store's own background task so
-/// this thread never blocks on ssh. It is not the forced pull, which lives on the Backup screen
-/// behind the confirmation that names the keystores it would destroy.
+/// `[p]` is an inspection-only FETCH, asked of the store's own background task so this thread
+/// never blocks on ssh. Applying remote state remains the forced pull on the Backup screen.
 pub(crate) fn panel(console: &Console) -> Result<Step, MenuErr> {
     let mut facts = Facts::read(console);
     let mut note = "";

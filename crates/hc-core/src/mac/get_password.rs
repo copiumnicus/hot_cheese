@@ -3,7 +3,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CString, NulError},
     ptr,
 };
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 #[repr(C)]
 struct CFDictionary(c_void);
@@ -29,9 +29,11 @@ extern "C" {
         cstring: *const c_char,
         encoding: u32,
     ) -> *const CFString;
-    fn CFDataGetLength(data: *const c_void) -> usize;
+    fn CFDataGetLength(data: *const c_void) -> isize;
     fn CFDataGetBytes(data: *const c_void, range: CFRange, buffer: *mut c_void);
-    fn CFDataGetBytePtr(theData: *const c_void) -> *mut u8;
+    fn CFGetTypeID(cf: *const c_void) -> usize;
+    fn CFDataGetTypeID() -> usize;
+    fn CFRelease(cf: *const c_void);
     static kSecClass: *const c_void;
     static kSecAttrService: *const c_void;
     static kSecAttrAccount: *const c_void;
@@ -42,23 +44,57 @@ extern "C" {
 
 #[repr(C)]
 struct CFRange {
-    location: usize,
-    length: usize,
+    location: isize,
+    length: isize,
 }
-const kCFStringEncodingUTF8: u32 = 0x08000100;
+const K_CFSTRING_ENCODING_UTF8: u32 = 0x08000100;
+/// A legacy master is 32 bytes; this merely leaves room for older encodings while preventing
+/// an unexpected Core Foundation result from driving an unbounded allocation.
+const MAX_KEYCHAIN_SECRET_BYTES: usize = 64 * 1024;
 
-fn create_cf_string(string: &str) -> Result<*const CFString, GetPasswordErr> {
-    let cstr = CString::new(string)?;
-    unsafe {
-        Ok(CFStringCreateWithCString(
-            ptr::null(),
-            cstr.as_ptr() as *const c_char,
-            kCFStringEncodingUTF8,
-        ))
+struct OwnedCf(*const c_void);
+
+impl OwnedCf {
+    fn new(ptr: *const c_void) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self(ptr))
+    }
+
+    fn as_ptr(&self) -> *const c_void {
+        self.0
     }
 }
 
-fn create_query(service: &str, account: &str) -> Result<*const CFDictionary, GetPasswordErr> {
+impl Drop for OwnedCf {
+    fn drop(&mut self) {
+        // SAFETY: every `OwnedCf` is created only from a Core Foundation create/copy call,
+        // which transfers one retain that must be balanced exactly once.
+        unsafe { CFRelease(self.0) }
+    }
+}
+
+fn create_cf_string(string: &str) -> Result<OwnedCf, GetPasswordErr> {
+    let cstr = CString::new(string)?;
+    let string = unsafe {
+        CFStringCreateWithCString(
+            ptr::null(),
+            cstr.as_ptr() as *const c_char,
+            K_CFSTRING_ENCODING_UTF8,
+        )
+    };
+    OwnedCf::new(string.cast()).ok_or(GetPasswordErr::FailCreateString)
+}
+
+struct Query {
+    dictionary: OwnedCf,
+    // The dictionary deliberately uses null callbacks, so it borrows rather than retains these
+    // two dynamically created values. Keep them alive until the query has been submitted.
+    _service: OwnedCf,
+    _account: OwnedCf,
+}
+
+fn create_query(service: &str, account: &str) -> Result<Query, GetPasswordErr> {
+    let service = create_cf_string(service)?;
+    let account = create_cf_string(account)?;
     unsafe {
         // Use Core Foundation constants for keys
         let keys = [kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnData];
@@ -66,8 +102,8 @@ fn create_query(service: &str, account: &str) -> Result<*const CFDictionary, Get
         // Use valid values for the keys
         let values = [
             kSecClassGenericPassword,
-            create_cf_string(service)? as *const c_void,
-            create_cf_string(account)? as *const c_void,
+            service.as_ptr(),
+            account.as_ptr(),
             kCFBooleanTrue,
         ];
 
@@ -81,11 +117,12 @@ fn create_query(service: &str, account: &str) -> Result<*const CFDictionary, Get
             ptr::null(),     // Value callbacks
         );
 
-        if dictionary.is_null() {
-            return Err(GetPasswordErr::FailCreateDict);
-        }
-
-        Ok(dictionary)
+        let dictionary = OwnedCf::new(dictionary.cast()).ok_or(GetPasswordErr::FailCreateDict)?;
+        Ok(Query {
+            dictionary,
+            _service: service,
+            _account: account,
+        })
     }
 }
 
@@ -95,40 +132,55 @@ create_err_with_impls!(
     NonzeroStatus(i32),
     NullRes,
     FailCreateDict,
+    FailCreateString,
+    WrongResultType,
+    InvalidLength(isize),
     Nul(NulError)
     ;
+    TooLarge { len: usize, max: usize },
 );
 
-pub fn get_password_from_keychain(service: &str, account: &str) -> Result<Vec<u8>, GetPasswordErr> {
+pub fn get_password_from_keychain(
+    service: &str,
+    account: &str,
+) -> Result<Zeroizing<Vec<u8>>, GetPasswordErr> {
     unsafe {
         let query = create_query(service, account)?;
         let mut result: *const CFTypeRef = std::ptr::null();
-        let status = SecItemCopyMatching(query, &mut result as *mut *const CFTypeRef);
+        let status = SecItemCopyMatching(
+            query.dictionary.as_ptr().cast(),
+            &mut result as *mut *const CFTypeRef,
+        );
         if status != 0 {
             return Err(GetPasswordErr::NonzeroStatus(status));
         }
-        if result.is_null() {
-            return Err(GetPasswordErr::NullRes);
+        let result = OwnedCf::new(result.cast()).ok_or(GetPasswordErr::NullRes)?;
+        if CFGetTypeID(result.as_ptr()) != CFDataGetTypeID() {
+            return Err(GetPasswordErr::WrongResultType);
         }
-        let result_data = result as *const c_void;
-        let length = CFDataGetLength(result_data);
+        let length = CFDataGetLength(result.as_ptr());
+        if length < 0 {
+            return Err(GetPasswordErr::InvalidLength(length));
+        }
+        let length = usize::try_from(length).map_err(|_| GetPasswordErr::InvalidLength(length))?;
+        if length > MAX_KEYCHAIN_SECRET_BYTES {
+            return Err(GetPasswordErr::TooLarge {
+                len: length,
+                max: MAX_KEYCHAIN_SECRET_BYTES,
+            });
+        }
 
-        // COPY BYTES FOR US
-        let mut buffer = vec![0u8; length];
+        // Copy into memory whose owner is explicit and whose drop path wipes the secret. A CFData
+        // returned by Security.framework is immutable; modifying its byte pointer is undefined.
+        let mut buffer = Zeroizing::new(vec![0u8; length]);
         CFDataGetBytes(
-            result_data,
+            result.as_ptr(),
             CFRange {
                 location: 0,
-                length,
+                length: length as isize,
             },
             buffer.as_mut_ptr() as *mut c_void,
         );
-
-        // ZEROIZE CFDATA
-        let byte_ptr = CFDataGetBytePtr(result_data);
-        let bytes = std::slice::from_raw_parts_mut(byte_ptr, length);
-        bytes.zeroize();
-
         Ok(buffer)
     }
 }
@@ -143,7 +195,7 @@ mod test {
         let service = "com.example.myapp";
         let account = "myusername";
         let v = get_password_from_keychain(service, account)?;
-        println!("{}", hex::encode(&v));
+        assert!(!v.is_empty(), "the requested Keychain item has data");
         Ok(())
     }
 }

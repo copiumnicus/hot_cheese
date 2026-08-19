@@ -9,11 +9,18 @@ master password** anymore.
 
 Every key read is gated by a **cryptographic** Touch ID step (not a UI prompt you
 could bypass), traffic is protected by **TLS certificate pinning**, and each
-secret is delivered over a per-request **Diffie-Hellman key exchange** (via
-[df-share](https://github.com/copiumnicus/df-share)) so only the calling client
-can decrypt it. Because the DEK never touches disk in the clear, the store is
-**safe to back up anywhere**, and a new machine can be **bootstrapped over SSH**
-without the DEK ever crossing the wire in plaintext.
+secret is delivered over a per-request **Diffie-Hellman key exchange** — an
+ephemeral P-256 exchange whose transcript is bound into both the KDF and the AEAD —
+so only the calling client can decrypt it. Because the DEK never touches disk in the
+clear, the **key material** in the store is safe to back up anywhere (the key names
+and policies beside it are not — see [Backups](#backups)), and a new machine can be
+**bootstrapped over SSH** without the DEK ever crossing the wire in plaintext.
+
+> **Breaking wire change: the `/read` exchange is no longer wire-compatible with
+> df-share.** HKDF `info` is now `"hotcheese/share/v1/hkdf" ‖ client_pub ‖ server_pub`
+> and the AES-GCM associated data is `"hotcheese/share" ‖ 0x00 ‖ key_name ‖ 0x00 ‖ 0x01`.
+> An old client cannot decrypt a new daemon's response and a new client cannot decrypt an
+> old daemon's. Upgrade both ends together. See [Client Integration](#client-integration).
 
 > Upgrading from the old Keychain-master build? See **[MIGRATION.md](./MIGRATION.md)**
 > for the non-destructive, verify-before-finalize cutover runbook.
@@ -61,7 +68,14 @@ without the DEK ever crossing the wire in plaintext.
 3. **Cryptographic Touch ID** — a Secure Enclave key bound to Touch ID is a real
    KEK. Each `/read` (and generate/address) unwraps the DEK by doing a
    Touch-ID-gated ECDH inside the Secure Enclave: no biometric ⇒ no ECDH ⇒ no DEK
-   ⇒ no decrypt. Per-request human approval is preserved.
+   ⇒ no decrypt. Per-request human approval is preserved. An enclave key blob sitting
+   at the key path is **adopted only when its public key is already recorded** —
+   `se_pub` in `keyring.json`, `grant_public_key` in `config.toml` — so a planted
+   non-biometric key is refused rather than inherited. `enroll` and `list` print that
+   key's 16-hex fingerprint and enrolment says **MINTED** or **ADOPTED**, so a
+   re-enrolment into a record somebody else planted is visible if you compare it. Read
+   the residual in [Security Model & Residual Risks](#security-model--residual-risks)
+   before you rely on it: `keyring.json` itself carries no MAC.
 4. **Per-payload signing grants** — `/sign` cannot reach the signing key without a
    `SignGrant`, and the only way to obtain one is to verify a fresh Secure Enclave
    ECDSA signature over the exact payload (rebuilt hash, policy digest, nonce,
@@ -74,12 +88,14 @@ without the DEK ever crossing the wire in plaintext.
    Enclave keys are device-bound).
 6. **Safe-to-replicate backups** — the store is a **git repository**. Every
    mutation auto-commits, a session pushes in the background, fetches on a timer,
-   and applies a remote's commits only when they are a fast-forward; a fork is
-   reported, never merged over. `serve` clones the store when it is missing, and
-   `backup push` / `backup fetch` / `backup pull --force` are the manual verbs. The
-   remote only ever sees ciphertext, and each install owns its own **vault**
-   repository, so machines holding different keys can share one backup host and
-   folder.
+   and validates remote history without applying it. A fast-forward proves ancestry,
+   not authorship, so only an explicit `backup pull --force` can make remote state
+   active. **Only the key material is ciphertext.** The remote also receives every key
+   **name** (key names *are* the file names), every `policies/<name>.toml` in
+   **plaintext**, the enrollment labels and public points in `keyring.json`, and a
+   commit-by-commit **timeline of when each of those changed**. Each install owns its
+   own **vault** repository, so machines holding different keys can share one backup
+   host and folder.
 7. **End-to-end encrypted reads** — per-request Diffie-Hellman exchange means the
    secret is encrypted specifically for the requesting client, on top of pinned
    TLS.
@@ -123,15 +139,27 @@ without the DEK ever crossing the wire in plaintext.
    never cached.
    - **Secure Enclave KEK** = `HKDF(ECDH(SE_priv, eph_pub))`. The SE private key
      never leaves the enclave and each ECDH requires a live Touch ID.
-   - **Passphrase KEK** = `Argon2id(passphrase, salt)`.
+   - **Passphrase KEK** = `Argon2id(passphrase, salt)`. The costs are recorded per
+     enrollment and validated on load as a **range**, not an exact match —
+     `m_cost` 65 536…131 072, `t_cost` 3…5, `p_cost` 1…4 — so the floor keeps a
+     downgrade rejected while a future build can still raise what it writes without
+     refusing to open a vault written by this one. The **ceiling** is there because
+     `keyring.json` is attacker-writable input that travels to untrusted backup
+     remotes and comes back: `unlock` derives one KEK per passphrase enrollment and
+     the keyring may hold 32, so an unbounded ceiling would let a planted keyring
+     turn one unlock attempt into an arbitrarily long stall. At the current ceiling a
+     derivation measures ≈0.29 s and a full 32-enrollment walk ≈9.4 s; the previous
+     ceiling (1 GiB, `t_cost` 64, `p_cost` 16) measured ≈35 s and ≈19 minutes for the
+     same walk.
 3. **Serving.** `hot_cheese serve` binds HTTPS on loopback, presents the pinned
    self-signed certificate, and answers the endpoints below. Every one of those
    endpoints except `/health` is put in front of the operator for an explicit
-   approval before anything unlocks. Secrets are returned through a df-share
+   approval before anything unlocks. Secrets are returned through an ephemeral P-256
    Diffie-Hellman exchange so only the requesting client can read them.
 4. **Replication.** Any mutation commits the store and the session pushes that
    commit to the configured remotes, into this install's vault repository
-   (`<folder>/<vault_id>.git`); ciphertext only.
+   (`<folder>/<vault_id>.git`). The secrets are ciphertext; the key names, the
+   policies and the commit timeline are not (see [Backups](#backups)).
 
 ---
 
@@ -228,6 +256,15 @@ Code signing — a **Developer ID Application** certificate plus notarization �
 needed to **distribute** the binary to *other* Macs without Gatekeeper warnings, never to
 run it locally.
 
+**What running unsigned costs you.** An ad-hoc signature carries no **hardened runtime**,
+so there is no library validation and no `DYLD_INSERT_LIBRARIES` restriction: a same-uid
+process can inject a dylib into `hot_cheese serve`. One injected read of the DEK turns a
+single approved Touch ID into unlimited silent use of **every** key, because the injected
+code is inside the process that holds the plaintext DEK. Nothing in this repo runs
+`codesign --options runtime`, so this is the shipping configuration, not a corner case.
+Treat "code execution as your uid" as full compromise of the store and size the machine's
+other software accordingly.
+
 ---
 
 ## Try It Without the Secure Enclave (demo)
@@ -268,7 +305,7 @@ xxd /tmp/hot_cheese_demo/software_enclave_hotcheese_se_kek_v1.key   # readable �
 Build / install the binary first:
 
 ```bash
-cargo install --force --locked --profile release --bin hot_cheese --path .
+cargo install --force --locked --profile release --bin hot_cheese --path crates/hc-cli
 # or run in place:  cargo run --release -- <subcommand>
 ```
 
@@ -285,7 +322,9 @@ hot_cheese init
   `DNS:localhost` + `IP:127.0.0.1`) and writes `ssl-cert.pem` / `ssl-key.pem`,
 - mints a fresh random **DEK**,
 - **requires a recovery passphrase** (entered twice) as the first, survivable
-  enrollment,
+  enrollment — **at least 20 characters and at least 8 distinct characters**, so a
+  long repetitive phrase is refused; the floors apply to a passphrase being *set*,
+  never to one being used, so an existing enrollment keeps unlocking unchanged,
 - prints the certificate **SHA-256 fingerprint** — record it for client pinning.
 
 Record the recovery passphrase **offline** (treat it like a seed phrase): it is
@@ -300,10 +339,21 @@ hot_cheese init --import-cert <cert.pem> --import-key <key.pem>
 
 `init` refuses to run when it finds a prior install — `config.toml`, a
 `store/keyring.json`, or any keystore file — and its error names what it found
-(`ExistingStore { store, keyring, keystores }`). Pass `--force` to deliberately
-reinitialize: that re-mints the DEK and **permanently orphans** any keystore
-already written under the previous DEK. The generated `ssl-key.pem` is written
-`0600`.
+(`ExistingStore { store, keyring, keystores }`). The generated `ssl-key.pem` is
+written `0600`.
+
+`--force` no longer just overrides that. It first **enumerates every casualty** — each
+keystore the new DEK orphans, by name, and each enrollment the new keyring discards, by
+id and label — and then demands the phrase back, typed exactly:
+
+```
+destroy the existing hot_cheese keys
+```
+
+Anything else refuses (`ConfirmationRefused`). With no terminal to type it on, pass it as
+`--confirm-destroy 'destroy the existing hot_cheese keys'`; without that flag a
+non-interactive `--force` fails with `ConfirmationNeedsTerminal` rather than proceeding.
+A store `init` finds empty skips the whole ceremony.
 
 ### 2. (Optional) Enroll the Secure Enclave
 
@@ -313,6 +363,28 @@ method for the **same** DEK:
 ```bash
 hot_cheese enroll se
 ```
+
+**It tells you whether the enclave key is new, and names it.** The last line is one of
+
+```
+MINTED a new Secure Enclave key: the set of enclave keys this store trusts CHANGED  se_key=<16 hex>
+ADOPTED the Secure Enclave key already on this disk; stop unless this is the fingerprint you enrolled  se_key=<16 hex>
+```
+
+`se_key` is the first 8 bytes of `SHA-256(SEC1 public key)`, 16 lowercase hex characters —
+the same form the bootstrap ritual names an enclave key by, and the `/read` prompt the
+recipient key. **Write it down, off the machine, the first time you see it**, and compare
+every later `enroll se` and `hot_cheese list` against it.
+
+**MINTED and ADOPTED are not equally safe.** MINTED means this command created the key, so
+the change to the trusted set is one you just caused. ADOPTED means a key was already at
+this machine's enclave key path and was taken up — the normal case is re-running `enroll se`
+on a machine you have already enrolled, and the *dangerous* case is a same-uid attacker who
+planted both a key blob and a matching `keyring.json` record and waited for you to re-enrol
+into it. `keyring.json` carries no MAC, so nothing else distinguishes those two; the
+fingerprint does. An ADOPTED line whose `se_key` is not the one you recorded is an alarm —
+stop and investigate, do not continue. See
+[Security Model & Residual Risks](#security-model--residual-risks).
 
 You can also enroll additional recovery passphrases:
 
@@ -333,6 +405,11 @@ and pins it into `config.toml` as `grant_public_key`. Every `/sign` mints a gran
 key and verifies it against that pin, so `serve` refuses to start when nothing is pinned or
 the blob is gone (`GrantKeyMissingRunEnrollGrant`) and when the on-disk grant key exports a
 different public key (`GrantKeyPinMismatch { pinned, found }`).
+
+It prints the same kind of line as `enroll se`, under `grant_key`: **MINTED** when the key
+`config.toml` pins CHANGED, **ADOPTED** when the key already on this disk is the one that was
+already pinned. Record `grant_key` the first time and compare it afterwards, exactly as for
+`se_key`.
 
 That pin is an **identity check, not a security boundary**: it catches an accidentally
 swapped `se_grant_*.blob` or a restore that brought `config.toml` but not the enclave key.
@@ -400,20 +477,47 @@ before any unlock. Run it in the foreground where you can answer it. With no
 terminal at all the daemon refuses those requests by type rather than pretending
 somebody said no.
 
+**The daemon refuses nothing on its own.** There is no rate limit and no per-pass prompt
+cap: the loopback listener authenticates nobody, so a request from an attacker and a
+request from your own service are byte-identical, and any budget the daemon spent by
+itself would be a lever an attacker aims at *everybody* — a cheap way to have every
+legitimate request refused. What bounds a flood is the operator:
+
+- **Prompts are strictly serial.** One approval thread, one prompt at a time, in arrival
+  order. Each one is on screen at least **400 ms** before a keystroke counts as an answer
+  to it (an answer that lands inside that window is reported and asked again, never
+  silently used as the answer to a request you had not read).
+- **A prompt left unanswered for 60 seconds auto-DENIES** and the daemon logs
+  `denying a request the operator never answered`. A closed terminal or an over-long
+  answer line denies too. There is no "assume yes" and no unbounded wait.
+- **`q` at a prompt is the escape hatch you control.** It denies that request, denies the
+  whole queued backlog without prompting, and buys **30 seconds of quiet from that caller
+  only**. The quiet lapses by itself and is scoped as finely as the listener can honestly
+  tell callers apart: **every client of the loopback listener is one caller** (loopback
+  authenticates nobody), each adapter socket is its own caller named by its manifest id,
+  and the operator's own CLI can never be silenced because no listener can reach it.
+
+A denied request answers **403**, deliberately not `500` — a client that retries every
+server error would otherwise turn your refusal into a retry loop and starve itself. At
+most **4** privileged operations may be queued behind the one on screen; a fifth is
+refused at once with **503** and `Retry-After: 1` rather than held. A connection that
+opens and produces no request within **2 seconds** is dropped, so a peer cannot hold
+listener slots without asking for anything.
+
 ---
 
 ## CLI Reference
 
 | Command | What it does |
 | --- | --- |
-| `init [--import-cert <pem> --import-key <pem>] [--force]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase, print the cert fingerprint. |
-| `enroll se [--label <s>]` | Enroll this machine's Secure Enclave as a KEK for the same DEK. No code signing, and **no Touch ID prompt** — it needs only the enclave's public key. |
-| `enroll passphrase [--label <s>]` | Enroll an additional recovery passphrase. |
-| `enroll grant` | Create this machine's Secure Enclave **grant-signing** key and pin its public key in `config.toml`. Prompts nothing — no Touch ID, no passphrase. Required before `serve` or `bundle sign`. Losing this key is benign; re-run to recover. |
+| `init [--import-cert <pem> --import-key <pem>] [--force [--confirm-destroy <phrase>]]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase (≥20 chars, ≥8 distinct), print the cert fingerprint. `--force` over an existing store lists every keystore and enrollment it destroys and then requires the phrase `destroy the existing hot_cheese keys` typed back — `--confirm-destroy` carries it where there is no terminal. |
+| `enroll se [--label <s>]` | Enroll this machine's Secure Enclave as a KEK for the same DEK. No code signing, and **no Touch ID prompt** — it needs only the enclave's public key. Ends on `MINTED` (new key, trusted set changed) or `ADOPTED` (key already on disk taken up), naming it as `se_key=<16 hex>`. Record it and compare it. |
+| `enroll passphrase [--label <s>]` | Enroll an additional recovery passphrase. Records no enclave key, so it prints no fingerprint. |
+| `enroll grant` | Create this machine's Secure Enclave **grant-signing** key and pin its public key in `config.toml`. Prompts nothing — no Touch ID, no passphrase. Required before `serve` or `bundle sign`. Prints `MINTED`/`ADOPTED` with `grant_key=<16 hex>`. Losing this key is benign; re-run to recover. |
 | `add <name> <ethereum\|solana\|bytes> [--use <shareable\|sign-only>]` | Import an existing secret under `name` (read from a hidden prompt). Defaults to `sign-only`. |
 | `generate <evm\|solana> <name> [--use <shareable\|sign-only>]` | Generate a fresh key under `name`. Defaults to `sign-only`. |
 | `address <evm\|solana> <name>` | Print the public address / pubkey of a stored key. |
-| `list` | List stored keystores (with each one's use) and keyring enrollments. Prompts nothing. |
+| `list` | List stored keystores (with each one's use) and keyring enrollments, each Secure Enclave enrollment carrying its `se_key=<16 hex>` fingerprint. Prompts nothing. |
 | `adapters` | Show every trusted adapter: manifest path, pinned vs computed hash, socket path, and the policy-intersection verdict `serve` will act on. Prompts nothing, unlocks nothing. |
 | `seal [<name>\|--all] [--use <shareable\|sign-only>]` | Bind a key's use into its envelope. Tightens only; `--all` binds just the still-unsealed keys. One unlock for the whole batch. |
 | `bundle new [--file <json>]` | Start a bundle from a JSON intent; the threshold comes from `bundles/safes.toml`. Refuses a Safe that file does not describe. Prompts nothing. **Pushes.** |
@@ -430,14 +534,15 @@ somebody said no.
 | `bundle peer add <name>` | Enroll a tailnet machine, once, after checking it answers and has a bundles dir. Writes `[[bundle_peers]]`. |
 | `bundle peer rm <name>` | Stop syncing with a machine. |
 | `bundle … --no-sync` | Do the verb and touch no peer. Accepted on every bundle verb, anywhere in the line. |
-| `serve` | Run the HTTPS daemon and the adapter sockets (clones the store from the first backup remote when there is no local keyring). Takes this install's store claim, prompts on its own terminal for every request, and refuses to start without an enrolled grant key matching the `config.toml` pin. |
+| `serve` | Run the HTTPS daemon and the adapter sockets. Takes this install's store claim, prompts on its own terminal for every request, and refuses to start without a local store or an enrolled grant key matching the `config.toml` pin. Restore a missing store explicitly with `backup pull --force` first. |
 | `backup status` | Print this install's vault, its local commit, and every configured remote. No network, no write, no claim. |
 | `backup push` | Push this install's commits to every configured remote, under its vault id. Fails only when **every** remote failed. |
-| `backup fetch` | Fetch every remote and fast-forward where the ancestry allows it. Fails with `Diverged` when a remote's history has forked from this one. |
-| `backup pull --force [--vault <id>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. |
+| `backup fetch` | Fetch and validate every remote without changing the active store. Reports `remote ahead` or fails with `Diverged` when histories fork. |
+| `backup pull --force [--vault <id>] [--confirm-rewind <phrase>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. A pull that is **not** a purely additive fast-forward — one that forks, rewinds onto an ancestor, deletes store files, or replaces store files with older content — additionally requires the phrase `roll this store back`. |
 | `backup list` | List the vaults sharing the first remote's folder, flagging this install's. Prompts nothing. |
+| `accept-deletions [--confirm-deletion <phrase>]` | Record store files or enrollments that are **already gone**, which every other command refuses to commit. Names each one, then requires the phrase `record the loss of these hot_cheese files` typed back — `--confirm-deletion` carries it where there is no terminal. CLI-only, and the only way out of a store wedged by a missing file. |
 | `migrate --old-store <dir> --new-store <dir> [--shareable <name>]…` | Migrate legacy Keychain-master keystores into the envelope format. Everything not named `--shareable` lands `sign_only` (see [MIGRATION.md](./MIGRATION.md)). |
-| `bootstrap-from <user@host>` | Bootstrap this machine's DEK + store from an authority machine over SSH. |
+| `bootstrap-from <user@host> [--recovery-passphrase]` | Bootstrap this machine's DEK + store from an authority machine over SSH. Enrolls this machine's Secure Enclave only, unless `--recovery-passphrase` also enrolls a recovery passphrase read from a masked prompt (or from stdin with no terminal). |
 
 `--unlock <se|passphrase>` is global: it works before or after any subcommand and selects
 which enrolled KEK unwraps the DEK. Omit it and nothing changes — the Secure Enclave is used
@@ -471,6 +576,17 @@ bundle_watch_secs = 30
 
 [mcp]
 max_pending = 16
+keys = ["TREASURY_SIGNER"]
+safes = ["0x1111111111111111111111111111111111111111"]
+nonce_window = 8
+proposal_ttl_mins = 1440
+proposals_per_hour = 16
+lock_cooldown_ms = 100
+
+[[mcp.anchor]]
+safe = "0x1111111111111111111111111111111111111111"
+chain_id = 1
+nonce = 42
 
 [[backup_remotes]]
 host = "user@1.2.3.4"
@@ -503,12 +619,19 @@ name = "Vendor payouts"
 | `store` | Directory holding the encrypted keystores + `keyring.json` (`~/` is expanded). |
 | `port` | HTTPS listen port (optional; defaults to `5555`). |
 | `grant_public_key` | Uncompressed SEC1 hex (65 bytes, `04`-prefixed) of the Secure Enclave grant key, written by `enroll grant`. **Required to sign**: every signature verifies its grant against this key, and `serve` refuses to start without it (`GrantKeyMissingRunEnrollGrant`) or when the on-disk grant key exports something else (`GrantKeyPinMismatch`). The *pin* is an identity check against a swapped or restored blob — **not** a defence against someone who can write the home dir. |
-| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. A bare IPv6 literal in `host` does not work in scp syntax; use `user@name`. |
+| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. `host` accepts only `[user@]hostname` made of `A-Za-z0-9_-.`, so a bare IPv6 literal or an embedded `:port` is refused at load; use `user@name`. **`host` must be a reachable `user@host`, not a `~/.ssh/config` alias** — every ssh this binary runs passes `-F /dev/null`, so `Host` aliases, `HostName`, `Port`, `User`, `IdentityFile` and `IdentityAgent` from that file are all ignored. See [SSH options](#ssh-options-what-is-pinned-and-what-that-breaks). |
 | `adapters` | List of `{ id, manifest, sha256 }` trusted signing adapters. `manifest` resolves under the home dir when relative; `sha256` is the pin the file's bytes must hash to *before* they are parsed. `serve` refuses to start on a mismatch, or when a manifest claims more than the key's policy grants. See [Signing Adapters](#signing-adapters). |
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
 | `bundle_watch_secs` | Seconds between ticks of the background bundle poller a session runs (optional; defaults to `30`, floored at `5`). The name is kept so an existing `config.toml` is not silently ignored. |
 | `backup_fetch_secs` | Seconds a session waits between backup fetches (optional; defaults to `300`). `0` disables the timer, leaving pushes-after-mutation and the manual verbs; re-enabling it takes a restart. |
 | `mcp.max_pending` | Unsigned bundles the MCP proposal server may leave waiting before it refuses to file another (optional; defaults to `16`). The queue is read by a human, so it is bounded by what a human will read. See [MCP](#mcp-an-agent-proposes-you-sign). |
+| `mcp.keys` | Allow-list of keystore names the agent may propose against (optional). **Absent or empty is every key in the store**, which is what an install that never states this gets. |
+| `mcp.safes` | Allow-list of Safe addresses the agent may propose against (optional). **Absent or empty is every Safe `bundles/safes.toml` describes.** |
+| `mcp.nonce_window` | How far above the anchor a proposal's Safe nonce may sit (optional; defaults to `8`). Without it the agent picks the nonce with no upper bound, and one human approval becomes a cheque the agent can arrange to have executed at a nonce of its choosing. |
+| `mcp.proposal_ttl_mins` | Minutes an **unsigned** proposal keeps counting toward `max_pending` and keeps holding its `(safe, chain, nonce)` slot (optional; defaults to `1440`, one day). |
+| `mcp.proposals_per_hour` | Proposals one agent session may file per hour (optional; defaults to `16`). Charged on the **attempt**, so a rejected proposal still spends allowance and an agent cannot wedge the queue here and on every peer by retrying. |
+| `mcp.lock_cooldown_ms` | Milliseconds a session must leave between tool calls that take the exclusive bundle lock (optional; defaults to `100`), so a busy agent cannot starve your own CLI of the lock. |
+| `mcp.anchor` | List of `{ safe, chain_id, nonce }` **operator-declared** absolute nonce anchors, written as `[[mcp.anchor]]` **after** the scalar `[mcp]` keys. hot_cheese has no RPC client, so a Safe's real nonce is not knowable here: this is you stating the nonce you read on chain. Without an anchor for a Safe, `nonce_window` is measured from the local queue instead. |
 | `token` | List of `{ address, chain_id, symbol, decimals, standard }` contracts the approval summary may also render **scaled**: `1.000000 USDC (1000000)` — always both forms, so a wrong `decimals` is bounded by the integer beside it. `address = "0x0…0"` annotates the chain's native `value`. `standard` is `erc20`, `erc721` or `erc1155`; a non-fungible standard must carry `decimals = 0`, because scaling a `tokenId` would render token #42 as `0.000042`. **An unlisted contract is not guessed at** — it renders the raw integer, exactly as it did before the table existed. |
 | `label` | List of `{ address, chain_id, name }` names the approval summary may show **beside** an address: `0x2222… (Vendor payouts)`. The full EIP-55 address is always printed — a name never replaces one, and nothing is ever truncated, because two addresses sharing their leading digits are trivial to grind. `name` is refused at load if it is empty, longer than 32 chars, holds anything but printable ASCII and spaces, holds a parenthesis, or starts with `0x`; a second `token` or `label` for one `(address, chain_id)` is refused too, since it could never fire. |
 
@@ -523,18 +646,24 @@ rebuild.
 All endpoints are served over pinned HTTPS on loopback. Every endpoint but `/health`
 is a privileged operation: it is printed on the daemon's terminal and answered `y`
 by the operator, and then prompts for **Touch ID** (when a Secure Enclave enrollment
-is in use). Names must match `[A-Za-z0-9_]+`. On failure the server returns
+is in use). Names must match `[A-Za-z0-9_]+`. A request the operator **refuses** answers
+`403 FORBIDDEN`; one that arrives with the approval queue already full answers
+`503 SERVICE_UNAVAILABLE` with `Retry-After: 1`; every other failure is
 `500 INTERNAL_SERVER_ERROR`.
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/health` | GET | Returns `ok` if the server is running. |
-| `/read/<name>` | GET (with body) | df-share Diffie-Hellman read: the body carries the client's ephemeral public key; the response is the secret encrypted so only that client can decrypt it. Works for both EVM and Solana keys. **Only for a `shareable` key** — see below. |
-| `/sign/<name>` | GET (with body) | Sign a Safe transaction. The body is a JSON intent carrying the `execTransaction` **fields**, never a hash; the response is `{safe_tx_hash, signature, signer}`. Policy-checked and grant-gated — see below. |
-| `/evm_generate/<name>` | GET | Generate a new secp256k1 key, **always `sign_only`**, then commit the store and push it in the background. |
-| `/evm_address/<name>` | GET | Return the Ethereum address derived from `<name>`. |
-| `/solana_generate/<name>` | GET | Generate a new ed25519 keypair, **always `sign_only`**, then commit the store and push it in the background. |
-| `/solana_address/<name>` | GET | Return the Solana pubkey of `<name>`. |
+| `/read/<name>` | POST | Ephemeral P-256 Diffie-Hellman read: the body carries the client's ephemeral public key; the response is the secret encrypted so only that client can decrypt it. Works for both EVM and Solana keys. **Only for a `shareable` key** — see below. |
+| `/sign/<name>` | POST | Sign a Safe transaction. The body is a JSON intent carrying the `execTransaction` **fields**, never a hash; the response is `{safe_tx_hash, signature, signer}`. Policy-checked and grant-gated — see below. |
+| `/evm_generate/<name>` | POST | Generate a new secp256k1 key, **always `sign_only`**, then commit the store and push it in the background. |
+| `/evm_address/<name>` | POST | Return the Ethereum address derived from `<name>`. |
+| `/solana_generate/<name>` | POST | Generate a new Ed25519 keypair, **always `sign_only`**, then commit the store and push it in the background. |
+| `/solana_address/<name>` | POST | Return the Solana pubkey of `<name>`. |
+
+Every privileged POST requires `Content-Type: application/json`, including the body-less
+generate/address routes. Besides making the wire format explicit, this prevents an HTML form
+from issuing a cross-origin localhost request; the server exposes no CORS preflight response.
 
 `/read` is the only endpoint that exports a key, and it serves **only** a key sealed
 `shareable`. A `sign_only` (or still-`unsealed`) key answers `500` and the daemon logs
@@ -543,9 +672,12 @@ made from the file's cleartext header **before the approval prompt and before an
 a refused export costs the owner **no approval and no biometric at all**. The generate endpoints always mint `sign_only`: a remote
 caller can never create itself an exportable key. See [Key uses](#key-uses).
 
-> TLS cert-pinning and the df-share Diffie-Hellman transfer are **unchanged** — existing
-> clients keep working as long as the pinned certificate is the same and the keys they read
-> are `shareable`.
+> TLS cert-pinning is **unchanged**, but the Diffie-Hellman transfer is **not**: the
+> exchange is now bound to its own transcript and is no longer wire-compatible with
+> df-share or with any pre-hardening client. An old client gets an AEAD failure, not a
+> readable secret. Rebuild your key consumers against the current
+> `hc_core::share` before upgrading the daemon. See
+> [Client Integration](#client-integration).
 
 The table above is the **loopback** surface. An adapter's own unix socket routes `/health` and
 `/sign/<name>` and nothing else — `/read` and every generate/address route are not in its
@@ -643,10 +775,16 @@ way to say "no bound" is to type it out:
 | `{ each = { max_len = 4, of = … } }` | `T[]`, `T[k]` | every element bounded by `of`, at most `max_len` of them |
 | `"struct"` | a declared EIP-712 struct | bounded by its own `[[typed_data.types]]` block |
 | `"batch"` | `multiSend`'s `bytes` | a packed batch; every entry is matched against the policy in its own right |
-| `"unbounded"` | anything | **deliberately unbounded**, and every approval says so at the head of the sheet |
+| `"unbounded"` | any type that does **not** reach a declared struct | **deliberately unbounded**, and every approval says so at the head of the sheet |
 
 Rules are **externally tagged** so an unrecognised term inside one is a refusal to load rather
 than a silently dropped field: `{ unbounded = { max = "100" } }` does not parse.
+
+**`"unbounded"` is legal only on a scalar.** Applying it to a struct-typed field — or to an
+array or tuple that reaches a declared struct — is a **parse-time refusal**
+(`SchemaFieldTypeMismatch`), because only `"struct"` makes the walk descend into a struct's
+own fields: one word would otherwise have silently disabled every rule beneath it while
+reading as a single loose value. Use `"struct"` there and declare the fields.
 
 `multiSend` is no longer a hole. Every entry of a batch is matched against the policy — its own
 destination, its own operation, its own native value, its own declared signature and its own
@@ -875,6 +1013,7 @@ An adapter then signs by POSTing an intent to its own socket:
 
 ```bash
 curl --unix-socket "$HOT_CHEESE_HOME/adapters/safe_treasury_bot.sock" \
+     -H 'Content-Type: application/json' \
      --data @intent.json http://localhost/sign/TREASURY
 ```
 
@@ -1148,16 +1287,39 @@ which is outside `bundles/` so nothing quarantined is ever synced back out. Ever
 one this machine's own writes satisfy by construction, so **quarantine can never eat your own
 signature** on any of them.
 
-The caps then bound the work. A pass **judges** at most **4096** files — the ones whose local
+The caps then bound the work. A pass **judges** at most **4160** files — the ones whose local
 identity (inode, ctime, length) moved since the last pass, so an unchanged file costs an `open`
 and an `fstat` and nothing else — and leaves the rest to the next pass rather than never judging
-them. A directory holding more than **64** files keeps 64 (`unsigned.json` first, then what has
-already been judged, then name order) and the overflow is **moved to quarantine, not deleted**:
-this is the one rule that can catch a valid local signature no pass has judged yet, which is
-exactly why it is reversible. A **65th bundle directory that arrives** is removed whole; one that
-was already here, or one this device wrote into, never is. The quarantine tree itself stops at
-**1024** files, past which a rejected file is deleted instead — except for the two rules a local
-file could trip, which are left in place.
+them. A directory holding more than **65** files (one seed plus the 64 owner signatures a Safe
+can carry) keeps 65 (`unsigned.json` first, then what has already been judged, then name order)
+and the overflow is **moved to quarantine, not deleted**: this is the one rule that can catch a
+valid local signature no pass has judged yet, which is exactly why it is reversible. A **65th
+bundle directory that arrives** is removed whole; one that was already here, or one this device
+wrote into, never is.
+
+**Arrival slots are shared per peer, durably.** One peer holds at most **16** of the 64
+directory slots (`MAX_DIRS_PER_PEER`). A slot is spent when *that peer's* pull delivers a new
+directory and freed only when that directory leaves this machine — it is a **share, not a
+per-pass allowance**, so a flooding peer gains nothing by waiting for the next pass, and one
+peer can never crowd the others out of the tree. Everything past the share is refused, which is
+also the only thing the poller's flood backoff can see. **The honest limit:** the map from
+directory to delivering peer is in memory only (an index on disk would sit in the tree peers
+write to, where a peer could mark its own arrivals as somebody else's), so a daemon restart
+re-grants every peer a fresh share.
+
+**Slots also expire, so nothing needs reclaiming by hand.** A bundle nobody has signed keeps
+its `(Safe, chain, nonce)` slot for **14 days** — a Safe executes each nonce once, so a dead
+proposal would otherwise block every later transaction for that nonce. A directory holding
+nothing but files for a Safe this machine's `safes.toml` does **not** describe keeps its slot
+for only **1 hour**: nothing in it can become valid until you add that Safe, and the peer still
+has it, so the pull after you do brings it straight back.
+
+**The quarantine tree self-heals.** It stops at **1024** files, but a sweep drops evidence older
+than **7 days** and evidence whose bundle directory is gone, and a sweep that has to make room
+evicts **oldest-first** down to 768. It sweeps once at startup and thereafter no more often
+than every 15 minutes, when a file is being quarantined. So a saturated install recovers on its
+own and needs **no operator action**; only a rejected file arriving at a tree that is full of
+evidence no sweep can yet reclaim is deleted instead of moved.
 
 **A hostile peer can therefore waste bounded disk, and nothing else.** Bandwidth is not bounded:
 nothing tells rsync "never fetch this path again", so a peer that re-sends what we quarantined
@@ -1189,12 +1351,13 @@ many have met their threshold, how many peers answered, how long ago, and what w
 and every bundle's own row still shows `met` when it is ready.
 
 A peer is an untrusted writer, and a poller makes that continuous rather than occasional, so the
-caps are enforced rather than reported: 64 KiB per file, 64 files per bundle directory (the
-overflow is **moved to `bundle-quarantine`**, never deleted), 64 bundle directories — one that
-*arrives* past the cap is removed, one that was already here is never touched — 1024 files in the
-quarantine tree, one signature per per-signer file, and 4096 files judged per tick, with the rest
-left to the next tick. A peer that trips those is skipped for a doubling number of ticks, up to
-32, which self-clears; it stays enrolled, and the console says why it went quiet.
+caps are enforced rather than reported: 64 KiB per file, 65 files per bundle directory (the
+overflow is **moved to `bundle-quarantine`**, never deleted), 64 bundle directories of which any
+one peer holds at most 16 — an arrival past either cap is removed, one that was already here is
+never touched — 1024 files in the quarantine tree, one signature per per-signer file, and 4160
+files judged per tick, with the rest left to the next tick. A peer that trips those is skipped
+for a doubling number of ticks, up to 32, which self-clears; it stays enrolled, and the console
+says why it went quiet.
 
 With no session running there is no poller: `hot_cheese bundle sync` remains the scriptable
 one-shot exchange, and `bundle list` / `bundle status` still pull for themselves.
@@ -1246,6 +1409,26 @@ Transport is **stdio**: no port, no socket, no listener, and no HTTP client anyw
 crate. `HOT_CHEESE_HOME` is the only thing it needs from the environment — it points at the same
 home dir the CLI uses, which is where `config.toml`, `bundles/safes.toml` and the policies live.
 Logs go to **stderr**, because stdout is the protocol.
+
+### Bounding the agent: the `[mcp]` table
+
+The agent limits all live in `[mcp]` in the **one** `config.toml` — there is no separate
+`mcp.toml`. Every key is optional and every default preserves what an install that never
+states it already had, so upgrading changes nothing until you tighten something:
+
+| Key | Default | What it bounds |
+| --- | --- | --- |
+| `keys` | *(empty — every key in the store)* | Which keystores the agent may propose against. Without it, **every** key in the store is proposable. |
+| `safes` | *(empty — every Safe in `safes.toml`)* | Which Safes the agent may propose against. |
+| `nonce_window` | `8` | How far above the anchor a proposal's Safe nonce may sit. Without an upper anchor the agent picks the nonce freely, and one approval becomes a cheque executable whenever the agent decides. |
+| `proposal_ttl_mins` | `1440` | How long an **unsigned** proposal keeps counting toward `max_pending` and keeps holding its `(safe, chain, nonce)` slot. |
+| `proposals_per_hour` | `16` | Proposals one agent session may file per hour, **charged on the attempt** — an agent cannot wedge the queue here and on every peer by retrying. |
+| `lock_cooldown_ms` | `100` | Minimum gap between tool calls that take the exclusive bundle lock, so a busy agent cannot starve your own CLI. |
+| `max_pending` | `16` | Unsigned bundles waiting before the server refuses to file another. |
+| `[[mcp.anchor]]` | *(none)* | `{ safe, chain_id, nonce }` you read **on chain** and state here; it anchors that Safe's window absolutely. hot_cheese has no RPC client, so with no anchor the window is measured from the local queue instead. Write these tables **after** the scalar keys. |
+
+Set `keys` and `safes` if the store holds anything the agent has no business touching, and
+set an `[[mcp.anchor]]` per Safe if you want the nonce window to mean something absolute.
 
 ### What the agent can do
 
@@ -1380,8 +1563,17 @@ blast radius, and it is not zero:
   `transfer(to=0x…, amount=…)` — leads with `⚠ UNBOUNDED FIELD` for anything the policy did not
   bound, and flags `⚠ UNLIMITED` and `⚠ HUGE` amounts in the first three lines. Read it, every
   time, and read the amount as base units.
-- It can fill the queue up to `max_pending`, which is noise, not loss.
-- It can claim a nonce, which the rival guard makes visible rather than silent.
+- It can fill the queue up to `max_pending` (default 16), which is noise, not loss — and
+  only at `proposals_per_hour` (default 16) per session, charged on the attempt, so it
+  cannot wedge the queue here and on every peer by retrying. An unsigned proposal stops
+  counting after `proposal_ttl_mins` (default 1440).
+- It can claim a nonce, which the rival guard makes visible rather than silent — and only
+  within `nonce_window` (default 8) above the anchor, so it cannot reserve a far-future
+  slot. **Set `[[mcp.anchor]]` if you want that anchor to be the chain's real nonce**;
+  without one the window is measured from your local queue, which the agent also writes to.
+- It can propose against any key and any Safe, unless you narrow `mcp.keys` /
+  `mcp.safes`. Both default to "everything", so this is the setting most installs should
+  actually change.
 
 What it cannot reach: the DEK, the keystore, the enclave, the grant key, and the biometric. Every
 signature still costs one Touch ID over a payload *you* read. An agent that proposes a hundred
@@ -1410,7 +1602,7 @@ let agent = HotCheeseAgent::new("https://localhost:5555")?;
 let health = agent.health()?;                 // "ok"
 let addr   = agent.address("TRADING_BOT")?;   // EVM address
 let sol    = agent.solana_address("SOLANA_TRADER")?;
-let secret = agent.read("TRADING_BOT")?;      // df-share DH read; needs a `shareable` key
+let secret = agent.read("TRADING_BOT")?;      // ephemeral DH read; needs a `shareable` key
 ```
 
 Anything a client `read`s must have been created (or sealed) `shareable` — a `sign_only`
@@ -1435,15 +1627,50 @@ system trust store. Use it for liveness (`/health`), and this client for pinning
 The Diffie-Hellman handshake and certificate pinning happen inside the agent, so
 the private key is encrypted end-to-end for the calling process.
 
+**The `/read` exchange changed, and it is not backward compatible.** The share layer now
+binds the transcript: HKDF `info` is `"hotcheese/share/v1/hkdf" ‖ client_pub ‖ server_pub`
+(both validated 65-byte uncompressed SEC1 points, in that order), and the AES-GCM
+associated data is `"hotcheese/share" ‖ 0x00 ‖ key_name ‖ 0x00 ‖ 0x01` — a domain
+separator, the **requested key name**, and the protocol version. A response obtained for
+one key therefore cannot be replayed to a client that asked for another, and substituting
+or swapping either public key yields a different key.
+
+The cost is that this is **wire-incompatible in both directions** with df-share and with
+any client built before the hardening: an old client decrypting a new response gets an AEAD
+failure, and so does a new client against an old daemon. There is no negotiation and no
+version fallback. Rebuild every key consumer against the current `hc_core::share` (copying
+`HotCheeseAgent` from `pin_cert.rs` again is the simplest route) and roll the clients and
+the daemon together.
+
 ---
 
 ## Backups
 
 Because the store is an envelope (the DEK never appears on disk in plaintext), the
-entire store directory is **safe to replicate to untrusted remotes** — the remote
-only ever sees ciphertext and `keyring.json` (which holds the DEK only in wrapped
-form). Only the **store dir** is synced; the certs/keys under the home dir are
-deliberately never replicated.
+**key material** is confidential on untrusted remotes: a remote that reads everything it
+holds cannot recover a private key. Only the **store dir** is synced; certs/keys under
+the home dir are deliberately never replicated. That does not make the remote an
+integrity authority either: fetched state is never applied automatically.
+
+**What the remote does learn.** Only the secrets are ciphertext. `git log -p` on the
+backup repository gives its holder:
+
+- **every key name**, because a keystore's file name *is* the key name (`store/EVM_KEY`);
+- **every signing policy in plaintext** — `store/policies/<name>.toml` is never encrypted,
+  so the remote reads which Safes, which destinations, which canonical call signatures and
+  which value ceilings each key is allowed;
+- **`keyring.json` in plaintext apart from the wrapped DEK**: the vault id, each
+  enrollment's id, its human label, its creation time, the Secure Enclave public points,
+  and the Argon2 salt and costs of every passphrase enrollment;
+- **a mutation timeline.** Every mutation is its own commit. The message is deliberately
+  only `hot_cheese <vault> <unix secs>` and never names the operation, but the diff shows
+  which file changed, so the remote reconstructs when each key was created, re-sealed or
+  re-policied, and when enrollments were added.
+
+Treat that as real metadata leakage: "which keys exist, what each is permitted to sign,
+and when you last touched it" is a useful map for anyone deciding which of your machines
+to attack. It is not a reason to skip backups; it is a reason not to put one on a host you
+would not tell that to.
 
 **The store is a git repository.** `<store>/.git` holds the history, the branch is
 always `main`, and `<store>/.git/info/exclude` keeps a half-written `*.hctmp` out of
@@ -1459,17 +1686,104 @@ Backups are automatic:
 - **Pushing** — a session coalesces commits and pushes in the background; a
   subcommand run with no daemon pushes before it returns. Every remote is attempted,
   and only *all* of them failing is an error.
-- **Fetching** — a session fetches every `backup_fetch_secs` (default 300) and
-  applies what it finds **only when it is a fast-forward**.
+- **Fetching** — a session fetches every `backup_fetch_secs` (default 300), validates
+  the remote tree/keyring and reports ancestry, but never changes the active store.
+  A fast-forward proves ancestry, not who authored the new commit.
 - **Divergence** — when both sides have moved, nothing is merged, nothing is pushed
   and nothing is deleted. It is a reported state, and only
   `hot_cheese backup pull --force` resolves it.
-- **On `serve`** — if the store has no `keyring.json`, it is **cloned** from the
-  first configured remote before the daemon starts.
+- **On `serve`** — a missing `keyring.json` is a refusal. Restore it explicitly with
+  `backup pull --force` before starting the daemon.
 - **Manually** — `backup status`, `backup push`, `backup fetch`,
   `backup pull --force`.
 
 Configure targets in `backup_remotes` (see [Configuration](#configuration)).
+
+**A routine commit refuses to replicate a loss.** If staging finds that a committed store
+file is gone, the commit fails with `CommitWouldDeleteStoreFiles { paths }`; if the staged
+keyring no longer wraps an enrollment the committed one did, it fails with
+`CommitWouldDropEnrollments { ids }`. That is the right default — the backup exists to
+survive exactly that loss, and a deletion replicates as a clean fast-forward the remote can
+never put back — but the refusal is permanent, and opening the store *is* a commit. One
+store file legitimately going missing therefore takes `serve`, `generate` and the forced-pull
+recovery down with it, for good.
+
+`hot_cheese accept-deletions` is the way out, and the only one:
+
+```bash
+hot_cheese accept-deletions
+```
+
+It names every missing file and every dropped enrollment first, then requires the phrase back,
+typed exactly:
+
+```
+record the loss of these hot_cheese files
+```
+
+Anything else is `ConfirmationRefused`. With no terminal, carry it as
+`--confirm-deletion 'record the loss of these hot_cheese files'`; without that flag a
+non-interactive run fails with `ConfirmationNeedsTerminal` rather than proceeding. A store
+with nothing gone answers `NoDeletionsToAccept` and writes nothing. The consent covers exactly
+the loss it named: if the store loses something else while the question is open, the commit is
+refused (`LossPreviewStale`) rather than recorded against an answer nobody gave.
+
+**It is CLI-only.** The interactive console cannot recover a wedged store, because its runtime
+calls `git.open()` at startup and that open is the commit which is already failing.
+`accept-deletions` deliberately runs outside that path.
+
+**It cannot recover a missing `keyring.json`.** If the keyring itself is the file that is gone
+there is no vault to commit under, and the command fails with `LocalKeyringMissing { store }`.
+That store is restored with `backup pull --force`, not with this.
+
+`backup pull --force` is therefore an explicit integrity trust decision. Before it
+touches the worktree, it rejects symlinks, gitlinks, unexpected paths, oversized
+files, malformed keyrings and wrong vault ids; it then names every tracked file it
+will change and every untracked file it will delete. It also refuses if the local
+store changes between that preview and confirmation. It cannot cryptographically
+prove that the backup host preserved the newest authentic commit.
+
+**A rewinding pull needs a second, separate confirmation.** `--force` alone now buys only a
+**purely additive** fast-forward. The pull classifies what it is about to do and, for any of
+these four grounds, demands the phrase `roll this store back` typed back before it applies
+anything (they are tested in this order, and the first one that matches is the one you are
+shown):
+
+| Classification | What the remote's tip is |
+| --- | --- |
+| `Fork` | **diverged**: both sides moved, so the incoming tip does not contain this machine's commits |
+| `Backwards` | an **ancestor** of your local commit — older history, replayed over the newer |
+| `Deletes` | a fast-forward that **drops store files** your local commit has |
+| `Contents` | a fast-forward that deletes nothing and discards no commit, and **replaces** the content of security-relevant store files with older bytes |
+
+With no terminal, carry it as `--confirm-rewind 'roll this store back'`; without that the
+non-interactive pull fails with `ConfirmationNeedsTerminal` instead of applying. The
+preview and the commit the confirmation refers to are pinned, so a background fetch between
+the question and the answer cannot change what you agreed to.
+
+**Why the extra gate.** A fast-forward proves ancestry and nothing else — not authorship,
+not freshness. The backup host chooses which history it serves and the `remote_at`
+timestamp is chosen freely by whoever wrote the commit. A hostile or rolled-back remote
+could otherwise hand you an older, perfectly ancestor-consistent state and silently undo a
+`seal`, restore a key you rotated away, or reinstate a policy you tightened — all inside
+what a plain `--force` would have applied without comment.
+
+**Why `Contents` is a separate ground.** The first three all describe a *loss* — a discarded
+commit or a deleted path — and a hostile remote does not need any of them. It can commit a
+**child of your own tip** whose tree keeps every path and merely reverts the bytes inside
+them: ancestry then passes cleanly, nothing is deleted, no local commit is discarded, and
+every affected path reports only as *modified*. The store grammar admits nothing but
+security-relevant paths — the keyring, a policy, a keystore — so that alone revives a retired
+keystore, restores an older `keyring.json`, or reinstates a looser policy. The console asks it
+in exactly those terms:
+
+```
+OLDER CONTENT: nothing is deleted and no local commit is discarded — the incoming tip
+REPLACES 2 security-relevant file(s) with older content — EVM_KEY, policies/EVM_KEY.toml.
+Ancestry proves neither who wrote this history nor that it is current, so a hostile backup
+host can serve exactly it: this can revive a retired keystore, restore an older keyring.json,
+or reinstate a looser policy. Accept this rollback?
+```
 
 **History is forever, and now replicated.** Every version of every keystore stays in
 the history on every remote; a key removed from the store is still recoverable from
@@ -1600,13 +1914,62 @@ key**, so it **never crosses the wire in plaintext**:
    endpoints).
 3. **B** recomputes the shared secret inside its enclave (Touch ID on B), opens
    the sealed DEK, and **re-wraps it under B's own KEKs** — a fresh `keyring.json`
-   enrolling B's Secure Enclave (and a recovery passphrase if
-   `HOT_CHEESE_BOOTSTRAP_PASSPHRASE` is set). A's keyring is never copied.
+   enrolling B's Secure Enclave, and a recovery passphrase **only** if you passed
+   `--recovery-passphrase`. A's keyring is never copied.
 
-Channel authentication comes from SSH (known_hosts / TOFU) — verify A's SSH host
-key fingerprint out-of-band before the first connect. A MITM that fully
-impersonates A could serve a DEK of its choosing, but cannot **learn** B's DEK,
-because confidentiality rests on B's enclave key, not on the channel.
+### Enrolling a recovery passphrase on B
+
+```bash
+hot_cheese bootstrap-from user@authority-host --recovery-passphrase
+```
+
+The passphrase is read from a **masked, confirmed prompt** when stdin is a terminal, and
+from **stdin** otherwise. It is collected *before* the ritual opens, so a mistyped
+confirmation costs nobody a Touch ID. The same ≥20-character / ≥8-distinct-character floors
+apply as at `init`.
+
+> **Upgrade note.** `HOT_CHEESE_BOOTSTRAP_PASSPHRASE` is **deleted**, with no fallback. It
+> leaked the passphrase to any same-uid process through `ps eww`, into shell history, and
+> into the ssh child's environment. If your provisioning script set it, `bootstrap-from`
+> now **silently enrolls the Secure Enclave only** — B ends up with no recovery enrollment
+> and no cross-machine restore path. Add the `--recovery-passphrase` flag, or run
+> `hot_cheese enroll passphrase` on B afterwards; `hot_cheese list` warns while none is
+> enrolled.
+
+Channel authentication comes from SSH host keys, checked strictly:
+`bootstrap-from` execs `/usr/bin/ssh` with `-F /dev/null`,
+`StrictHostKeyChecking=yes`, `UserKnownHostsFile=~/.ssh/known_hosts` and
+`BatchMode=yes`. That means **A's host key must already be in your `known_hosts`** —
+first contact is refused rather than prompted, so put it there deliberately and verify
+the fingerprint out-of-band. A MITM that fully impersonates A could serve a DEK of its
+choosing, but cannot **learn** B's DEK, because confidentiality rests on B's enclave key,
+not on the channel.
+
+### SSH options: what is pinned, and what that breaks
+
+Every `ssh` this binary runs — backup push/fetch/pull, the bootstrap pipe, and bundle peer
+sync — is `/usr/bin/ssh` with a fixed option list rather than whatever the environment
+supplies:
+
+| Path | `StrictHostKeyChecking` | Also always |
+| --- | --- | --- |
+| Backup transport (`backup push`/`fetch`/`pull`, `serve`'s clone) | `yes` | `-F /dev/null`, `UserKnownHostsFile=~/.ssh/known_hosts`, `BatchMode=yes`, `PermitLocalCommand=no`, `ForkAfterAuthentication=no`, `ControlMaster=no`, `ControlPath=none`, `ConnectionAttempts=1` |
+| `bootstrap-from` | `yes` | the same, plus `ClearAllForwardings=yes`, and a cleared environment except `SSH_AUTH_SOCK` |
+| Bundle peer sync (tailnet) | `accept-new` | the same set; a **first** contact enrolls the key, a **changed** key is refused |
+
+`-F /dev/null` is the load-bearing one: without it a same-uid process that can write
+`~/.ssh/config` attaches its own `ProxyCommand` to your backup connection. With it, the
+host key is the only thing authenticating the far end, which is why the known-hosts file
+is named explicitly too (`ssh` expands `~` from the passwd database, not `$HOME`).
+
+> **This breaks `~/.ssh/config` aliases, and it will break real setups on upgrade.**
+> `-F /dev/null` discards that file entirely, so a `Host` alias and everything under it —
+> `HostName`, `Port`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump` — is ignored.
+> A `backup_remotes` entry or a `bundle_peers` entry written as an alias
+> (`host = "backup"`) now fails to resolve. Rewrite it as a directly reachable
+> `user@host`, put the key in your agent (`SSH_AUTH_SOCK` is the one variable the
+> bootstrap child keeps), and check with `hot_cheese backup fetch` before relying on it.
+> A non-default port cannot be expressed in a `backup_remotes` `host` at all.
 
 ---
 
@@ -1668,9 +2031,45 @@ Secure Enclave key (device-bound) or the recovery passphrase (offline).
 **What it does *not* protect against.** A live attacker who already has **code
 execution on the unlocked host**. Such an attacker can solicit reads at the Touch
 ID bar exactly like a legitimate client — this is unchanged from the previous
-version and is inherent to a local signing service.
+version and is inherent to a local signing service. Worse, because the binary runs
+without the hardened runtime (see below), such an attacker does not have to ask at all.
 
 Specific residual risks:
+
+- **The binary has no hardened runtime, so `DYLD_INSERT_LIBRARIES` works.** A plain
+  `cargo build --release` is ad-hoc signed: no entitlements, no library validation, no
+  dyld-injection restriction. A same-uid process can inject a dylib into `hot_cheese
+  serve` and read the DEK out of the process that just unwrapped it, converting **one**
+  approved Touch ID into unlimited silent use of **every** key. This is the price of
+  "no code signing required", and it is a real one. Hardening it would mean a Developer
+  ID certificate and `codesign --options runtime`, which this repo does not do.
+- **The Touch ID gate's authority is `keyring.json`, and `keyring.json` carries no MAC.**
+  A Secure Enclave key blob planted at the well-known path is no longer adopted on its
+  own: it is taken as this machine's key only when its public point is **already
+  recorded** — `se_pub` in a `keyring.json` enrollment for the KEK, `grant_public_key` in
+  `config.toml` for the grant key — and an unrecorded blob is refused outright
+  (`UnrecordedEnclaveKey`). That closes the path where a same-uid process planted a
+  **non-biometric** enclave key and the next enrollment adopted it as the KEK, after
+  which the DEK unwrapped with no biometric at all. What remains: `keyring.json` is plain
+  JSON with no integrity tag, so a same-uid attacker who plants **both** a non-biometric
+  blob **and** a matching enrollment record can still wait for you to re-enrol into it.
+  **What makes that visible is the enclave key fingerprint, and comparing it is your job.**
+  `enroll se`, `enroll grant` and `list` all print it — `se_key` / `grant_key`, the first 8
+  bytes of `SHA-256(SEC1 public key)` as 16 lowercase hex characters, 64 bits: short enough
+  to write on paper, wide enough that an attacker cannot arrange a match. Enrolment says
+  which of the two happened:
+
+  - **MINTED** — this command created the key, so the trusted set changing is something you
+    just caused.
+  - **ADOPTED** — a key already on this disk was taken up. Benign when you are re-enrolling
+    a machine you already enrolled; it is also **exactly what a planted blob plus a planted
+    `keyring.json` record produces**. Nothing else can tell those apart.
+
+  So record `se_key` and `grant_key` the first time you see them, keep them **off the
+  machine**, and compare them at every later `enroll` and `list`. An ADOPTED line naming a
+  fingerprint you did not record is an alarm, not drift — stop there. (`bootstrap-from` logs
+  `recipient_key_sha256` in the same 16-hex form, and the authority's Touch ID sheet names it,
+  so the same comparison works across a bootstrap.)
 
 - **The recovery passphrase is as powerful as the Secure Enclave.** Anyone with
   it can unwrap the DEK on any machine. Store it **offline, like a seed phrase**.
@@ -1691,7 +2090,12 @@ Specific residual risks:
   anti-rollback is not implemented**. An attacker who can write **old ciphertexts (under
   the same DEK)** back into your store could roll a key back to a previous value — and,
   if it was `shareable` before you tightened it, back to a state whose header authorizes
-  export. Mitigate by protecting store/backup integrity.
+  export. Unattended fetches cannot activate such a replay, and an incoming tip that
+  replaces the content of store files is now classified `Contents` and needs the
+  `roll this store back` phrase even though its ancestry is clean — but the phrase is a
+  question put to you, not a proof, and an explicit forced pull still trusts the selected
+  remote snapshot. Protect backup integrity and read the named REPLACED files before
+  confirming a pull.
 - **SE/ECDH equivalence is validated in software.** The host-side half of the
   Secure Enclave ECDH (that `ECDH(eph_priv, se_pub)` equals the enclave's
   `ECDH(se_priv, eph_pub)`) is covered by a non-ignored software test. The **full
@@ -1737,8 +2141,11 @@ Specific residual risks:
 
 **Why Touch ID?**
 It is no longer just a UI gate — the Secure Enclave key is a cryptographic KEK.
-A read physically requires a present, authorized human to complete the
-Touch-ID-gated ECDH that unwraps the DEK. No biometric, no decryption.
+*Unwrapping* the DEK requires a present, authorized human to complete the
+Touch-ID-gated ECDH. No biometric, no unwrap. It bounds unwraps, not what the process
+does with a DEK it already unwrapped: see the two residuals — dyld injection and the
+unauthenticated `keyring.json` — under
+[Security Model & Residual Risks](#security-model--residual-risks).
 
 **What if I lose the master key?**
 There is no master key. The DEK is wrapped under multiple independent KEKs: your

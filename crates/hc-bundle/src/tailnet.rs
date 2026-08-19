@@ -11,14 +11,25 @@
 use err_mac::create_err_with_impls;
 use hashbrown::HashMap;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
-/// The CLI's name on `$PATH`.
-const BINARY: &str = "tailscale";
+/// Fixed macOS installation locations, preferred over executing a caller-controlled `$PATH`.
+const BINARIES: [&str; 3] = [
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/usr/local/bin/tailscale",
+];
 
-/// Where the macOS app keeps the same binary when it is not on `$PATH`.
-const APP_BINARY: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+/// A status response is already byte-bounded, but this separately bounds downstream sorting,
+/// matching and terminal rows. Config can enroll at most 64 of these nodes.
+const MAX_TAILNET_PEERS: usize = 1024;
+
+/// DNS names are at most 253 bytes; the extra two bytes leave room for a root dot and avoid
+/// silently accepting a non-hostname-sized display value from an external status document.
+const MAX_NODE_NAME_BYTES: usize = 255;
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -29,7 +40,8 @@ create_err_with_impls!(
     ;
     BinaryNotFound { searched: Vec<PathBuf> },
     StatusFailed { code: i32 },
-    BackendNotRunning { state: Backend }
+    BackendNotRunning { state: Backend },
+    TooManyPeers { found: usize, max: usize }
 );
 
 /// `BackendState` as tailscaled reports it. Only [`Backend::Running`] can answer for a tailnet;
@@ -85,40 +97,46 @@ impl Node {
     }
 }
 
-/// The `tailscale` binary: `$PATH` first, then the macOS app bundle. The error lists every
-/// place that was tried, because "install Tailscale" and "it is installed but not linked" are
-/// different problems with different fixes.
+/// The `tailscale` binary from a fixed installation location. A candidate must resolve to a
+/// regular executable that is not group/world writable; otherwise an environment or permissive
+/// file cannot turn discovery into arbitrary code execution inside the signing process.
 fn binary() -> Result<PathBuf, TailnetErr> {
     let mut searched = Vec::new();
-    if let Ok(path) = std::env::var("PATH") {
-        for entry in path.split(':') {
-            if entry.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(entry).join(BINARY);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-            searched.push(candidate);
+    for location in BINARIES {
+        let candidate = PathBuf::from(location);
+        searched.push(candidate.clone());
+        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode();
+        if metadata.file_type().is_file() && mode & 0o111 != 0 && mode & 0o022 == 0 {
+            return Ok(resolved);
         }
     }
-    let app = PathBuf::from(APP_BINARY);
-    if app.is_file() {
-        return Ok(app);
-    }
-    searched.push(app);
     Err(TailnetErr::BinaryNotFound { searched })
 }
 
 /// Every peer on this machine's tailnet, sorted by hostname. Neither stdout nor stderr is
 /// inherited, so a console that owns the terminal keeps owning it.
 pub fn peers() -> Result<Vec<Node>, TailnetErr> {
+    const MAX_STATUS_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_STATUS_ERROR_BYTES: u64 = 256 * 1024;
     let bin = binary()?;
-    let out = Command::new(&bin).args(["status", "--json"]).output()?;
+    let mut command = Command::new(&bin);
+    command.args(["status", "--json"]);
+    let out = hc_core::output_bounded_timeout(
+        &mut command,
+        MAX_STATUS_BYTES,
+        MAX_STATUS_ERROR_BYTES,
+        Duration::from_secs(15),
+    )?;
     if !out.status.success() {
         tracing::warn!(
             binary = %bin.display(),
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            stderr = %hc_core::safe_diagnostic(&out.stderr),
             "tailscale status failed"
         );
         return match out.status.code() {
@@ -171,20 +189,34 @@ fn backend(state: &str) -> Backend {
 /// `peer add` blames the wrong thing. The peer map is a JSON object and therefore unordered,
 /// so the result is sorted before it is returned.
 fn parse_status(json: &[u8]) -> Result<Vec<Node>, TailnetErr> {
-    let status: StatusJson = serde_json::from_slice(json)?;
+    let status: StatusJson = hc_core::wire::strict_json_from_slice(json)?;
     let state = backend(&status.backend_state);
     if state != Backend::Running {
         return Err(TailnetErr::BackendNotRunning { state });
     }
-    let mut out = Vec::new();
-    for node in status.peer.unwrap_or_default().into_values() {
+    let peers = status.peer.unwrap_or_default();
+    if peers.len() > MAX_TAILNET_PEERS {
+        return Err(TailnetErr::TooManyPeers {
+            found: peers.len(),
+            max: MAX_TAILNET_PEERS,
+        });
+    }
+    let mut out = Vec::with_capacity(peers.len());
+    for node in peers.into_values() {
         let trimmed = node.dns_name.trim_end_matches('.');
+        let dns_name = (!trimmed.is_empty()
+            && trimmed.len() <= MAX_NODE_NAME_BYTES
+            && hc_core::config::validate_ssh_target(trimmed).is_ok())
+        .then(|| trimmed.to_string());
+        let host_bytes =
+            &node.host_name.as_bytes()[..node.host_name.len().min(MAX_NODE_NAME_BYTES)];
+        let mut host_name = hc_core::safe_diagnostic(host_bytes);
+        if node.host_name.len() > MAX_NODE_NAME_BYTES {
+            host_name.push_str("...[truncated]");
+        }
         out.push(Node {
-            dns_name: match trimmed.is_empty() {
-                true => None,
-                false => Some(trimmed.to_string()),
-            },
-            host_name: node.host_name,
+            dns_name,
+            host_name,
             online: node.online,
         });
     }
@@ -262,5 +294,56 @@ mod tests {
                 other => panic!("expected a refusal for {state}, got {other:?}"),
             }
         }
+    }
+
+    /// Node metadata comes from outside this process and reaches both tracing and the interactive
+    /// console. Control/bidi bytes in a hostname must become inert ASCII, while a DNS name that
+    /// cannot safely be handed to ssh must never become an enrollable address.
+    #[test]
+    fn hostile_node_names_are_inert_and_cannot_become_ssh_targets() {
+        let json = br#"{
+          "BackendState": "Running",
+          "Peer": {
+            "nodekey:bad": {
+              "HostName": "line\n\u001b[31mred\u202e",
+              "DNSName": "not a shell-safe name.",
+              "Online": true
+            }
+          }
+        }"#;
+        let peers = parse_status(json).expect("the status document itself is valid");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].dns_name, None);
+        assert!(peers[0].host_name.is_ascii());
+        assert!(!peers[0].host_name.contains('\n'));
+        assert!(!peers[0].host_name.contains('\u{1b}'));
+        assert!(peers[0].host_name.contains("\\n"));
+    }
+
+    #[test]
+    fn a_status_document_cannot_publish_an_unbounded_peer_set() {
+        let mut peer = serde_json::Map::new();
+        for at in 0..=MAX_TAILNET_PEERS {
+            peer.insert(
+                format!("nodekey:{at}"),
+                serde_json::json!({
+                    "HostName": format!("node-{at}"),
+                    "DNSName": format!("node-{at}.example.ts.net."),
+                    "Online": true,
+                }),
+            );
+        }
+        let json = serde_json::to_vec(&serde_json::json!({
+            "BackendState": "Running",
+            "Peer": peer,
+        }))
+        .expect("render the status fixture");
+        assert!(matches!(
+            parse_status(&json),
+            Err(TailnetErr::TooManyPeers {
+                found,
+                max: MAX_TAILNET_PEERS,
+            }) if found == MAX_TAILNET_PEERS + 1
+        ));
     }
 }

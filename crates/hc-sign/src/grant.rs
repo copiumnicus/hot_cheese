@@ -16,15 +16,19 @@
 //! costs a re-run of `hot_cheese enroll grant`.
 use alloy_primitives::B256;
 use err_mac::create_err_with_impls;
+use hc_core::is_valid_key_name;
 use hc_core::mac::local_auth::LaContext;
 use hc_core::mac::secure_enclave::{grant_sign, SE_GRANT_KEY_LABEL};
 use p256::ecdsa::signature::Verifier;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 create_err_with_impls!(
     #[derive(Debug)]
     pub GrantErr,
     NoPinnedGrantKey,
+    InvalidName,
+    ClockOverflow,
     Hex(hex::FromHexError),
     Ecdsa(p256::ecdsa::Error),
     Se(hc_core::mac::secure_enclave::SeErr),
@@ -106,6 +110,12 @@ impl GrantTerms {
         out.push(MAX_SIGNATURES);
         out
     }
+
+    /// The grant's identity: SHA-256 of the canonical encoding, so one value states every term
+    /// the enclave signed and a caller can re-assert all of them at once.
+    pub fn digest(&self) -> B256 {
+        B256::from_slice(&Sha256::digest(self.canonical_bytes()))
+    }
 }
 
 /// Minted terms and the enclave's raw `r || s` over their canonical bytes.
@@ -114,21 +124,27 @@ pub struct Signed {
     signature: [u8; 64],
 }
 
-/// Proof that a live human approved exactly one payload, minted only by [`verify`]. Not
-/// `Clone`, not `Copy`, not serializable: `HotApi::sign` takes it by value and drops it.
+/// Proof that a live human approved exactly one payload, minted only by [`verify`]. It holds
+/// the WHOLE of what the enclave signed, so every term is re-assertable where the signature is
+/// taken. Not `Clone`, not `Copy`, not serializable: `HotApi::sign` takes it by value and drops
+/// it.
 pub struct SignGrant {
-    key_name: String,
-    intent_digest: B256,
+    terms: GrantTerms,
 }
 
 impl SignGrant {
     /// Keystore this grant authorizes, which must be the one being unlocked.
     pub fn key_name(&self) -> &str {
-        &self.key_name
+        &self.terms.key_name
     }
     /// The digest `sign` is allowed to sign, and the only one it does sign.
     pub fn intent_digest(&self) -> B256 {
-        self.intent_digest
+        self.terms.intent_digest
+    }
+    /// [`GrantTerms::digest`] of the terms the enclave signature covered: keystore, intent
+    /// digest, policy digest, manifest digest, kind, nonce and expiry together.
+    pub fn terms_digest(&self) -> B256 {
+        self.terms.digest()
     }
 }
 
@@ -139,6 +155,9 @@ impl SignGrant {
 /// shows a second sheet, and a machine with no usable biometric fails closed with
 /// [`hc_core::mac::secure_enclave::SeErr::TouchIdDenied`].
 pub fn mint(terms: GrantTerms, auth: Option<&LaContext>) -> Result<Signed, GrantErr> {
+    if !is_valid_key_name(&terms.key_name) {
+        return Err(GrantErr::InvalidName);
+    }
     let reason = format!(
         "Approve one hot_cheese signature for \"{}\" (intent {})",
         terms.key_name, terms.intent_digest
@@ -160,23 +179,25 @@ pub fn verify(signed: Signed, pinned_pub_hex: &str, now_ms: u64) -> Result<SignG
     let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&hex::decode(pinned_pub_hex)?)?;
     let signature = p256::ecdsa::Signature::from_slice(&signed.signature)?;
     verifying.verify(&signed.terms.canonical_bytes(), &signature)?;
-    if now_ms > signed.terms.expires_at_ms {
+    if now_ms >= signed.terms.expires_at_ms {
         return Err(GrantErr::Expired {
             now_ms,
             expires_at_ms: signed.terms.expires_at_ms,
         });
     }
     Ok(SignGrant {
-        key_name: signed.terms.key_name,
-        intent_digest: signed.terms.intent_digest,
+        terms: signed.terms,
     })
 }
 
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> Result<u64, GrantErr> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as u64)
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )
+    .map_err(|_| GrantErr::ClockOverflow)
 }
 
 /// Seconds since the Unix epoch. Every timestamp a status type publishes is this, so nothing
@@ -187,12 +208,20 @@ pub fn now_secs() -> Result<u64, GrantErr> {
         .as_secs())
 }
 
-/// A grant for the tests that exercise signing itself; it cannot exist in a real build.
-#[cfg(any(test, feature = "test-util"))]
-pub fn grant_for_test(key_name: &str, intent_digest: B256) -> SignGrant {
+/// A grant for the tests that exercise signing itself. `#[cfg(test)]` and not a cargo feature:
+/// a forgery primitive a dependent could switch on is a forgery primitive.
+#[cfg(test)]
+pub(crate) fn grant_for_test(key_name: &str, intent_digest: B256) -> SignGrant {
     SignGrant {
-        key_name: key_name.to_string(),
-        intent_digest,
+        terms: GrantTerms {
+            key_name: key_name.to_string(),
+            intent_digest,
+            policy_digest: B256::ZERO,
+            manifest_digest: B256::ZERO,
+            kind: IntentKind::SafeTx,
+            nonce: [0u8; 16],
+            expires_at_ms: 0,
+        },
     }
 }
 
@@ -237,7 +266,9 @@ mod tests {
 
     /// A grant is only proof if it verifies for the terms that were signed and nothing else:
     /// a signature lifted onto other terms, or one whose expiry has passed, must be refused
-    /// before any `SignGrant` exists.
+    /// before any `SignGrant` exists. What survives verification carries the WHOLE of what was
+    /// signed, so the policy digest, the manifest digest, the kind, the nonce and the expiry are
+    /// re-assertable where the key is reached and not just the two terms signing reads.
     #[test]
     fn verify_refuses_lifted_signatures_and_expired_terms() {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
@@ -255,6 +286,10 @@ mod tests {
         .expect("a fresh grant over its own terms verifies");
         assert_eq!(granted.key_name(), "TRADER");
         assert_eq!(granted.intent_digest(), B256::from([0x11u8; 32]));
+        assert_eq!(granted.terms_digest(), terms().digest());
+        let mut other_policy = terms();
+        other_policy.policy_digest = B256::from([0x99u8; 32]);
+        assert_ne!(granted.terms_digest(), other_policy.digest());
 
         let mut other = terms();
         other.intent_digest = B256::from([0x99u8; 32]);
@@ -277,7 +312,7 @@ mod tests {
                     terms: terms(),
                 },
                 &pin,
-                terms().expires_at_ms + 1,
+                terms().expires_at_ms,
             ),
             Err(GrantErr::Expired { .. })
         ));

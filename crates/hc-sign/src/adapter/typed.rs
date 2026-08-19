@@ -9,7 +9,7 @@
 //! Everything the digest depends on — the resolver, the domain, the struct name at every depth —
 //! is a function of the policy file. The message is coerced ONCE, and that single value is both
 //! what is hashed and what is rendered, so the digest signed is the digest read.
-use super::{annotate, call, Alarm, Raised};
+use super::{annotate, call, Alarm, Raised, Summary};
 use crate::intent::TypedDataIntent;
 use crate::policy::Policy;
 use crate::schema::{
@@ -267,10 +267,11 @@ impl TypedMessage<'_> {
         self.digest
     }
 
-    /// The human's only view of the message: the alarms first, worst-ranked first, then every
-    /// declared field with the operator's own name beside the value that was coerced — the same
-    /// value [`TypedMessage::digest`] was taken over.
-    pub fn summary(&self, key: &str, config: &Config) -> String {
+    /// The human's only view of the message: the alarms as their own block, worst-ranked first,
+    /// and every declared field with the operator's own name beside the value that was coerced —
+    /// the same value [`TypedMessage::digest`] was taken over. The domain is printed in full,
+    /// `salt` included: everything inside the digest a human is asked to approve is visible.
+    pub fn summary(&self, key: &str, config: &Config) -> Summary {
         let chain_id = self.schema.domain.chain_id;
         let mut raised = vec![Raised {
             alarm: Alarm::TypedMessage,
@@ -290,23 +291,37 @@ impl TypedMessage<'_> {
         }
         raised.sort_by_key(|r| r.alarm.rank());
 
-        let mut out = String::new();
+        let mut alarms = Vec::with_capacity(raised.len());
         for one in &raised {
-            out.push_str(&one.alarm.line(&one.at, chain_id, config));
-            out.push('\n');
+            alarms.push(one.alarm.line(&one.at, chain_id, config));
         }
-        out.push_str(&self.schema.primary_type);
-        self.fields(&mut out, &self.schema.primary_type, &self.value, 1, config);
-        out.push_str(&format!(
+
+        let mut body = self.schema.primary_type.clone();
+        self.fields(&mut body, &self.schema.primary_type, &self.value, 1, config);
+        body.push_str(&format!(
             "\n  schema={schema} domain={domain} version={version} chain={chain}\n  \
-             verifyingContract={contract}\n  key={key}",
+             verifyingContract={contract}{salt}\n  key={key}",
             schema = self.schema.schema,
-            domain = self.domain.name.as_deref().unwrap_or("<none>"),
-            version = self.domain.version.as_deref().unwrap_or("<none>"),
+            domain = self
+                .domain
+                .name
+                .as_deref()
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "<none>".to_string()),
+            version = self
+                .domain
+                .version
+                .as_deref()
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "<none>".to_string()),
             chain = chain_id,
             contract = annotate::address(self.schema.domain.verifying_contract, chain_id, config),
+            salt = match self.domain.salt {
+                Some(salt) => format!("\n  salt={salt}"),
+                None => String::new(),
+            },
         ));
-        out
+        Summary { alarms, body }
     }
 
     /// Every declared field of `name`, in declaration order, indented under its struct. The
@@ -578,9 +593,10 @@ mod tests {
         let salt = format!("0x{}", "11".repeat(32));
         let admitted =
             admit(&intent(message("1000000", &salt)), &p, NOW).expect("the message must admit");
-        let text = admitted.summary("TREASURY", &plain());
+        let summary = admitted.summary("TREASURY", &plain());
+        let text = summary.to_string();
         assert!(text.starts_with("\u{26a0} UNBOUNDED FIELD"), "{text}");
-        assert!(text.contains("[details.salt]"), "{text}");
+        assert!(summary.head(1).contains("[details.salt]"), "{text}");
         assert!(text.contains("\u{26a0} TYPED MESSAGE"), "{text}");
         assert!(text.contains("PermitSingle"), "{text}");
         assert!(text.contains("details = PermitDetails"), "{text}");
@@ -590,5 +606,36 @@ mod tests {
         assert!(text.contains("schema=permit2_usdc"), "{text}");
         assert!(text.contains("key=TREASURY"), "{text}");
         assert!(text.contains(&CONTRACT.to_string()), "{text}");
+    }
+
+    /// The domain `salt` is inside the digest, so it is on the sheet: a message whose schema
+    /// declares one renders it in full, and the two domains that differ only in `salt` are two
+    /// different digests a human must be able to tell apart.
+    #[test]
+    fn a_declared_domain_salt_is_shown_with_the_message() {
+        let value = format!("0x{}", "33".repeat(32));
+        let text = format!(
+            "safe = \"0x1111111111111111111111111111111111111111\"\nchain_id = 1\n\n{}",
+            SCHEMA.replace(
+                "  chain_id = 1\n",
+                &format!("  chain_id = 1\n  salt = \"{value}\"\n"),
+            )
+        );
+        let salted: Policy = toml::from_str(&text).expect("the salted schema must load");
+        crate::schema::check_schemas(&salted.typed_data).expect("the salted schema must check");
+
+        let body = message("1000000", &format!("0x{}", "11".repeat(32)));
+        let admitted =
+            admit(&intent(body.clone()), &salted, NOW).expect("the salted message must admit");
+        let shown = admitted.summary("TREASURY", &plain()).to_string();
+        assert!(shown.contains(&format!("salt={value}")), "{shown}");
+
+        let plainly = policy();
+        let unsalted = admit(&intent(body), &plainly, NOW).expect("the message must admit");
+        assert_ne!(admitted.digest(), unsalted.digest());
+        assert!(!unsalted
+            .summary("TREASURY", &plain())
+            .to_string()
+            .contains("\n  salt="));
     }
 }

@@ -103,6 +103,49 @@ pub struct TypedTx<'p> {
     root: TypedCall<'p>,
 }
 
+/// The human's whole view of one payload, in two parts so that no renderer can print it and
+/// lose the half that matters. The alarms are not leading lines of a string a terminal may
+/// scroll away or a prompt may cut: they are their own field, and [`Summary::head`] is how a
+/// surface with room for a few lines gets the worst of them rather than the first of the body.
+pub struct Summary {
+    /// Every alarm this payload raises, worst first, one line each.
+    pub alarms: Vec<String>,
+    /// The decoded call, then the transaction's own fields.
+    pub body: String,
+}
+
+impl Summary {
+    /// The worst `lines` alarms, and a line counting the ones this does not show.
+    pub fn head(&self, lines: usize) -> String {
+        let mut out = String::new();
+        for alarm in self.alarms.iter().take(lines) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(alarm);
+        }
+        let dropped = self.alarms.len().saturating_sub(lines);
+        if dropped > 0 {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "\u{26a0} {dropped} MORE: alarms not shown here, read the whole summary"
+            ));
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for Summary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for alarm in &self.alarms {
+            writeln!(f, "{alarm}")?;
+        }
+        write!(f, "{}", self.body)
+    }
+}
+
 /// Rebuild the Safe EIP-712 `safeTxHash` from the submitted fields.
 pub fn safe_tx_hash(i: &SafeTxIntent) -> B256 {
     let t = SafeTx {
@@ -156,7 +199,7 @@ fn admit_site<'p>(
         to: site.to,
         source: Box::new(source),
     })?;
-    if let Some(grant) = grant {
+    let granted = if let Some(grant) = grant {
         let granted = match_call(&grant.calls, &site).map_err(|source| AdapterErr::NotGranted {
             at: site.at.clone(),
             to: site.to,
@@ -170,7 +213,10 @@ fn admit_site<'p>(
                 grant: granted.signature.canonical().to_string(),
             });
         }
-    }
+        Some(granted)
+    } else {
+        None
+    };
 
     let refused = || {
         Box::new(Refused {
@@ -182,14 +228,12 @@ fn admit_site<'p>(
         })
     };
     let region = &site.data[4..];
-    let args = rule
-        .signature
-        .function()
-        .abi_decode_input(region, true)
-        .map_err(|source| AdapterErr::ArgumentsNotDecodable {
+    let args = rule.signature.decode_input(region).map_err(|source| {
+        AdapterErr::ArgumentsNotDecodable {
             call: refused(),
             source: Box::new(source),
-        })?;
+        }
+    })?;
     if rule.signature.function().abi_encode_input_raw(&args)? != region {
         return Err(AdapterErr::EncodingNotCanonical { call: refused() });
     }
@@ -211,6 +255,27 @@ fn admit_site<'p>(
                 signature: rule.signature.canonical().to_string(),
                 source: Box::new(source),
             })?;
+    }
+    if let Some(granted) = granted {
+        let mut grant_walk = FieldWalk::new(now_secs, &[]);
+        for (at, value) in args.iter().enumerate() {
+            let Some(arg) = granted.at(at) else {
+                return Err(AdapterErr::ArgUnruled {
+                    at: site.at.clone(),
+                    to: site.to,
+                    signature: granted.signature.canonical().to_string(),
+                    arg: at,
+                });
+            };
+            grant_walk
+                .field(&arg.name, &arg.rule, value)
+                .map_err(|source| AdapterErr::Field {
+                    at: site.at.clone(),
+                    to: site.to,
+                    signature: granted.signature.canonical().to_string(),
+                    source: Box::new(source),
+                })?;
+        }
     }
 
     let body = match rule.signature.canonical() == MULTI_SEND {
@@ -263,15 +328,15 @@ impl TypedTx<'_> {
     }
 
     /// The human's only view of what they are signing: every [`Alarm`] this payload raises,
-    /// worst first, then the decoded call, then destination/value/operation/nonce, Safe and
-    /// chain, and the gas-refund fields. The alarms lead because an approval sheet gets the head
-    /// of this text, never the tail, and they are sorted by [`Alarm::rank`] with a stable sort so
-    /// equal ranks keep the order they were found in and one payload always renders one way. The
-    /// sub-calls of a `multiSend` raise their alarms into that same block, so an `enableModule`
-    /// buried at entry 30 competes for the head of the text on rank rather than on position.
-    /// `config` supplies names and decimals only: with empty tables this renders the same bytes
-    /// it rendered before there were tables.
-    pub fn summary(&self, config: &Config) -> String {
+    /// worst first, and separately the decoded call, then destination/value/operation/nonce,
+    /// Safe and chain, and the gas-refund fields. The alarms are their own part of the
+    /// [`Summary`] because an approval surface gets the head of this text and never the tail;
+    /// they are sorted by [`Alarm::rank`] with a stable sort so equal ranks keep the order they
+    /// were found in and one payload always renders one way. The sub-calls of a `multiSend`
+    /// raise their alarms into that same block, so an `enableModule` buried at entry 30 competes
+    /// for the head on rank rather than on position. `config` supplies names and decimals only:
+    /// with empty tables this renders the same bytes it rendered before there were tables.
+    pub fn summary(&self, config: &Config) -> Summary {
         let i = &self.intent;
         let mut flat = Vec::new();
         self.root.flatten(&mut flat);
@@ -305,23 +370,20 @@ impl TypedTx<'_> {
             base_gas = i.base_gas,
             safe_tx_gas = i.safe_tx_gas,
         );
-        let mut out = String::new();
-        for alarm in &raised {
-            out.push_str(&alarm.alarm.line(&alarm.at, i.chain_id, config));
-            out.push('\n');
+        let mut alarms = Vec::with_capacity(raised.len());
+        for one in &raised {
+            alarms.push(one.alarm.line(&one.at, i.chain_id, config));
         }
-        out.push_str(&body);
-        out
+        Summary { alarms, body }
     }
 }
 
 /// What a payload does that nothing else in the system constrains.
 ///
 /// The policy has already pinned the destination, the signature, the operation, the native value
-/// and every argument by the time a human sees any of this, so the ranking below is by what is
-/// LEFT free once it has: unknown code running as the Safe first, then whatever the policy
-/// declared unbounded, then the Safe's own configuration, and last the shapes the policy bounds
-/// tightly on its own.
+/// and every argument by the time a human sees any of this. The sheet shows only three lines, so
+/// permanent control-plane changes rank before generic looseness: unknown code running as the
+/// Safe first, then module/guard/fallback and owner changes, then opaque or otherwise loose data.
 enum Alarm {
     /// Named code, still running with the Safe's storage and balances.
     DelegatecallDecoded {
@@ -344,15 +406,15 @@ enum Alarm {
         /// The packed payload they were read from.
         payload: Bytes,
     },
-    /// A module, guard or fallback handler of the Safe changes.
+    /// A module, guard or fallback handler changes.
     ModuleGuardFallback {
-        /// The Safe whose configuration changes.
-        safe: Address,
+        /// The contract this call is aimed at, whose configuration changes.
+        to: Address,
     },
     /// The owner set or threshold changes.
     OwnerRotation {
-        /// The Safe whose owners change.
-        safe: Address,
+        /// The contract this call is aimed at, whose owners change.
+        to: Address,
     },
     /// Any other decoded call against the Safe itself.
     SelfCall {
@@ -393,15 +455,15 @@ impl Alarm {
     fn rank(&self) -> u8 {
         match self {
             Alarm::DelegatecallDecoded { .. } => 1,
-            Alarm::UnboundedField { .. } => 2,
-            Alarm::TypedMessage => 3,
-            Alarm::Batch { .. } => 4,
-            Alarm::ModuleGuardFallback { .. } => 5,
-            Alarm::OwnerRotation { .. } => 6,
-            Alarm::SelfCall { .. } => 7,
-            Alarm::OpaqueHash => 8,
+            Alarm::ModuleGuardFallback { .. } => 2,
+            Alarm::OwnerRotation { .. } => 3,
+            Alarm::OpaqueHash => 4,
+            Alarm::SelfCall { .. } => 5,
+            Alarm::UnboundedField { .. } => 6,
+            Alarm::TypedMessage => 7,
+            Alarm::Refund { .. } => 8,
             Alarm::DeadlineFar { .. } => 9,
-            Alarm::Refund { .. } => 10,
+            Alarm::Batch { .. } => 10,
         }
     }
 
@@ -431,14 +493,14 @@ impl Alarm {
                 bytes = payload.len(),
                 digest = hex::encode(Sha256::digest(payload)),
             ),
-            Alarm::ModuleGuardFallback { safe } => format!(
+            Alarm::ModuleGuardFallback { to } => format!(
                 "\u{26a0} SAFE CONFIG{at}: a module, guard or fallback handler of {} changes; the \
                  new address controls it permanently",
-                who(*safe)
+                who(*to)
             ),
-            Alarm::OwnerRotation { safe } => format!(
+            Alarm::OwnerRotation { to } => format!(
                 "\u{26a0} OWNER ROTATION{at}: the owner set or threshold of {} changes",
-                who(*safe)
+                who(*to)
             ),
             Alarm::SelfCall { safe } => format!(
                 "\u{26a0} SELF-CALL{at}: this transaction calls {} itself",
@@ -499,10 +561,10 @@ fn alarms(i: &SafeTxIntent, call: &TypedCall) -> Vec<Alarm> {
         });
     }
     if safe_config {
-        out.push(Alarm::ModuleGuardFallback { safe: i.safe });
+        out.push(Alarm::ModuleGuardFallback { to: call.site.to });
     }
     if rotation {
-        out.push(Alarm::OwnerRotation { safe: i.safe });
+        out.push(Alarm::OwnerRotation { to: call.site.to });
     }
     if call.site.to == i.safe && !rotation && !safe_config && !opaque {
         out.push(Alarm::SelfCall { safe: i.safe });
@@ -524,6 +586,8 @@ fn alarms(i: &SafeTxIntent, call: &TypedCall) -> Vec<Alarm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grant::IntentKind;
+    use crate::manifest::Grant;
     use crate::policy::{AllowRule, OwnerMgmt};
     use crate::schema::{unbounded_call, ArgRule, CallRule, FieldRule, Signature};
     use alloy_primitives::Bytes;
@@ -650,14 +714,14 @@ mod tests {
             .expect("a config with no annotation tables")
     }
 
-    pub(crate) fn shown(i: &SafeTxIntent, policy: &Policy) -> String {
+    pub(crate) fn summarized(i: &SafeTxIntent, policy: &Policy) -> Summary {
         admit(i.clone(), policy, None, 0)
             .expect("the fixture must admit")
             .summary(&plain())
     }
 
-    fn sheet(summary: &str) -> String {
-        summary.lines().take(3).collect::<Vec<_>>().join("\n")
+    pub(crate) fn shown(i: &SafeTxIntent, policy: &Policy) -> String {
+        summarized(i, policy).to_string()
     }
 
     /// The alloy `sol!`-derived SafeTx/domain typehashes must reproduce the canonical Safe
@@ -673,13 +737,13 @@ mod tests {
         };
 
         let type_hash = keccak256(
-            b"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)".to_vec(),
+            b"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)",
         );
         let mut enc = Vec::new();
         enc.extend_from_slice(&type_hash);
         enc.extend_from_slice(&addr_word(i.to));
         enc.extend_from_slice(&u256_word(i.value));
-        enc.extend_from_slice(&keccak256(i.data.to_vec()));
+        enc.extend_from_slice(&keccak256(&i.data));
         enc.extend_from_slice(&u256_word(U256::from(i.operation.as_u8())));
         enc.extend_from_slice(&u256_word(i.safe_tx_gas));
         enc.extend_from_slice(&u256_word(i.base_gas));
@@ -689,8 +753,7 @@ mod tests {
         enc.extend_from_slice(&u256_word(i.nonce));
         let struct_hash = keccak256(enc);
 
-        let domain_type =
-            keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)".to_vec());
+        let domain_type = keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
         let mut denc = Vec::new();
         denc.extend_from_slice(&domain_type);
         denc.extend_from_slice(&u256_word(i.chain_id));
@@ -927,7 +990,84 @@ mod tests {
         ));
     }
 
-    /// The approval sheet is three lines, so the ranking of the alarm block decides what the
+    #[test]
+    fn an_adapter_grants_argument_bounds_are_enforced_at_request_time() {
+        let policy = policy_with(vec![rule_at(
+            TOKEN,
+            Operation::Call,
+            vec![bounded(
+                "transfer(address,uint256)",
+                vec![
+                    (
+                        0,
+                        "to",
+                        FieldRule::OneOf {
+                            addresses: vec![VENDOR, ATTACKER],
+                        },
+                    ),
+                    (
+                        1,
+                        "amount",
+                        FieldRule::Max {
+                            max: U256::from(1_000u64),
+                            amount_of: TOKEN,
+                        },
+                    ),
+                ],
+            )],
+        )]);
+        let grant = Grant {
+            key: "trader".to_string(),
+            intent_kinds: vec![IntentKind::SafeTx],
+            chain_ids: vec![U256::from(1u64)],
+            safes: vec![SAFE],
+            calls: vec![rule_at(
+                TOKEN,
+                Operation::Call,
+                vec![bounded(
+                    "transfer(address,uint256)",
+                    vec![
+                        (
+                            0,
+                            "recipient",
+                            FieldRule::OneOf {
+                                addresses: vec![VENDOR],
+                            },
+                        ),
+                        (
+                            1,
+                            "amount",
+                            FieldRule::Max {
+                                max: U256::from(100u64),
+                                amount_of: TOKEN,
+                            },
+                        ),
+                    ],
+                )],
+            )],
+            typed_data: Vec::new(),
+            refunds: None,
+        };
+        let mut intent = base_intent();
+        intent.data = transfer_data(VENDOR, U256::from(100u64));
+        assert!(admit(intent.clone(), &policy, Some(&grant), 0).is_ok());
+
+        intent.data = transfer_data(ATTACKER, U256::from(1u64));
+        assert!(matches!(
+            admit(intent.clone(), &policy, Some(&grant), 0),
+            Err(AdapterErr::Field { source, .. })
+                if matches!(*source, FieldDenied::AddressNotAllowed { .. })
+        ));
+
+        intent.data = transfer_data(VENDOR, U256::from(101u64));
+        assert!(matches!(
+            admit(intent, &policy, Some(&grant), 0),
+            Err(AdapterErr::Field { source, .. })
+                if matches!(*source, FieldDenied::ValueTooHigh { .. })
+        ));
+    }
+
+    /// The approval sheet is a few lines, so the ranking of the alarm block decides what the
     /// human actually reads: a field the policy left unbounded must outrank a refund, which is
     /// denied outright without an opt-in and then bounded by two allow-lists and three ceilings.
     /// With every argument bounded, the refund leads on its own.
@@ -945,7 +1085,7 @@ mod tests {
         );
         i.gas_price = U256::from(7u64);
         i.refund_receiver = ATTACKER;
-        let shown_free = sheet(&shown(&i, &free));
+        let shown_free = summarized(&i, &free).head(3);
         let unbounded = shown_free
             .find("\u{26a0} UNBOUNDED FIELD")
             .expect("the unbounded argument is on the sheet");
@@ -958,6 +1098,46 @@ mod tests {
         only_refund.data = transfer_data(VENDOR, U256::from(1u64));
         only_refund.gas_price = U256::from(7u64);
         assert!(shown(&only_refund, &token_policy()).starts_with("\u{26a0} REFUND"));
+    }
+
+    /// A summary keeps its alarms as their own part, so a surface with room for three lines
+    /// prints the three WORST alarms and says how many it is not showing — rather than the first
+    /// three lines of a text whose tail is where the alarms would be. The body is never in that
+    /// head, and everything raised is still in the whole sheet.
+    #[test]
+    fn a_short_surface_gets_the_worst_alarms_and_a_count_of_the_rest() {
+        let free = policy_with(vec![rule_at(
+            TOKEN,
+            Operation::Call,
+            vec![unbounded_call(
+                "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+            )],
+        )]);
+        let mut i = base_intent();
+        i.data = calldata(
+            "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+            &[
+                addr_word(VENDOR),
+                addr_word(ATTACKER),
+                u256_word(U256::from(1u64)),
+                u256_word(U256::from(2u64)),
+                u256_word(U256::from(3u64)),
+                [0x01u8; 32],
+                [0x02u8; 32],
+            ],
+        );
+        i.gas_price = U256::from(7u64);
+        let summary = summarized(&i, &free);
+        assert_eq!(summary.alarms.len(), 8, "{summary}");
+
+        let head = summary.head(3);
+        assert_eq!(head.lines().count(), 4, "{head}");
+        assert!(head.ends_with("\u{26a0} 5 MORE: alarms not shown here, read the whole summary"));
+        for line in head.lines() {
+            assert!(line.starts_with('\u{26a0}'), "{head}");
+        }
+        assert!(!head.contains("nonce="), "{head}");
+        assert!(summary.to_string().contains("nonce="), "{summary}");
     }
 
     /// A batch's alarms compete for the head of the sheet on rank rather than on position, and
@@ -993,15 +1173,21 @@ mod tests {
         i.to = LIB;
         i.operation = Operation::Delegatecall;
         i.data = batch::multi_send(&entries);
-        let listed = shown(&i, &p);
-        assert!(listed.contains("\u{26a0} SAFE CONFIG [2]"), "{listed}");
+        let summary = summarized(&i, &p);
+        let listed = summary.to_string();
         assert!(listed.contains("2 sub-calls"), "{listed}");
         assert!(
             listed.contains(&format!("enableModule(a0={MODULE})")),
             "{listed}"
         );
-        let sheet = sheet(&listed);
+        let sheet = summary.head(3);
         assert!(sheet.starts_with("\u{26a0} DELEGATECALL"), "{sheet}");
-        assert!(sheet.contains("\u{26a0} SAFE CONFIG [2]"), "{sheet}");
+        assert!(
+            sheet.contains(&format!(
+                "\u{26a0} SAFE CONFIG [2]: a module, guard or fallback \
+                 handler of {REGISTRY} changes"
+            )),
+            "the alarm must name the contract the call is actually aimed at: {sheet}"
+        );
     }
 }

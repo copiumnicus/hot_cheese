@@ -24,7 +24,8 @@
 //! Extending it: a new supported transaction shape gets its OWN tool with its own constrained
 //! arguments. Never widen one of these, and never add a generic escape hatch — an escape hatch
 //! would put the whole surface back.
-use crate::proposal::{slot_held, Proposal};
+use crate::limits::{place_nonce, NonceWindow, Session};
+use crate::proposal::{self, Proposal};
 use crate::McpErr;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -32,6 +33,7 @@ use err_mac::create_err_with_impls;
 use hc_bundle::sync::SyncMode;
 use hc_bundle::Safes;
 use hc_core::config::Config;
+use hc_core::is_valid_key_name;
 use hc_sign::adapter;
 use hc_sign::intent::{Operation, SafeTxIntent};
 use hc_sign::policy::Policy;
@@ -51,6 +53,14 @@ create_err_with_impls!(
     Tool(McpErr)
     ;
 );
+
+/// A config this server cannot read or trust refuses the tool the way any other library failure
+/// does: the model reads which rule refused, never a JSON-RPC error that would abort its turn.
+impl From<hc_core::config::ConfigErr> for CallErr {
+    fn from(source: hc_core::config::ConfigErr) -> Self {
+        Self::Tool(McpErr::Config(source))
+    }
+}
 
 /// What an agent may ask for. A name this enum does not carry is a `-32601`, never a silent
 /// no-op, and only [`Tool::ProposeErc20Transfer`] writes anything.
@@ -79,17 +89,45 @@ impl Tool {
     /// Deserialize this tool's arguments, then run it. The parse is the whole boundary: what
     /// fails here is a malformed call the model must fix, and what fails inside is a refusal
     /// the model can correct and retry.
-    pub fn call(self, arguments: Value) -> Result<Value, CallErr> {
+    ///
+    /// Four of these six take the exclusive claim on the bundle tree, and the operator's own CLI
+    /// takes the same try-lock and fails outright when it loses. So each of the four charges the
+    /// session's cooldown first, after the parse and immediately before the claim: a malformed
+    /// call never reaches the tree, never reaches the config and so never costs anything, and a
+    /// well-formed one cannot be spun fast enough to decide whether a human can run a command.
+    pub fn call(self, session: &mut Session, arguments: Value) -> Result<Value, CallErr> {
         Ok(match self {
-            Tool::ListSafes => list_safes()?,
-            Tool::ListSigningKeys => list_signing_keys()?,
-            Tool::ListBundles => list_bundles()?,
-            Tool::BundleStatus => bundle_status(serde_json::from_value(arguments)?)?,
+            Tool::ListSafes => {
+                require_no_arguments(arguments)?;
+                list_safes()?
+            }
+            Tool::ListSigningKeys => {
+                require_no_arguments(arguments)?;
+                list_signing_keys(&Config::load()?)?
+            }
+            Tool::ListBundles => {
+                require_no_arguments(arguments)?;
+                session.claim_lock(Config::load()?.mcp())?;
+                list_bundles()?
+            }
+            Tool::BundleStatus => {
+                let arg = serde_json::from_value(arguments)?;
+                let config = Config::load()?;
+                session.claim_lock(config.mcp())?;
+                bundle_status(&config, arg)?
+            }
             Tool::PreviewErc20Transfer => {
-                preview_erc20_transfer(serde_json::from_value(arguments)?)?
+                let transfer = serde_json::from_value(arguments)?;
+                let config = Config::load()?;
+                session.claim_lock(config.mcp())?;
+                preview_erc20_transfer(&config, transfer)?
             }
             Tool::ProposeErc20Transfer => {
-                propose_erc20_transfer(serde_json::from_value(arguments)?)?
+                let transfer = serde_json::from_value(arguments)?;
+                let config = Config::load()?;
+                session.claim_lock(config.mcp())?;
+                session.claim_proposal(config.mcp())?;
+                propose_erc20_transfer(&config, transfer)?
             }
         })
     }
@@ -128,16 +166,27 @@ impl Tool {
             }),
             Tool::PreviewErc20Transfer => json!({
                 "name": "preview_erc20_transfer",
-                "description": "Judge one ERC-20 transfer and write NOTHING: returns the safeTxHash owners would sign, the decoded summary, whether the key's policy allows it (or the exact typed refusal with the offending values), whether the Safe is known here, and whether the nonce is already claimed. Call this before propose_erc20_transfer; it costs the operator nothing.",
+                "description": "Judge one ERC-20 transfer and write NOTHING: returns the safeTxHash owners would sign, the decoded summary, the name of the policy rule that refuses it if one does, whether the Safe is known here, where the nonce sits against the anchor the operator's queue is measured from, and whether that nonce is already claimed. A refusal names the rule and never what the rule contains; the operator's own log gets the full detail. Call this before propose_erc20_transfer as often as you like: it writes nothing and spends none of your proposal allowance.",
                 "inputSchema": erc20_transfer_schema(),
             }),
             Tool::ProposeErc20Transfer => json!({
                 "name": "propose_erc20_transfer",
-                "description": "File one ERC-20 transfer into the operator's review queue: the Safe calls transfer(recipient, amount) on token. This is the ONLY transaction shape this server can express and the only verb here that writes. THIS DOES NOT SIGN AND CANNOT SIGN. It runs the same policy check the signer runs and, only if that passes, writes an unsigned bundle and pushes it to the co-signing machines. A human then reads the decoded summary and approves with Touch ID; nothing reachable from here can do that for them. The server builds the calldata itself, sends no native currency, uses a plain CALL and never a delegatecall, and zeroes every gas-refund field — so no other transaction can be described through this tool at all. A refusal comes back as a tool error naming what was wrong, so you can correct it and retry; a refused proposal writes nothing at all.",
+                "description": "File one ERC-20 transfer into the operator's review queue: the Safe calls transfer(recipient, amount) on token. This is the ONLY transaction shape this server can express and the only verb here that writes. THIS DOES NOT SIGN AND CANNOT SIGN. It runs the same policy check the signer runs and, only if that passes, writes an unsigned bundle and pushes it to the co-signing machines. A human then reads the decoded summary and approves with Touch ID; nothing reachable from here can do that for them. The server builds the calldata itself, sends no native currency, uses a plain CALL and never a delegatecall, and zeroes every gas-refund field — so no other transaction can be described through this tool at all. A refusal comes back as a tool error naming which rule refused, so you can correct it and retry; a refused proposal writes nothing at all, and it still spends one of your hourly proposals, so iterate with preview_erc20_transfer instead. The nonce must sit inside the window above the anchor preview_erc20_transfer reports.",
                 "inputSchema": erc20_transfer_schema(),
             }),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoArguments {}
+
+fn require_no_arguments(arguments: Value) -> Result<(), serde_json::Error> {
+    if arguments.is_null() {
+        return Ok(());
+    }
+    serde_json::from_value::<NoArguments>(arguments).map(|_| ())
 }
 
 /// The published surface: every tool, its description, and its JSON Schema.
@@ -189,7 +238,7 @@ fn erc20_transfer_schema() -> Value {
             },
             "nonce": {
                 "type": ["string", "integer"],
-                "description": "The Safe's own nonce. hot_cheese has no RPC client and cannot read it from the chain, so you must supply it: call list_bundles and take a nonce no slot has claimed. Two proposals under one nonce are mutually exclusive and one of them will be wasted.",
+                "description": "The Safe's own nonce. hot_cheese has no RPC client and cannot read it from the chain, so you must supply it: call list_bundles and take a nonce no slot has claimed. Two proposals under one nonce are mutually exclusive and one of them will be wasted. It is also bounded — a nonce more than the configured window above the anchor is refused, because an approval that far ahead executes at a time and in an order the operator did not agree to. preview_erc20_transfer reports the anchor and the window.",
             },
         },
     })
@@ -223,7 +272,7 @@ impl Erc20Transfer {
     /// do not carry is fixed here rather than defaulted, which is what makes the shapes this
     /// server cannot express unreachable instead of merely unset.
     fn intent(self) -> Result<SafeTxIntent, McpErr> {
-        if !hc_core::is_valid_string_name(&self.key) {
+        if !is_valid_key_name(&self.key) {
             return Err(McpErr::InvalidKeyName { key: self.key });
         }
         let data = Erc20::transferCall {
@@ -294,15 +343,20 @@ struct KeyView {
     refunds_configured: bool,
 }
 
-/// One bundle in a slot.
+/// One bundle in a slot, counted against the LOCAL `safes.toml` rather than against the
+/// threshold the bundle file states: that file is written by peers, so believing its threshold
+/// would let one of them decide what the operator is told about how close a bundle is.
 #[derive(Serialize)]
 struct BundleView {
     hash: B256,
     /// The local keystore the bundle names; a device may rebind it when it signs.
     key: String,
     signatures: usize,
+    /// Signatures `safes.toml` requires today.
     threshold: u8,
     met: bool,
+    /// The threshold the bundle file claims, only when it disagrees with the local one.
+    stated: Option<u8>,
     created_at_ms: u64,
 }
 
@@ -346,11 +400,11 @@ struct StatusView {
     summary: SummaryView,
     intent: SafeTxIntent,
     signers: Vec<Address>,
+    /// Signatures `safes.toml` requires today.
     threshold: u8,
-    /// What `safes.toml` states today; a difference means the Safe changed under the bundle.
-    safes_threshold: u8,
+    /// The threshold the bundle file claims, only when it disagrees with the local one.
+    stated: Option<u8>,
     met: bool,
-    not_owners: Vec<Address>,
     missing: Vec<Address>,
     rivals: Vec<B256>,
     age_ms: u64,
@@ -361,9 +415,9 @@ struct StatusView {
 #[serde(tag = "verdict", rename_all = "snake_case")]
 enum Verdict {
     Allowed,
-    /// The typed refusal, carrying the values that caused it.
+    /// Which rule refused, and nothing that rule holds.
     Denied {
-        denial: String,
+        rule: String,
     },
 }
 
@@ -376,6 +430,8 @@ struct PreviewView {
     policy: Verdict,
     /// Whether `safes.toml` describes this (Safe, chain); an unknown one cannot be filed.
     safe_known: bool,
+    /// Where the nonce sits against the anchor, and whether `propose` will accept it.
+    nonce: NonceWindow,
     /// Digests already claiming this (Safe, chain, nonce). Non-empty means pick another nonce.
     slot_taken: Vec<B256>,
 }
@@ -385,6 +441,8 @@ struct PreviewView {
 struct ProposedView {
     hash: B256,
     summary: String,
+    /// Where the filed nonce sits against the anchor, which is also what the operator's log says.
+    nonce: NonceWindow,
 }
 
 /// The canonical signatures of one destination's rules, which is the text an operator writes
@@ -412,16 +470,41 @@ fn list_safes() -> Result<Value, McpErr> {
 
 /// Every `<store>/policies/*.toml`, ascending by name. A policy that will not load is skipped
 /// LOUDLY rather than taking the listing down with it, the way a bundle directory is.
-fn list_signing_keys() -> Result<Value, McpErr> {
-    let store = Config::load()?.store_path();
+fn list_signing_keys(config: &Config) -> Result<Value, McpErr> {
+    let store = config.store_path();
     let dir = store.join("policies");
     let mut names = Vec::new();
     if dir.is_dir() {
-        for entry in std::fs::read_dir(&dir)? {
-            let file = entry?.file_name().to_string_lossy().to_string();
+        for (at, entry) in std::fs::read_dir(&dir)?.enumerate() {
+            if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "policy directory has too many entries",
+                )
+                .into());
+            }
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file = entry.file_name().to_string_lossy().to_string();
             let Some(name) = file.strip_suffix(".toml") else {
                 continue;
             };
+            if !is_valid_key_name(name) {
+                tracing::warn!(
+                    file = %hc_core::safe_diagnostic_text(&file),
+                    "skipping a policy with an invalid key name"
+                );
+                continue;
+            }
+            if names.len() >= hc_core::MAX_STORE_FILES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "policy directory has too many signing keys",
+                )
+                .into());
+            }
             names.push(name.to_string());
         }
     }
@@ -432,7 +515,11 @@ fn list_signing_keys() -> Result<Value, McpErr> {
         let policy = match Policy::load(&store, &name) {
             Ok(loaded) => loaded.policy,
             Err(e) => {
-                tracing::warn!(%name, error = %e, "skipping a policy that will not load");
+                tracing::warn!(
+                    %name,
+                    error = %hc_core::safe_diagnostic_text(&e.to_string()),
+                    "skipping a policy that will not load"
+                );
                 continue;
             }
         };
@@ -469,9 +556,10 @@ fn list_bundles() -> Result<Value, McpErr> {
             bundles.push(BundleView {
                 hash: one.hash,
                 key: one.bundle.intent.key.clone(),
-                signatures: one.bundle.signatures.len(),
-                threshold: one.bundle.threshold,
-                met: one.bundle.met(),
+                signatures: one.quorum.have,
+                threshold: one.quorum.threshold,
+                met: one.quorum.met,
+                stated: one.quorum.stated,
                 created_at_ms: one.bundle.created_at_ms,
             });
         }
@@ -486,87 +574,114 @@ fn list_bundles() -> Result<Value, McpErr> {
     Ok(serde_json::to_value(out)?)
 }
 
-fn bundle_status(arg: HashArg) -> Result<Value, McpErr> {
-    let config = Config::load()?;
+fn bundle_status(config: &Config, arg: HashArg) -> Result<Value, McpErr> {
     let status = hc_bundle::status(SyncMode::Off, arg.hash)?;
     let mut signers = Vec::new();
     for sig in &status.bundle.signatures {
         signers.push(sig.signer);
     }
-    let summary = match Policy::load(&config.store_path(), &status.bundle.intent.key) {
-        Ok(loaded) => summary_of(status.bundle.intent.clone(), &loaded, &config),
-        Err(_) => SummaryView::Refused,
-    };
+    let (_verdict, summary) = judge(&status.bundle.intent, config);
     Ok(serde_json::to_value(StatusView {
         hash: status.hash,
         summary,
         signers,
-        threshold: status.bundle.threshold,
-        safes_threshold: status.safes_threshold,
-        met: status.bundle.met(),
+        threshold: status.quorum.threshold,
+        stated: status.quorum.stated,
+        met: status.quorum.met,
         intent: status.bundle.intent,
-        not_owners: status.not_owners,
         missing: status.missing,
         rivals: status.rivals,
         age_ms: status.age_ms,
     })?)
 }
 
-/// The approval text of one intent under one policy, which exists only if the policy admits it.
-/// It comes out of the signer's own `prepare`, so the text here is the text the operator will
-/// read — there is no second renderer that could disagree with it.
-fn summary_of(
-    intent: SafeTxIntent,
-    policy: &hc_sign::policy::LoadedPolicy,
-    config: &Config,
-) -> SummaryView {
-    match hc_sign::sign::prepare(intent, policy, None, B256::ZERO, config) {
-        Ok((_approved, text)) => SummaryView::Decoded { text },
-        Err(_) => SummaryView::Refused,
+/// The verdict and the approval text of one intent under the key's own policy. It runs the
+/// signer's own `prepare`, so the text is the text the operator will read and the verdict is the
+/// answer `propose_erc20_transfer` will get; a policy file that will not load is itself a denial,
+/// because a policy that cannot be read has authorized nothing.
+fn judge(intent: &SafeTxIntent, config: &Config) -> (Verdict, SummaryView) {
+    let loaded = match Policy::load(&config.store_path(), &intent.key) {
+        Ok(loaded) => loaded,
+        Err(e) => return denied(intent, e.into()),
+    };
+    match hc_sign::sign::prepare(intent.clone(), &loaded, None, B256::ZERO, config) {
+        Ok((_approved, summary)) => (
+            Verdict::Allowed,
+            SummaryView::Decoded {
+                text: body_for_agent(intent, &summary),
+            },
+        ),
+        Err(e) => denied(intent, e.into()),
     }
 }
 
-/// Judge a transfer and store nothing. The verdict runs the signer's own `prepare`, so it is the
-/// same answer `propose_erc20_transfer` will get; a policy file that will not load is itself a
-/// denial, because a policy that cannot be read has authorized nothing.
-fn preview_erc20_transfer(transfer: Erc20Transfer) -> Result<Value, McpErr> {
+/// The decoded call for the agent, and the alarms for the operator alone. An alarm is what the
+/// policy and the operator's own annotations make of this payload — it names contracts, labels
+/// and ceilings this surface does not publish — so it goes to the local log and never into the
+/// answer the caller reads. The body is the agent's own transaction decoded back at it.
+fn body_for_agent(intent: &SafeTxIntent, summary: &hc_sign::adapter::Summary) -> String {
+    if !summary.alarms.is_empty() {
+        tracing::warn!(
+            key = %hc_core::safe_diagnostic_text(&intent.key),
+            safe = %intent.safe,
+            nonce = %intent.nonce,
+            alarms = %hc_core::safe_diagnostic_text(&summary.alarms.join(" \u{2016} ")),
+            "an agent's transfer raised alarms; they are the operator's to read, not the agent's"
+        );
+    }
+    summary.body.clone()
+}
+
+/// A denial the agent reads and the operator's log records, and the two are not the same thing:
+/// the caller is told which rule refused, the log is told everything. A refusal that echoed the
+/// rule's contents would publish the payee list and the ceiling that `list_signing_keys` decides
+/// what to say about — an adversarial agent maps the whole policy by reading its own refusals.
+fn denied(intent: &SafeTxIntent, e: McpErr) -> (Verdict, SummaryView) {
+    tracing::warn!(
+        key = %hc_core::safe_diagnostic_text(&intent.key),
+        safe = %intent.safe,
+        nonce = %intent.nonce,
+        detail = %hc_core::safe_diagnostic_text(&e.to_string()),
+        "the policy refused an agent's transfer; the agent was told only which rule refused"
+    );
+    (Verdict::Denied { rule: e.refusal() }, SummaryView::Refused)
+}
+
+/// Judge a transfer and store nothing.
+fn preview_erc20_transfer(config: &Config, transfer: Erc20Transfer) -> Result<Value, McpErr> {
     let intent = transfer.intent()?;
-    let config = Config::load()?;
     let safe_known = Safes::load()?.find(intent.safe, intent.chain_id).is_ok();
-    let (policy, summary) = match Policy::load(&config.store_path(), &intent.key) {
-        Ok(loaded) => {
-            match hc_sign::sign::prepare(intent.clone(), &loaded, None, B256::ZERO, &config) {
-                Ok((_approved, text)) => (Verdict::Allowed, SummaryView::Decoded { text }),
-                Err(e) => (
-                    Verdict::Denied {
-                        denial: e.to_string(),
-                    },
-                    SummaryView::Refused,
-                ),
-            }
-        }
-        Err(e) => (
-            Verdict::Denied {
-                denial: e.to_string(),
-            },
-            SummaryView::Refused,
-        ),
-    };
+    let (policy, summary) = judge(&intent, config);
+    let queue = proposal::survey(config.mcp(), &intent)?;
     Ok(serde_json::to_value(PreviewView {
         safe_tx_hash: adapter::safe_tx_hash(&intent),
         summary,
         policy,
         safe_known,
-        slot_taken: slot_held(&intent)?,
+        nonce: place_nonce(config.mcp(), &intent, queue.lowest_nonce),
+        slot_taken: queue.slot,
     })?)
 }
 
-fn propose_erc20_transfer(transfer: Erc20Transfer) -> Result<Value, McpErr> {
-    let proposal = Proposal::check(transfer.intent()?)?;
-    let summary = proposal.summary().to_string();
+fn propose_erc20_transfer(config: &Config, transfer: Erc20Transfer) -> Result<Value, McpErr> {
+    let intent = transfer.intent()?;
+    let proposal = Proposal::check(config, intent.clone())?;
+    let nonce = proposal.nonce();
+    let summary = body_for_agent(&intent, proposal.summary());
     let hash = proposal.file()?;
-    tracing::info!(%hash, "an agent filed a proposal; it is unsigned and needs a human");
-    Ok(serde_json::to_value(ProposedView { hash, summary })?)
+    tracing::info!(
+        %hash,
+        nonce = %nonce.nonce,
+        anchor = %nonce.anchor,
+        above_anchor = %nonce.above_anchor,
+        anchored = nonce.anchored,
+        "an agent filed a proposal; it is unsigned and needs a human"
+    );
+    Ok(serde_json::to_value(ProposedView {
+        hash,
+        summary,
+        nonce,
+    })?)
 }
 
 #[cfg(test)]
@@ -600,7 +715,10 @@ mod tests {
             .intent()
             .expect("a valid key name builds an intent");
 
-        assert_eq!(intent.to, TOKEN, "the Safe calls the token and nothing else");
+        assert_eq!(
+            intent.to, TOKEN,
+            "the Safe calls the token and nothing else"
+        );
         assert_eq!(intent.value, U256::ZERO);
         assert_eq!(intent.operation, Operation::Call);
         assert_eq!(intent.safe_tx_gas, U256::ZERO);
@@ -633,6 +751,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn no_argument_tools_reject_unpublished_arguments() {
+        let mut session = Session::default();
+        assert!(matches!(
+            Tool::ListSafes.call(&mut session, json!({"unexpected": true})),
+            Err(CallErr::Params(_))
+        ));
+        assert!(matches!(
+            Tool::ListBundles.call(&mut session, json!([1, 2, 3])),
+            Err(CallErr::Params(_))
+        ));
+    }
+
+    /// A malformed call must die at the parse, before it can charge the cooldown that decides
+    /// whether the operator's own CLI can take the bundle lock. Two bad calls in a row therefore
+    /// both come back as parse failures rather than the second one being told to slow down.
+    #[test]
+    fn a_malformed_call_never_charges_the_bundle_lock_cooldown() {
+        let mut session = Session::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                Tool::ProposeErc20Transfer.call(&mut session, json!({"key": "AGENT"})),
+                Err(CallErr::Params(_))
+            ));
+        }
+    }
+
     /// A key name is joined onto a policy path, so a name that is not `[A-Za-z0-9_]+` must die
     /// at the one place these arguments become an intent rather than reach the filesystem.
     #[test]
@@ -645,5 +790,29 @@ mod tests {
             transfer.intent(),
             Err(McpErr::InvalidKeyName { .. })
         ));
+    }
+
+    /// A policy that will not parse hands its own source bytes to the operator's log through the
+    /// failure that rejected it, so what this listing logs must carry no newline and no bidi
+    /// override however the file was written.
+    #[test]
+    fn a_hostile_policy_file_cannot_write_control_bytes_into_the_operator_log() {
+        let hostile = concat!(
+            "safe = \"0x1111111111111111111111111111111111111111\"\n",
+            "chain_id = \"\u{202e}approved by the operator\nsigned\n"
+        );
+        let Err(refused) = Policy::parse(hostile.as_bytes()) else {
+            panic!("an unterminated basic string must be a parse failure");
+        };
+        let raw = refused.to_string();
+        assert!(
+            raw.contains("approved by the operator"),
+            "the failure no longer carries the file's own bytes: {raw}"
+        );
+
+        let logged = hc_core::safe_diagnostic_text(&raw);
+        assert!(!logged.contains('\n'), "{logged}");
+        assert!(!logged.contains('\u{202e}'), "{logged}");
+        assert!(!logged.contains('\u{1b}'), "{logged}");
     }
 }

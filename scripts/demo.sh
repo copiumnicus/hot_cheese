@@ -1,18 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export HOT_CHEESE_HOME="${HOT_CHEESE_HOME:-/tmp/hot_cheese_demo}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+HC_DEMO_ALLOW_ANY_PATH="${HC_DEMO_ALLOW_ANY_PATH:-}"
+
+fatal() {
+  echo "ABORT: $*" >&2
+  exit 1
+}
+
+if [[ -z "${HOT_CHEESE_HOME:-}" ]]; then
+  HOT_CHEESE_HOME=/tmp/hot_cheese_demo
+fi
+HOT_CHEESE_HOME="${HOT_CHEESE_HOME%/}"
+if [[ -z "$HOT_CHEESE_HOME" ]]; then
+  fatal "HOT_CHEESE_HOME is empty. Export a throwaway one, e.g. /tmp/hot_cheese_demo. This script rm -rf's it."
+fi
+if [[ "$HOT_CHEESE_HOME" != /* ]]; then
+  fatal "HOT_CHEESE_HOME must be an absolute path, got '$HOT_CHEESE_HOME'"
+fi
+if [[ -z "${HOME:-}" ]]; then
+  fatal "HOME is not set, so the real install location cannot be determined"
+fi
+REAL_HOME="$HOME/.config/hot_cheese"
+if [[ "$HOT_CHEESE_HOME" == "$HOME" ]]; then
+  fatal "HOT_CHEESE_HOME is your login home $HOME, which this script rm -rf's"
+fi
+if [[ "$HOT_CHEESE_HOME" == "$REAL_HOME" ]]; then
+  fatal "HOT_CHEESE_HOME points at the REAL install $REAL_HOME"
+fi
+case "$HOT_CHEESE_HOME/" in
+  "$REAL_HOME"/*) fatal "HOT_CHEESE_HOME lives inside the real install $REAL_HOME" ;;
+esac
+case "$REAL_HOME/" in
+  "$HOT_CHEESE_HOME"/*) fatal "the real install $REAL_HOME lives inside HOT_CHEESE_HOME, which this script rm -rf's" ;;
+esac
+if [[ -z "$HC_DEMO_ALLOW_ANY_PATH" ]]; then
+  case "$HOT_CHEESE_HOME" in
+    /tmp/?* | /private/tmp/?* | /var/folders/?*) ;;
+    *) fatal "HOT_CHEESE_HOME must be under /tmp, /private/tmp or /var/folders (this script rm -rf's it). Set HC_DEMO_ALLOW_ANY_PATH=1 to override." ;;
+  esac
+fi
+export HOT_CHEESE_HOME
 export HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE=1
-BIN="${BIN:-./target/release/hot_cheese}"
+BIN="${BIN:-$REPO_ROOT/target/release/hot_cheese}"
 
 if [[ ! -x "$BIN" ]]; then
   echo "Building release binary first..." >&2
   cargo build --release
-  BIN="./target/release/hot_cheese"
+  BIN="$REPO_ROOT/target/release/hot_cheese"
 fi
+[[ -x "$BIN" ]] || fatal "no hot_cheese binary at $BIN"
 
 echo "==> Fresh demo home at $HOT_CHEESE_HOME"
-rm -rf "$HOT_CHEESE_HOME"
+rm -rf -- "$HOT_CHEESE_HOME"
 
 echo
 echo "==> 1) init  (set a recovery passphrase when prompted, twice)"

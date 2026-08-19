@@ -4,11 +4,12 @@
 //! biometric is now cryptographically load-bearing: with the Secure Enclave
 //! unlocker, no Touch ID means no ECDH means no KEK means no DEK.
 //!
-//! Every enrollment unwraps the SAME DEK, so a machine whose Secure Enclave key is gone
-//! (blob deleted, or the `.biometryCurrentSet` ACL invalidated by a Touch ID re-enrollment)
-//! is not bricked: [`UnlockErr::SeKeyUnavailableTryUnlockPassphrase`] tells the operator to
-//! re-run the command with `--unlock passphrase`, which unwraps the DEK from the recovery
-//! enrollment instead.
+//! Every enrollment unwraps the SAME DEK, so a machine whose Secure Enclave key is gone (the
+//! blob deleted) is not bricked: [`UnlockErr::SeKeyUnavailableTryUnlockPassphrase`] tells the
+//! operator to re-run the command with `--unlock passphrase`, which unwraps the DEK from the
+//! recovery enrollment instead. Only an absent key earns that hint —
+//! [`UnlockErr::SeKeyPresentButUnprovenDoNotReenroll`] is the answer when a key is there but
+//! this vault cannot prove it is the one it recorded.
 use crate::crypto::envelope::Dek;
 use crate::keyring::{Enrollment, Keyring};
 use crate::mac::local_auth::LaContext;
@@ -31,6 +32,10 @@ create_err_with_impls!(
     Argon2(argon2::Error),
     Se(crate::mac::secure_enclave::SeErr)
     ;
+    PassphraseTooShort { found: usize, min: usize },
+    PassphraseTooLong { found: usize, max: usize },
+    PassphraseTooSimple { distinct: usize, min: usize },
+    SeKeyPresentButUnprovenDoNotReenroll { source: crate::mac::secure_enclave::SeErr }
 );
 
 /// A KEK source that can wrap (enroll) and unwrap (unlock) the DEK.

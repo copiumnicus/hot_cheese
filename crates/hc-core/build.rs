@@ -1,6 +1,10 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+
+const XCRUN: &str = "/usr/bin/xcrun";
+const SWIFTC: &str = "/usr/bin/swiftc";
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
@@ -22,12 +26,14 @@ fn main() {
     };
     let target = format!("{swift_arch}-apple-macosx{min_os}");
 
-    let sdk = run_capture("xcrun", &["--show-sdk-path"]);
+    let sdk = run_capture(XCRUN, &["--show-sdk-path"]);
     let resource = swift_runtime_resource_path(&target);
     let compat = PathBuf::from(&resource).join("macosx");
 
     let lib = out_dir.join("libse_bridge.a");
-    let status = Command::new("swiftc")
+    let module_cache = out_dir.join("swift-module-cache");
+    fs::create_dir_all(&module_cache).expect("create the private Swift module cache");
+    let status = Command::new(SWIFTC)
         .args([
             "-emit-library",
             "-static",
@@ -35,6 +41,8 @@ fn main() {
             "-module-name",
             "se_bridge",
         ])
+        .arg("-module-cache-path")
+        .arg(&module_cache)
         .args(["-target", &target, "-sdk", &sdk, "-o"])
         .arg(&lib)
         .arg("swift/se_bridge.swift")
@@ -67,7 +75,7 @@ fn run_capture(cmd: &str, args: &[&str]) -> String {
 }
 
 fn swift_runtime_resource_path(target: &str) -> String {
-    let info = run_capture("swiftc", &["-print-target-info", "-target", target]);
+    let info = run_capture(SWIFTC, &["-print-target-info", "-target", target]);
     let parts: Vec<&str> = info.split('"').collect();
     for (i, p) in parts.iter().enumerate() {
         if *p == "runtimeResourcePath" {

@@ -22,23 +22,26 @@ use hc_core::config::{
     Config,
 };
 use hc_core::crypto::envelope::{
-    atomic_write, encrypt_file, parse_keystore, read_keystore, seal_keystore, write_private_file,
-    Dek, KeyUse, KeystoreFile,
+    atomic_write, encrypt_file_new, enforce_store_modes, parse_keystore, read_keystore,
+    seal_keystore, write_private_file, Dek, EnvErr, KeyUse, KeystoreFile, MAX_SECRET_BYTES,
 };
-use hc_core::is_valid_string_name;
-use hc_core::keyring::{EnrollParams, Keyring, VaultId};
+use hc_core::is_valid_key_name;
+use hc_core::keyring::{EnrollParams, Enrollment, Keyring, VaultId};
 use hc_core::mac::secure_enclave;
 use hc_core::mac::{authorize_with_touch_id, get_password_from_keychain, BackendImpl, MacBackend};
-use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
+use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker};
 use hc_daemon::approval::Approver;
 use hc_daemon::git_store::{self, GitStore};
 use hc_daemon::renderer::Headless;
 use hc_daemon::runtime::UnlockGate;
 use hc_daemon::{flock, HotApi, OpContext, Operation};
+use std::io::IsTerminal;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use zeroize::{Zeroize, Zeroizing};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// What [`CliErr::Console`] carries in a build without the console: only its absence.
 #[cfg(not(feature = "console"))]
@@ -60,9 +63,9 @@ const GRANT_LABEL: &str = hc_core::mac::secure_enclave::SE_GRANT_KEY_LABEL;
 // Defaults baked into a fresh `config.toml` on `init`.
 const DEFAULT_SERVICE: &str = "com.cc.hot_cheese";
 const DEFAULT_ACCOUNT: &str = "hot_cheese_master";
+const MAX_PEM_BYTES: u64 = 1024 * 1024;
 
-// Variants in source order: PassphraseMismatch (prompt confirmation differed),
-// AlreadyInitialized (`init` without `--force`), CertKeyPairRequired (one of
+// Variants in source order: AlreadyInitialized (`init` without `--force`), CertKeyPairRequired (one of
 // --import-cert/--import-key supplied), PullNeedsForce (`backup pull` without --force, after
 // naming everything the pull would destroy), ServeRefusesPassphraseUnlock (`serve --unlock
 // passphrase` would cache the passphrase for the daemon's lifetime and drop the per-request
@@ -74,10 +77,13 @@ const DEFAULT_ACCOUNT: &str = "hot_cheese_master";
 // is not the one config.toml pins).
 // GrantKeyMissingRunEnrollGrant is `serve` without an enrolled grant key, which every
 // signature needs: nothing is pinned in config.toml, or the enclave blob is gone.
+// ConfirmationNeedsTerminal is an irreversible verb (`init --force`, a rewinding `backup pull`,
+// `accept-deletions`) with no terminal to type its phrase on, ConfirmationRefused is the same
+// guard when what came back was not the phrase, and NoDeletionsToAccept is `accept-deletions`
+// on a store that has lost nothing.
 create_err_with_impls!(
     #[derive(Debug)]
     pub CliErr,
-    PassphraseMismatch,
     AlreadyInitialized,
     CertKeyPairRequired,
     PullNeedsForce,
@@ -85,8 +91,10 @@ create_err_with_impls!(
     SealNeedsTarget,
     TouchIdDenied,
     GrantKeyMissingRunEnrollGrant,
+    StoreMissingRunBackupPull,
     Config(hc_core::config::ConfigErr),
     Keyring(hc_core::keyring::KeyringErr),
+    Passphrase(PassphraseErr),
     Unlock(hc_core::unlock::UnlockErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
     ApiBackend(hc_daemon::ApiBackendErr),
@@ -102,6 +110,7 @@ create_err_with_impls!(
     Grant(hc_sign::grant::GrantErr),
     Serde(serde_json::Error),
     Runtime(hc_daemon::runtime::RuntimeErr),
+    Tls(hc_daemon::ServeErr),
     Flock(hc_daemon::flock::FlockErr),
     Console(ConsoleErr),
     Rcgen(rcgen::Error),
@@ -112,8 +121,29 @@ create_err_with_impls!(
     SealCannotLoosen { name: String, from: KeyUse, to: KeyUse },
     SealVerifyMismatch { name: String },
     NotBundleable { kind: hc_sign::grant::IntentKind },
-    GrantKeyPinMismatch { pinned: String, found: String }
+    SecretInputTooLarge { size: usize, max: usize },
+    GrantKeyPinMismatch { pinned: String, found: String },
+    ConfirmationNeedsTerminal { required: &'static str, flag: &'static str },
+    ConfirmationRefused { typed: String, required: &'static str },
+    NoDeletionsToAccept { store: PathBuf }
 );
+
+// Mismatch is the confirmation entry differing from the first, Empty a passphrase read from an
+// empty stdin, Unlock the enrollment rule refusing the entry at the prompt. No variant ever
+// carries the entered secret.
+create_err_with_impls!(
+    #[derive(Debug)]
+    pub PassphraseErr,
+    Mismatch,
+    Empty,
+    Unlock(UnlockErr),
+    Utf8(std::str::Utf8Error),
+    StdIo(std::io::Error)
+    ;
+);
+
+/// Hex is the widest supported textual encoding; this also bounds base58 decoding work.
+const MAX_ENCODED_SECRET_BYTES: usize = MAX_SECRET_BYTES * 2 + 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,6 +174,9 @@ enum Commands {
         /// Overwrite an existing config/store.
         #[arg(long)]
         force: bool,
+        /// Confirm a forced overwrite without a terminal, by repeating the phrase it asks for.
+        #[arg(long, value_name = "PHRASE", requires = "force")]
+        confirm_destroy: Option<String>,
     },
     /// Add another way to unlock the same DEK (Secure Enclave or recovery passphrase).
     #[command(subcommand)]
@@ -198,17 +231,24 @@ enum Commands {
         #[arg(long = "use", value_name = "USE", default_value = "sign-only", value_parser = key_use_parser())]
         key_use: KeyUse,
     },
-    /// Run the HTTPS daemon (auto-pulls the store from the first backup remote if absent).
+    /// Run the HTTPS daemon. A missing store must be restored explicitly first.
     Serve,
     /// Push or pull the encrypted store to/from configured backup remotes.
     #[command(subcommand)]
     Backup(BackupCmd),
+    /// Record store files or enrollments that are already gone, which every other command
+    /// refuses to commit. Names each one, then requires the phrase it asks for.
+    AcceptDeletions {
+        /// Confirm without a terminal, by repeating the phrase it asks for.
+        #[arg(long, value_name = "PHRASE")]
+        confirm_deletion: Option<String>,
+    },
     /// Migrate legacy Keychain-master keystores into the new envelope format.
     Migrate {
         /// Directory holding the legacy keystores.
         #[arg(long, value_name = "DIR")]
         old_store: PathBuf,
-        /// Destination store dir (must be empty).
+        /// This initialized installation's configured store (normally ~/.config/hot_cheese/store).
         #[arg(long, value_name = "DIR")]
         new_store: PathBuf,
         /// Migrate this key as shareable (repeatable). Everything unnamed becomes sign-only
@@ -220,6 +260,10 @@ enum Commands {
     BootstrapFrom {
         /// SSH target, e.g. user@host.
         target: String,
+        /// Also enroll a recovery passphrase here, read from a masked prompt or, with no
+        /// terminal, from stdin.
+        #[arg(long)]
+        recovery_passphrase: bool,
     },
     /// Authority side of the SSH bootstrap (invoked remotely over SSH).
     #[command(hide = true)]
@@ -253,7 +297,7 @@ enum BackupCmd {
     Status,
     /// Push the store to every configured remote, under this install's vault id.
     Push,
-    /// Fetch the first configured remote and fast-forward; refuses to merge a fork.
+    /// Fetch and inspect configured remotes without changing the active store.
     Fetch,
     /// Discard local history for the first remote's copy. Names what it destroys, and does
     /// nothing without --force.
@@ -264,6 +308,10 @@ enum BackupCmd {
         /// Actually discard local history. Without it the destruction is only listed.
         #[arg(long)]
         force: bool,
+        /// Accept a pull that rewinds, forks, deletes store files or replaces them with older
+        /// content, by repeating the phrase it asks for.
+        #[arg(long, value_name = "PHRASE", requires = "force")]
+        confirm_rewind: Option<String>,
     },
     /// List the vaults sharing the first configured remote's folder.
     List,
@@ -325,7 +373,11 @@ pub fn run() -> ExitCode {
     // subscriber must never be installed underneath it.
     let result = match cli.command {
         Some(command) => {
-            init_stdout_tracing();
+            if command_owns_stdout(&command) {
+                init_stderr_tracing();
+            } else {
+                init_stdout_tracing();
+            }
             dispatch(command, cli.unlock)
         }
         None => cmd_console(cli.unlock),
@@ -347,13 +399,27 @@ fn init_stdout_tracing() {
         .try_init();
 }
 
+/// Hidden machine protocols must keep stdout byte-exact. In particular, a tracing line inserted
+/// between bootstrap frames is indistinguishable from a hostile length prefix to the peer.
+fn command_owns_stdout(command: &Commands) -> bool {
+    matches!(command, Commands::BootstrapServe)
+}
+
+fn init_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(env_log_level())
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
     match command {
         Commands::Init {
             import_cert,
             import_key,
             force,
-        } => cmd_init(import_cert, import_key, force),
+            confirm_destroy,
+        } => cmd_init(import_cert, import_key, force, confirm_destroy),
         Commands::Enroll(cmd) => cmd_enroll(cmd, unlock),
         Commands::Add {
             name,
@@ -372,16 +438,23 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
         Commands::Seal { name, all, key_use } => cmd_seal(name, all, key_use, unlock),
         Commands::Serve => cmd_serve(unlock),
         Commands::Backup(cmd) => cmd_backup(cmd),
+        Commands::AcceptDeletions { confirm_deletion } => cmd_accept_deletions(confirm_deletion),
         Commands::Migrate {
             old_store,
             new_store,
             shareable,
         } => cmd_migrate(&old_store, &new_store, shareable, unlock),
-        Commands::BootstrapFrom { target } => {
+        Commands::BootstrapFrom {
+            target,
+            recovery_passphrase,
+        } => {
             let _store = flock::store_claim()?;
-            Ok(bootstrap::bootstrap_from(&target)?)
+            Ok(bootstrap::bootstrap_from(&target, recovery_passphrase)?)
         }
-        Commands::BootstrapServe => Ok(bootstrap::bootstrap_serve()?),
+        Commands::BootstrapServe => {
+            let _store = flock::store_claim()?;
+            Ok(bootstrap::bootstrap_serve()?)
+        }
         Commands::SeSelftest => cmd_se_selftest(),
     }
 }
@@ -434,7 +507,7 @@ fn make_unlocker(
         UnlockMethod::Se => Ok(Box::new(SecureEnclaveUnlocker::new(SE_LABEL))),
         UnlockMethod::Passphrase => {
             let pass = prompt_passphrase("Recovery passphrase: ")?;
-            Ok(Box::new(PassphraseUnlocker::new(pass)))
+            Ok(Box::new(PassphraseUnlocker::from_secret(pass)))
         }
     }
 }
@@ -456,18 +529,42 @@ fn resolve_unlock_method(keyring: &Keyring, method: Option<UnlockMethod>) -> Unl
 }
 
 /// Prompt once for a passphrase.
-fn prompt_passphrase(prompt: &str) -> Result<String, CliErr> {
-    Ok(rpassword::prompt_password(prompt)?)
+fn prompt_passphrase(prompt: &str) -> Result<Zeroizing<String>, PassphraseErr> {
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
-/// Prompt twice and confirm the two entries match.
-fn prompt_new_passphrase() -> Result<String, CliErr> {
-    let first = rpassword::prompt_password("New passphrase: ")?;
-    let second = rpassword::prompt_password("Confirm passphrase: ")?;
-    if first != second {
-        return Err(CliErr::PassphraseMismatch);
+/// The rule an enrollment applies, run here against a throwaway DEK so the prompt and the
+/// enrollment can never disagree about what a new recovery passphrase is.
+pub(crate) fn check_new_passphrase(entered: &Zeroizing<String>) -> Result<(), UnlockErr> {
+    PassphraseUnlocker::from_secret(entered.clone()).enroll("preflight", &Dek::random())?;
+    Ok(())
+}
+
+/// Prompt twice, confirm the two entries match, and refuse here what the enrollment would refuse
+/// later — before any caller writes a file, opens an SSH pipe or spends a Touch ID. A terminal
+/// asks again; anything else takes the refusal as the command's answer.
+pub(crate) fn prompt_new_passphrase() -> Result<Zeroizing<String>, PassphraseErr> {
+    loop {
+        let first = prompt_passphrase("New passphrase: ")?;
+        if first.is_empty() {
+            return Err(PassphraseErr::Empty);
+        }
+        if let Err(error) = check_new_passphrase(&first) {
+            if !std::io::stdin().is_terminal() {
+                return Err(error.into());
+            }
+            tracing::warn!(%error, "passphrase refused; enter a different one");
+            continue;
+        }
+        let second = prompt_passphrase("Confirm passphrase: ")?;
+        if bool::from(first.as_bytes().ct_eq(second.as_bytes())) {
+            return Ok(first);
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(PassphraseErr::Mismatch);
+        }
+        tracing::warn!("the two entries differ; enter the new passphrase again");
     }
-    Ok(first)
 }
 
 /// Load `config.toml`, then load `<store>/keyring.json`.
@@ -480,6 +577,16 @@ fn load_config_and_keyring() -> Result<(Config, Keyring), CliErr> {
 /// `<store>/keyring.json`.
 fn keyring_file(config: &Config) -> PathBuf {
     config.store_path().join("keyring.json")
+}
+
+/// Existence check for overwrite guards. Unlike `Path::exists`, a dangling symlink is occupied,
+/// and metadata errors other than absence are not silently reclassified as a free pathname.
+fn path_is_occupied(path: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Load the keyring once, resolve which KEK this invocation runs under, build the unlocker and
@@ -498,47 +605,230 @@ fn backend_for(
     Ok((MacBackend::new(&config.store, unlocker)?, gate))
 }
 
+/// Everything an `init` guard has to weigh before a fresh DEK replaces the old one.
+struct StoreContents {
+    /// Keystore names the new DEK would leave permanently undecryptable.
+    keystores: Vec<String>,
+    /// Enrollments the new keyring would discard.
+    enrollments: Vec<Enrollment>,
+    /// Whether `keyring.json` occupies the store at all, readable or not.
+    keyring: bool,
+    /// Every directory entry in the store, keystore or not.
+    entries: usize,
+}
+
+impl StoreContents {
+    fn read(store: &Path) -> Result<Self, CliErr> {
+        let mut keystores = Vec::new();
+        let mut entries = 0usize;
+        match std::fs::read_dir(store) {
+            Ok(dir) => {
+                for (at, entry) in dir.enumerate() {
+                    if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "pre-existing store has too many entries",
+                        )
+                        .into());
+                    }
+                    let entry = entry?;
+                    entries += 1;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    if let Some(name) = entry.file_name().to_str() {
+                        if is_valid_key_name(name) {
+                            keystores.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        keystores.sort();
+
+        let keyring_path = store.join(hc_core::keyring::KEYRING_FILE);
+        let keyring = path_is_occupied(&keyring_path)?;
+        let mut enrollments = Vec::new();
+        if keyring {
+            match Keyring::load(&keyring_path) {
+                Ok(loaded) => enrollments = loaded.enrollments,
+                Err(error) => {
+                    tracing::warn!(%error, "the keyring is unreadable; it will be replaced unlisted")
+                }
+            }
+        }
+        Ok(Self {
+            keystores,
+            enrollments,
+            keyring,
+            entries,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.keyring && self.entries == 0
+    }
+}
+
+const FORCED_INIT_PHRASE: &str = git_store::Destruction::Replacement.phrase();
+const FORCED_INIT_FLAG: &str = "--confirm-destroy";
+const PULL_REWIND_PHRASE: &str = "roll this store back";
+const PULL_REWIND_FLAG: &str = "--confirm-rewind";
+const ACCEPT_DELETION_PHRASE: &str = git_store::Destruction::Deletion.phrase();
+const ACCEPT_DELETION_FLAG: &str = "--confirm-deletion";
+
+/// The one way an irreversible verb takes consent: the exact phrase, typed on a terminal, or
+/// carried by `flag` where there is no terminal to type it on. Anything else refuses, so a
+/// habitual `-y` and an unattended run both fail closed. The accepted bytes come back, because a
+/// capability that a confirmed destruction mints must be minted from them and not from a constant.
+fn require_typed_confirmation(
+    required: &'static str,
+    flag: &'static str,
+    confirm: Option<&str>,
+) -> Result<String, CliErr> {
+    let typed = match confirm {
+        Some(phrase) => phrase.to_string(),
+        None => {
+            if !std::io::stdin().is_terminal() {
+                return Err(CliErr::ConfirmationNeedsTerminal { required, flag });
+            }
+            tracing::warn!(phrase = %required, "type this phrase to proceed, or Ctrl-C to abort");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line
+        }
+    };
+    if typed.trim() != required {
+        return Err(CliErr::ConfirmationRefused {
+            typed: hc_core::safe_diagnostic_text(typed.trim()),
+            required,
+        });
+    }
+    Ok(typed)
+}
+
+/// `--force` mints a new DEK, so every keystore wrapped under the old one becomes permanently
+/// undecryptable. Name each casualty first, then require the phrase back before any of it happens.
+///
+/// The phrase is what mints the capability the replacing commit is recorded under; a store with
+/// nothing to destroy has no replacement to confirm and gets none.
+fn confirm_forced_init(
+    store: &Path,
+    existing: &StoreContents,
+    confirm: Option<&str>,
+) -> Result<Option<git_store::Consent>, CliErr> {
+    if existing.is_empty() {
+        return Ok(None);
+    }
+    tracing::warn!(
+        store = %store.display(),
+        keystores = existing.keystores.len(),
+        enrollments = existing.enrollments.len(),
+        entries = existing.entries,
+        "`init --force` mints a NEW DEK; everything below stays encrypted under the OLD one and becomes permanently undecryptable"
+    );
+    for name in &existing.keystores {
+        tracing::warn!(key = %name, "  keystore orphaned by the new DEK");
+    }
+    for enrollment in &existing.enrollments {
+        tracing::warn!(id = %enrollment.id, label = %enrollment.label, "  enrollment discarded with the old keyring");
+    }
+    let typed = require_typed_confirmation(FORCED_INIT_PHRASE, FORCED_INIT_FLAG, confirm)?;
+    Ok(Some(git_store::Consent::confirmed(
+        git_store::Destruction::Replacement,
+        &typed,
+    )?))
+}
+
+/// Record store state that is already gone. A routine mutation refuses to, because the backup
+/// exists to survive exactly that loss and a deletion replicates as a clean fast-forward — but
+/// the refusal is permanent and `open` is a commit, so without this the first store file to
+/// vanish takes `serve`, `generate` and the forced-pull recovery down with it for good.
+///
+/// Runs without [`claimed_store`]: opening the store is the operation that is already failing.
+fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
+    let config = Arc::new(Config::load()?);
+    let git = GitStore::cli(config.clone(), flock::store_claim()?)?;
+    let missing = git.missing()?;
+    if missing.is_empty() {
+        return Err(CliErr::NoDeletionsToAccept {
+            store: config.store_path(),
+        });
+    }
+    tracing::warn!(
+        store = %config.store_path().display(),
+        files = missing.paths.len(),
+        enrollments = missing.ids.len(),
+        "these are ALREADY GONE from this store; recording their loss replicates it to every backup, and a backup cannot restore what it no longer holds"
+    );
+    for path in &missing.paths {
+        tracing::warn!(file = %path, "  GONE: a store file the last commit still has");
+    }
+    for id in &missing.ids {
+        tracing::warn!(enrollment = %id, "  GONE: an unlock path the committed keyring still wraps");
+    }
+    let typed = require_typed_confirmation(
+        ACCEPT_DELETION_PHRASE,
+        ACCEPT_DELETION_FLAG,
+        confirm.as_deref(),
+    )?;
+    git.mutation().commit_loss(
+        git_store::Consent::confirmed(git_store::Destruction::Deletion, &typed)?,
+        &missing,
+    )?;
+    tracing::info!(
+        files = missing.paths.len(),
+        enrollments = missing.ids.len(),
+        "recorded the loss; the store commits again"
+    );
+    Ok(())
+}
+
 fn cmd_init(
     import_cert: Option<PathBuf>,
     import_key: Option<PathBuf>,
     force: bool,
+    confirm_destroy: Option<String>,
 ) -> Result<(), CliErr> {
     // Home dir holds config.toml + the TLS cert/key; the store lives under it so
     // $HOT_CHEESE_HOME fully isolates an install (the demo's /tmp home stays self-contained).
     let home = home_dir();
     let store = home.join("store");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    // First-run initialization mutates the same store and home material as every later command.
+    // Take the claim before inspecting either so two initializers cannot both mint a DEK and
+    // race to replace one another's keyring/config.
+    let _store = flock::store_claim()?;
 
     // A fresh DEK orphans every keystore already wrapped under the old one, so refuse when
     // ANY prior install is visible — config.toml, a keyring, or keystore files.
-    if !force {
-        if config_path().exists() {
+    let existing = StoreContents::read(&store)?;
+    let consent = if force {
+        confirm_forced_init(&store, &existing, confirm_destroy.as_deref())?
+    } else {
+        let (existing_cert, existing_key) = cert_paths();
+        if path_is_occupied(&config_path())?
+            || path_is_occupied(&existing_cert)?
+            || path_is_occupied(&existing_key)?
+        {
             return Err(CliErr::AlreadyInitialized);
         }
-        let keyring = store.join("keyring.json").exists();
-        let mut keystores = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&store) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|t| t.is_file())
-                    && entry.file_name().to_str().is_some_and(is_valid_string_name)
-                {
-                    keystores += 1;
-                }
-            }
-        }
-        if keyring || keystores > 0 {
+        if !existing.is_empty() {
             return Err(CliErr::ExistingStore {
+                keyring: existing.keyring,
+                keystores: existing.keystores.len(),
                 store,
-                keyring,
-                keystores,
             });
         }
-    }
-
-    std::fs::create_dir_all(&home)?;
-    let _store = match force {
-        true => Some(flock::store_claim()?),
-        false => None,
+        None
     };
+
     let config = Config {
         service: DEFAULT_SERVICE.to_string(),
         account: DEFAULT_ACCOUNT.to_string(),
@@ -554,26 +844,26 @@ fn cmd_init(
         token: Vec::new(),
         label: Vec::new(),
     };
-    std::fs::create_dir_all(&store)?;
+    config.validate()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&store)?;
+    enforce_store_modes(&store)?;
 
-    // TLS cert: import the supplied pair, or mint a self-signed localhost cert. The cert is
-    // public; the private key is written 0600 on both paths (std::fs::copy would carry the
-    // source's mode over instead).
-    let (cert_path, key_path) = cert_paths();
-    let cert_der = match (import_cert, import_key) {
+    // TLS cert: import the supplied pair, or mint a self-signed localhost cert.
+    let tls = match (import_cert, import_key) {
         (Some(c), Some(k)) => {
-            std::fs::copy(&c, &cert_path)?;
-            let key_pem = Zeroizing::new(std::fs::read(&k)?);
-            write_private_file(&key_path, &key_pem)?;
-            der_from_cert_pem(&cert_path)?
+            let cert_pem = hc_core::read_regular_file_bounded(&c, MAX_PEM_BYTES)?;
+            let key_pem = Zeroizing::new(hc_core::read_regular_file_bounded(&k, MAX_PEM_BYTES)?);
+            let cert_der = hc_daemon::validate_tls_pair(&cert_pem, &key_pem)?;
+            TlsMaterial {
+                cert_pem,
+                key_pem,
+                cert_der,
+            }
         }
-        (None, None) => {
-            let (cert_pem, key_pem, der) = generate_localhost_cert()?;
-            let key_pem = Zeroizing::new(key_pem);
-            std::fs::write(&cert_path, cert_pem)?;
-            write_private_file(&key_path, key_pem.as_bytes())?;
-            der
-        }
+        (None, None) => generate_localhost_cert()?,
         // Importing requires both halves.
         _ => return Err(CliErr::CertKeyPairRequired),
     };
@@ -582,7 +872,14 @@ fn cmd_init(
     let dek = Dek::random();
     tracing::info!("A recovery passphrase is required: it is the only cross-machine restore path.");
     let pass = prompt_new_passphrase()?;
-    let enrollment = PassphraseUnlocker::new(pass).enroll("recovery", &dek)?;
+    let enrollment = PassphraseUnlocker::from_secret(pass).enroll("recovery", &dek)?;
+
+    // The cert is public; the private key is written 0600 on both paths (std::fs::copy would
+    // carry the source's mode over instead).
+    let (cert_path, key_path) = cert_paths();
+    atomic_write(&cert_path, &tls.cert_pem)?;
+    write_private_file(&key_path, &tls.key_pem)?;
+
     let mut keyring = Keyring::new();
     // A fresh DEK is a fresh vault: it gets its own remote subtree so this install can share
     // a backup folder with other installs instead of overwriting one of them.
@@ -594,13 +891,23 @@ fn cmd_init(
     // Persist config last, once the store + keyring are in place.
     config.save()?;
 
-    git_store::ensure_repo(&store)?;
+    git_store::ensure_repo(&store, consent)?;
 
-    let fingerprint = sha256_hex(&cert_der);
+    let fingerprint = sha256_hex(&tls.cert_der);
     tracing::info!(home = %home.display(), store = %store.display(), %vault, "initialized hot_cheese");
     tracing::info!(cert = %cert_path.display(), "TLS certificate written");
     tracing::info!(sha256 = %fingerprint, "certificate fingerprint (pin this on the client)");
     Ok(())
+}
+
+/// What an enrollment did to the set of Secure Enclave keys `keyring.json` records.
+enum EnclaveKeyChange {
+    /// A key this store had never recorded, so the set of keys it trusts grew by one.
+    Minted { se_key: String },
+    /// The key already at this machine's enclave key path, and already recorded here.
+    Adopted { se_key: String },
+    /// A passphrase enrollment, which records no enclave key at all.
+    Untouched,
 }
 
 fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
@@ -623,25 +930,64 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
             SecureEnclaveUnlocker::new(SE_LABEL).enroll(&label, &dek)?
         }
         EnrollCmd::Passphrase { label } => {
-            let dek = enroll_dek(&keyring, unlock)?;
             let pass = prompt_new_passphrase()?;
-            PassphraseUnlocker::new(pass).enroll(&label, &dek)?
+            let dek = enroll_dek(&keyring, unlock)?;
+            PassphraseUnlocker::from_secret(pass).enroll(&label, &dek)?
         }
         EnrollCmd::Grant => {
             secure_enclave::ensure_grant_key(GRANT_LABEL)?;
-            let pinned = hex::encode(secure_enclave::grant_public_key(GRANT_LABEL)?);
-            let mut pinning = Config::load()?;
-            pinning.grant_public_key = Some(pinned.clone());
-            pinning.save()?;
-            tracing::info!(grant_public_key = %pinned, "created the Secure Enclave grant key and pinned it in config.toml");
+            let public_key = secure_enclave::grant_public_key(GRANT_LABEL)?;
+            let pinned = hex::encode(&public_key);
+            let adopted = config.grant_public_key.as_deref() == Some(pinned.as_str());
+            Config::update(|pinning| {
+                pinning.grant_public_key = Some(pinned.clone());
+                Ok::<(), CliErr>(())
+            })?;
+            let grant_key = se_fingerprint(&public_key);
+            if adopted {
+                tracing::warn!(%grant_key, "ADOPTED the Secure Enclave grant key already on this disk; stop unless this is the fingerprint you enrolled");
+            } else {
+                tracing::warn!(%grant_key, "MINTED a new Secure Enclave grant key: the key config.toml pins CHANGED");
+            }
+            tracing::info!(grant_public_key = %pinned, "pinned the Secure Enclave grant key in config.toml");
             return Ok(());
         }
     };
 
     let id = enrollment.id.clone();
+    let change = match &enrollment.params {
+        EnrollParams::SecureEnclave { se_pub, .. } => {
+            let mut adopted = false;
+            for enrolled in &keyring.enrollments {
+                if let EnrollParams::SecureEnclave {
+                    se_pub: recorded, ..
+                } = &enrolled.params
+                {
+                    adopted |= recorded == se_pub;
+                }
+            }
+            let se_key = se_fingerprint(se_pub);
+            match adopted {
+                true => EnclaveKeyChange::Adopted { se_key },
+                false => EnclaveKeyChange::Minted { se_key },
+            }
+        }
+        EnrollParams::Passphrase { .. } => EnclaveKeyChange::Untouched,
+    };
     keyring.add(enrollment);
     keyring.save(&keyring_file(&config))?;
     tracing::info!(enrollment = %id, "added enrollment");
+    match change {
+        EnclaveKeyChange::Minted { se_key } => tracing::warn!(
+            %se_key,
+            "MINTED a new Secure Enclave key: the set of enclave keys this store trusts CHANGED"
+        ),
+        EnclaveKeyChange::Adopted { se_key } => tracing::warn!(
+            %se_key,
+            "ADOPTED the Secure Enclave key already on this disk; stop unless this is the fingerprint you enrolled"
+        ),
+        EnclaveKeyChange::Untouched => {}
+    }
     git.after_mutation()?;
     Ok(())
 }
@@ -660,24 +1006,27 @@ fn cmd_add(
 ) -> Result<(), CliErr> {
     let config = Arc::new(Config::load()?);
     let git = claimed_store(&config)?;
-    if !is_valid_string_name(name) {
+    if !is_valid_key_name(name) {
         tracing::error!(%name, "invalid key name: only a-z, A-Z, 0-9, _ are allowed");
-        return Err(CliErr::ApiBackend(hc_daemon::ApiBackendErr::KeyExists));
+        return Err(CliErr::ApiBackend(hc_daemon::ApiBackendErr::InvalidName));
     }
     let store = config.store_path();
-    if store.join(name).exists() {
+    if path_is_occupied(&store.join(name))? {
         tracing::error!(%name, "key already exists");
         return Err(CliErr::ApiBackend(hc_daemon::ApiBackendErr::KeyExists));
     }
 
-    // Read + decode the secret, then zeroize the decoded bytes after encryption.
-    let mut secret = read_secret(kind)?;
+    let secret = read_secret(kind)?;
 
     let (backend, _) = backend_for(&config, unlock)?;
     let dek = backend.unlock_dek(&format!("Unlock \"{}\" for import key", name), None)?;
-    let result = encrypt_file(&backend.store_path(), name, &dek, key_use, &secret);
-    secret.zeroize();
-    result?;
+    match encrypt_file_new(&backend.store_path(), name, &dek, key_use, &secret) {
+        Err(EnvErr::StdIo(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CliErr::ApiBackend(hc_daemon::ApiBackendErr::KeyExists))
+        }
+        Err(error) => return Err(error.into()),
+        Ok(()) => {}
+    }
     tracing::info!(%name, %key_use, "imported key");
 
     git.after_mutation()?;
@@ -710,6 +1059,7 @@ fn cmd_generate(
 }
 
 fn cmd_address(chain: Chain, name: &str, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    let _store = flock::store_claim()?;
     let config = Arc::new(Config::load()?);
     let (backend, _) = backend_for(&config, unlock)?;
     let api = HotApi::new(Box::new(backend), config);
@@ -726,13 +1076,11 @@ fn cmd_address(chain: Chain, name: &str, unlock: Option<UnlockMethod>) -> Result
 
 /// A JSON body from `--file` or stdin. Every verb that ingests one takes it the same way.
 fn read_input(file: Option<&Path>) -> Result<Vec<u8>, std::io::Error> {
+    const MAX_CLI_INPUT_BYTES: u64 = hc_sign::qr::MAX_BODY_BYTES as u64;
     let Some(path) = file else {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
-        return Ok(buf);
+        return hc_core::read_bounded(std::io::stdin().lock(), MAX_CLI_INPUT_BYTES);
     };
-    std::fs::read(path)
+    hc_core::read_regular_file_bounded(path, MAX_CLI_INPUT_BYTES)
 }
 
 /// THE local signing path. Policy, the manifest-free CLI provenance, the pinned grant key, the
@@ -742,6 +1090,7 @@ fn sign_intent_locally(
     intent: hc_sign::intent::SafeTxIntent,
     unlock: Option<UnlockMethod>,
 ) -> Result<hc_sign::SignResponse, CliErr> {
+    let _store = flock::store_claim()?;
     let config = Arc::new(Config::load()?);
     let (backend, gate) = backend_for(&config, unlock)?;
     let api = HotApi::new(Box::new(backend), config);
@@ -762,11 +1111,23 @@ fn cmd_list() -> Result<(), CliErr> {
 
     tracing::info!(count = keyring.enrollments.len(), "enrollments");
     for e in &keyring.enrollments {
-        let kind = match e.params {
-            EnrollParams::SecureEnclave { .. } => "secure_enclave",
-            EnrollParams::Passphrase { .. } => "passphrase",
-        };
-        tracing::info!(id = %e.id, kind, label = %e.label, created_at = e.created_at, "  enrollment");
+        match &e.params {
+            EnrollParams::SecureEnclave { se_pub, .. } => tracing::info!(
+                id = %e.id,
+                kind = "secure_enclave",
+                label = %e.label,
+                se_key = %se_fingerprint(se_pub),
+                created_at = e.created_at,
+                "  enrollment"
+            ),
+            EnrollParams::Passphrase { .. } => tracing::info!(
+                id = %e.id,
+                kind = "passphrase",
+                label = %e.label,
+                created_at = e.created_at,
+                "  enrollment"
+            ),
+        }
     }
     if !keyring.has_passphrase() {
         tracing::warn!(
@@ -836,13 +1197,20 @@ fn cmd_adapters() -> Result<(), CliErr> {
 /// keyring and any `.hctmp` write are excluded by the name rule, which rejects `.`.
 fn keystore_names(store: &Path) -> Result<Vec<String>, CliErr> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(store)? {
+    for (at, entry) in std::fs::read_dir(store)?.enumerate() {
+        if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "store directory has too many entries",
+            )
+            .into());
+        }
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_valid_string_name(&name) {
+        if is_valid_key_name(&name) {
             names.push(name);
         }
     }
@@ -862,6 +1230,9 @@ fn cmd_seal(
     let config = Arc::new(Config::load()?);
     let git = claimed_store(&config)?;
     let store = config.store_path();
+    if name.as_deref().is_some_and(|name| !is_valid_key_name(name)) {
+        return Err(hc_daemon::ApiBackendErr::InvalidName.into());
+    }
     let names = match (all, name) {
         (true, _) => keystore_names(&store)?,
         (false, Some(name)) => vec![name],
@@ -901,9 +1272,9 @@ fn cmd_seal(
         None,
     )?;
     for (name, file) in pending {
-        let plaintext = Zeroizing::new(file.open(&name, &dek)?);
+        let plaintext = file.open(&name, &dek)?;
         let bytes = seal_keystore(&name, &dek, key_use, &plaintext)?;
-        let verify = Zeroizing::new(parse_keystore(&bytes)?.open(&name, &dek)?);
+        let verify = parse_keystore(&bytes)?.open(&name, &dek)?;
         if verify.as_slice() != plaintext.as_slice() {
             return Err(CliErr::SealVerifyMismatch { name });
         }
@@ -943,7 +1314,9 @@ fn cmd_serve(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
         });
     }
 
-    git_store::clone_if_absent(&config)?;
+    if git_store::local_vault(&config.store_path())? == git_store::LocalVault::Absent {
+        return Err(CliErr::StoreMissingRunBackupPull);
+    }
 
     let (backend, _) = backend_for(&config, unlock)?;
     Ok(hc_daemon::serve(config, Box::new(backend), store)?)
@@ -1002,23 +1375,81 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                 .into());
             }
         }
-        BackupCmd::Pull { vault, force } => {
+        BackupCmd::Pull {
+            vault,
+            force,
+            confirm_rewind,
+        } => {
             let git = claimed_store(&config)?;
             let remote = first_remote(&config)?;
             let vault = git_store::pull_vault(&config, remote, vault)?;
-            let doomed = git.pull_preview(remote, &vault)?;
+            let mut doomed = git.pull_preview(remote, &vault)?;
             tracing::warn!(
                 host = %remote.host,
                 %vault,
-                keystores = doomed.tracked.len(),
-                untracked = doomed.untracked.len(),
-                "a forced pull DELETES everything this machine has that the remote does not"
+                relation = %doomed.relation,
+                local_only_commits = doomed.local_only,
+                remote_only_commits = doomed.remote_only,
+                local_committed_at = ?doomed.local_at,
+                remote_committed_at = doomed.remote_at,
+                added = doomed.added.len(),
+                changed = doomed.changed.len(),
+                removed = doomed.removed.len(),
+                "a forced pull REPLACES the active store with an explicitly trusted remote copy"
             );
-            for name in doomed.tracked.iter().chain(&doomed.untracked) {
-                tracing::warn!(file = %name, "  deleted by the pull");
+            for name in &doomed.added {
+                tracing::info!(file = %name, "  ADDED by the pull");
+            }
+            for name in &doomed.changed {
+                tracing::warn!(file = %name, "  REPLACED by the pull");
+            }
+            for name in &doomed.removed {
+                tracing::warn!(file = %name, "  DELETED by the pull");
+            }
+            for id in &doomed.lost_enrollments {
+                tracing::warn!(enrollment = %id, "  UNLOCK PATH LOST: the incoming keyring keeps none of this machine's enrollments");
+            }
+            for name in &doomed.tracked {
+                tracing::warn!(file = %name, "  local edit discarded by the reset");
+            }
+            for name in &doomed.untracked {
+                tracing::warn!(file = %name, "  untracked file deleted by the clean");
             }
             if !force {
                 return Err(CliErr::PullNeedsForce);
+            }
+            if let Some(rewind) = doomed.rewind {
+                let ground = match rewind {
+                    git_store::Rewind::Backwards => {
+                        "OLDER HISTORY: the incoming tip is a commit this machine already moved past"
+                    }
+                    git_store::Rewind::Fork => {
+                        "FORK: the incoming tip does not contain this machine's commits and discards them"
+                    }
+                    git_store::Rewind::Deletes => {
+                        "DELETION: the incoming tip drops store files this machine's commit has"
+                    }
+                    git_store::Rewind::Contents => {
+                        "OLDER CONTENT: nothing is deleted and no local commit is discarded, and the security-relevant files listed as REPLACED above take older content — which can revive a retired keystore, restore an older keyring.json, or reinstate a looser policy"
+                    }
+                };
+                tracing::warn!(
+                    ground,
+                    ?rewind,
+                    local_only_commits = doomed.local_only,
+                    replaced = doomed.changed.len(),
+                    removed = doomed.removed.len(),
+                    lost_enrollments = doomed.lost_enrollments.len(),
+                    local_committed_at = ?doomed.local_at,
+                    remote_committed_at = doomed.remote_at,
+                    "THIS PULL PUTS BACK STATE THIS MACHINE MOVED PAST: every file listed as REPLACED or DELETED above takes the content a remote host chose"
+                );
+                require_typed_confirmation(
+                    PULL_REWIND_PHRASE,
+                    PULL_REWIND_FLAG,
+                    confirm_rewind.as_deref(),
+                )?;
+                doomed.accept_rewind();
             }
             git.pull_apply(&doomed)?;
             tracing::info!(host = %remote.host, %vault, head = %doomed.remote_head, "pulled the store from the remote");
@@ -1059,9 +1490,28 @@ fn cmd_migrate(
     shareable: Vec<String>,
     unlock: Option<UnlockMethod>,
 ) -> Result<(), CliErr> {
+    // Migration changes the initialized keyring's store. Take that installation's claim before
+    // loading either file, then require the requested destination to be the same directory; an
+    // arbitrary --new-store would not be protected by this lock and would be backed up wrongly.
+    let claim = flock::store_claim()?;
     let (config, keyring) = load_config_and_keyring()?;
+    let configured_store = config.store_path();
+    let expected = std::fs::canonicalize(&configured_store)?;
+    let found = std::fs::canonicalize(new_store)?;
+    if expected != found {
+        return Err(migrate::MigrateErr::WrongNewStore {
+            expected: configured_store,
+            found: new_store.to_path_buf(),
+        }
+        .into());
+    }
     let config = Arc::new(config);
-    let git = claimed_store(&config)?;
+    let git = GitStore::cli(config.clone(), claim)?;
+    let shareable: hashbrown::HashSet<String> = shareable.into_iter().collect();
+
+    // Reject public mistakes and unsafe filesystem state before either Touch ID authorization.
+    // `migrate::run` repeats this preflight once the secrets are available.
+    migrate::preflight(old_store, new_store, &shareable)?;
 
     // The legacy master lives in the login Keychain behind Touch ID.
     if !authorize_with_touch_id("read the legacy hot_cheese Keychain master for migrate") {
@@ -1069,22 +1519,13 @@ fn cmd_migrate(
         return Err(CliErr::TouchIdDenied);
     }
     // Zeroizing so the legacy master is wiped on every exit path, including early `?` returns.
-    let old_master = Zeroizing::new(get_password_from_keychain(
-        &config.service,
-        &config.account,
-    )?);
+    let old_master = get_password_from_keychain(&config.service, &config.account)?;
 
     // Unlock the new DEK that the migrated keys will be re-encrypted under.
     let unlocker = make_unlocker(&keyring, unlock)?;
     let dek = unlocker.unlock("Unlock the hot_cheese DEK for migrate", &keyring, None)?;
 
-    let migrated = migrate::run(
-        old_store,
-        &old_master,
-        new_store,
-        &dek,
-        &shareable.into_iter().collect(),
-    )?;
+    let migrated = migrate::run(old_store, &old_master, new_store, &dek, &shareable)?;
 
     tracing::info!(count = migrated.len(), "migration complete");
     for k in &migrated {
@@ -1094,82 +1535,72 @@ fn cmd_migrate(
     Ok(())
 }
 
-/// Read a secret from a hidden prompt and decode it per `kind`. Output is the raw
-/// secret bytes the caller must zeroize after use.
-fn read_secret(kind: SecretKind) -> Result<Vec<u8>, CliErr> {
+/// Read a secret from a hidden prompt and decode it per `kind`. Every buffer holding the
+/// plaintext is wiped when it drops, including on the error paths.
+fn read_secret(kind: SecretKind) -> Result<Zeroizing<Vec<u8>>, CliErr> {
     let prompt = match kind {
         SecretKind::Ethereum => "Private key (hex, 0x optional): ",
         SecretKind::Solana => "Keypair (base58): ",
         SecretKind::Bytes => "Secret (raw UTF-8): ",
     };
-    let mut entered = rpassword::prompt_password(prompt)?;
-    let decoded = decode_secret(kind, &entered);
-    entered.zeroize();
-    decoded
+    let entered = Zeroizing::new(rpassword::prompt_password(prompt)?);
+    decode_secret(kind, &entered)
 }
 
 /// Pure decoding of an entered secret string into raw bytes, mirroring the legacy
 /// `add_existing` example: ethereum=hex(0x optional), solana=base58, bytes=UTF-8.
-fn decode_secret(kind: SecretKind, entered: &str) -> Result<Vec<u8>, CliErr> {
-    match kind {
-        SecretKind::Ethereum => {
-            // df_share::from_hex_str strips an optional 0x and returns None on bad hex.
-            df_share::from_hex_str(entered.trim()).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hex").into()
-            })
-        }
+fn decode_secret(kind: SecretKind, entered: &str) -> Result<Zeroizing<Vec<u8>>, CliErr> {
+    if entered.len() > MAX_ENCODED_SECRET_BYTES {
+        return Err(CliErr::SecretInputTooLarge {
+            size: entered.len(),
+            max: MAX_ENCODED_SECRET_BYTES,
+        });
+    }
+    let decoded = Zeroizing::new(match kind {
+        SecretKind::Ethereum => hex::decode(
+            entered
+                .trim()
+                .strip_prefix("0x")
+                .or_else(|| entered.trim().strip_prefix("0X"))
+                .unwrap_or(entered.trim()),
+        )
+        .map_err(|_| {
+            CliErr::StdIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid hex",
+            ))
+        }),
         SecretKind::Solana => bs58::decode(entered.trim()).into_vec().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid base58").into()
+            CliErr::StdIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid base58",
+            ))
         }),
         SecretKind::Bytes => Ok(entered.as_bytes().to_vec()),
+    }?);
+    if decoded.len() > MAX_SECRET_BYTES {
+        return Err(EnvErr::PlaintextTooLarge {
+            size: decoded.len(),
+            max: MAX_SECRET_BYTES,
+        }
+        .into());
     }
+    Ok(decoded)
 }
 
-/// Read a PEM cert file and return its first certificate's DER bytes (for fingerprinting).
-fn der_from_cert_pem(path: &Path) -> Result<Vec<u8>, CliErr> {
-    let pem = std::fs::read_to_string(path)?;
-    for block in pem.split("-----BEGIN CERTIFICATE-----").skip(1) {
-        if let Some(end) = block.find("-----END CERTIFICATE-----") {
-            let b64: String = block[..end].split_whitespace().collect();
-            if let Some(der) = b64_decode(&b64) {
-                return Ok(der);
-            }
-        }
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no certificate in PEM").into())
-}
-
-/// Minimal standard-base64 decoder (no external dep) for extracting cert DER from PEM.
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=').collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut nbits = 0u32;
-    for &c in &bytes {
-        let v = val(c)? as u32;
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    Some(out)
+/// The TLS pair `init` installs once the recovery passphrase is accepted.
+struct TlsMaterial {
+    /// Certificate PEM, public.
+    cert_pem: Vec<u8>,
+    /// Private key PEM, written 0600.
+    key_pem: Zeroizing<Vec<u8>>,
+    /// Certificate DER, whose SHA-256 is the fingerprint clients pin.
+    cert_der: Vec<u8>,
 }
 
 /// Generate a self-signed localhost cert (CN=localhost, SAN DNS:localhost + IP:127.0.0.1,
-/// EKU serverAuth). Returns (cert PEM, key PEM, cert DER).
-fn generate_localhost_cert() -> Result<(String, String, Vec<u8>), CliErr> {
+/// EKU serverAuth).
+fn generate_localhost_cert() -> Result<TlsMaterial, CliErr> {
     use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
 
     let key_pair = KeyPair::generate()?;
@@ -1187,10 +1618,18 @@ fn generate_localhost_cert() -> Result<(String, String, Vec<u8>), CliErr> {
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
     let cert = params.self_signed(&key_pair)?;
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    let der = cert.der().as_ref().to_vec();
-    Ok((cert_pem, key_pem, der))
+    Ok(TlsMaterial {
+        cert_pem: cert.pem().into_bytes(),
+        key_pem: Zeroizing::new(key_pair.serialize_pem().into_bytes()),
+        cert_der: cert.der().as_ref().to_vec(),
+    })
+}
+
+/// The 16 lowercase hex characters of SHA-256 over a SEC1 enclave public key, the form the
+/// bootstrap ritual and the `/read` prompt already name an enclave key by.
+fn se_fingerprint(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(public_key)[..8])
 }
 
 /// Lowercase hex of SHA-256 over `bytes` (cert DER → pinning fingerprint).
@@ -1289,7 +1728,8 @@ mod tests {
     /// Disaster recovery types the vault id in by hand, so the value parser has to turn
     /// `v_<hex>` into a real [`VaultId`] and reject anything that is not one; omitting
     /// `--vault` must stay `None` so the pull falls back to this install's own id. A bare
-    /// `pull` must also stay un-forced, because the forced one deletes keystores.
+    /// `pull` must also stay un-forced and carry no rollback consent, because the forced one
+    /// deletes keystores and the rewinding one replays history a remote host chose.
     #[test]
     fn backup_pull_takes_a_typed_vault_id() {
         let cli = Cli::try_parse_from([
@@ -1305,7 +1745,7 @@ mod tests {
             .parse()
             .expect("fixture id parses");
         assert!(
-            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force })) if vault == Some(expected) && force)
+            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force, confirm_rewind })) if vault == Some(expected) && force && confirm_rewind.is_none())
         );
 
         let cli = Cli::try_parse_from(["hot_cheese", "backup", "pull"]).expect("bare pull parses");
@@ -1313,12 +1753,24 @@ mod tests {
             cli.command,
             Some(Commands::Backup(BackupCmd::Pull {
                 vault: None,
-                force: false
+                force: false,
+                confirm_rewind: None
             }))
         ));
 
         assert!(
             Cli::try_parse_from(["hot_cheese", "backup", "pull", "--vault", "nonsense"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hot_cheese",
+                "backup",
+                "pull",
+                "--confirm-rewind",
+                PULL_REWIND_PHRASE
+            ])
+            .is_err(),
+            "rollback consent is meaningless without --force"
         );
     }
 
@@ -1374,6 +1826,7 @@ mod tests {
     fn bootstrap_serve_is_hidden_but_parses() {
         let cli = Cli::try_parse_from(["hot_cheese", "bootstrap-serve"])
             .expect("bootstrap-serve should parse");
+        assert!(cli.command.as_ref().is_some_and(command_owns_stdout));
         assert!(matches!(cli.command, Some(Commands::BootstrapServe)));
     }
 
@@ -1418,8 +1871,8 @@ mod tests {
     fn ethereum_decodes_with_and_without_0x() {
         let with = decode_secret(SecretKind::Ethereum, "0xdeadbeef").expect("0x hex decodes");
         let without = decode_secret(SecretKind::Ethereum, "deadbeef").expect("bare hex decodes");
-        assert_eq!(with, vec![0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(with, without);
+        assert_eq!(with.as_slice(), &[0xde, 0xad, 0xbe, 0xef][..]);
+        assert_eq!(with.as_slice(), without.as_slice());
     }
 
     #[test]
@@ -1432,20 +1885,109 @@ mod tests {
         let raw = vec![1u8, 2, 3, 4, 5, 255, 0, 127];
         let encoded = bs58::encode(&raw).into_string();
         let decoded = decode_secret(SecretKind::Solana, &encoded).expect("base58 decodes");
-        assert_eq!(decoded, raw);
+        assert_eq!(decoded.as_slice(), raw.as_slice());
     }
 
     #[test]
     fn bytes_passes_through_utf8() {
         let decoded = decode_secret(SecretKind::Bytes, "hello world").expect("utf8 passes through");
-        assert_eq!(decoded, b"hello world".to_vec());
+        assert_eq!(decoded.as_slice(), &b"hello world"[..]);
     }
 
     #[test]
-    fn base64_decoder_matches_known_vector() {
-        // "Man" -> "TWFu", "hot_cheese" -> base64 below.
-        assert_eq!(b64_decode("TWFu"), Some(b"Man".to_vec()));
-        assert_eq!(b64_decode("aG90X2NoZWVzZQ=="), Some(b"hot_cheese".to_vec()));
+    fn secret_decoding_is_bounded_before_unlock() {
+        assert!(matches!(
+            decode_secret(SecretKind::Bytes, &"x".repeat(MAX_SECRET_BYTES + 1)),
+            Err(CliErr::Envelope(EnvErr::PlaintextTooLarge { .. }))
+        ));
+        assert!(matches!(
+            decode_secret(
+                SecretKind::Solana,
+                &"1".repeat(MAX_ENCODED_SECRET_BYTES + 1)
+            ),
+            Err(CliErr::SecretInputTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn imported_tls_material_must_parse_and_match_before_installation() {
+        let mine = generate_localhost_cert().expect("generate first pair");
+        let other = generate_localhost_cert().expect("generate second pair");
+        assert_eq!(
+            hc_daemon::validate_tls_pair(&mine.cert_pem, &mine.key_pem)
+                .expect("matching pair validates"),
+            mine.cert_der
+        );
+        assert!(hc_daemon::validate_tls_pair(&mine.cert_pem, &other.key_pem).is_err());
+        assert!(hc_daemon::validate_tls_pair(b"not pem", &mine.key_pem).is_err());
+    }
+
+    /// `init --force` mints a new DEK, so before anything happens it has to name every keystore
+    /// it strands and every enrollment it drops, and refuse until the phrase comes back exactly.
+    #[test]
+    fn forced_init_names_what_it_destroys_and_refuses_without_the_phrase() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot_cheese_forced_init_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).expect("fixture store");
+
+        let empty = StoreContents::read(&store).expect("an empty store reads");
+        assert!(empty.is_empty());
+        assert!(confirm_forced_init(&store, &empty, None)
+            .expect("an empty store needs no confirmation")
+            .is_none());
+
+        std::fs::write(store.join("SOLANA_MAIN"), b"ciphertext").expect("fixture keystore");
+        std::fs::write(store.join("EVM_HOT"), b"ciphertext").expect("fixture keystore");
+        let dek = Dek::random();
+        let mut keyring = Keyring::new();
+        keyring.add(
+            PassphraseUnlocker::new("correct horse battery staple".to_string())
+                .enroll("recovery", &dek)
+                .expect("fixture enrollment"),
+        );
+        keyring
+            .save(&store.join(hc_core::keyring::KEYRING_FILE))
+            .expect("fixture keyring");
+
+        let existing = StoreContents::read(&store).expect("the store reads");
+        assert!(!existing.is_empty());
+        assert!(existing.keyring);
+        assert_eq!(existing.keystores, ["EVM_HOT", "SOLANA_MAIN"]);
+        assert_eq!(existing.enrollments.len(), 1);
+        assert_eq!(existing.enrollments[0].label, "recovery");
+
+        assert!(matches!(
+            confirm_forced_init(&store, &existing, Some("y")),
+            Err(CliErr::ConfirmationRefused { .. })
+        ));
+        assert!(
+            confirm_forced_init(&store, &existing, Some(FORCED_INIT_PHRASE))
+                .expect("the exact phrase proceeds")
+                .is_some(),
+            "the phrase is what mints the capability the replacing commit needs"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Both surfaces that name an enclave key must render one key as the same 16 characters, or
+    /// the fingerprint an operator wrote down at `enroll` cannot be compared with the one `list`
+    /// and the console print, and the comparison this control exists for is worthless.
+    #[cfg(feature = "console")]
+    #[test]
+    fn the_cli_and_the_console_name_an_enclave_key_identically() {
+        let mut key = [4u8; 65];
+        key[1] = 9;
+        let printed = se_fingerprint(&key);
+        assert_eq!(printed.len(), 16);
+        assert_eq!(printed, hc_console::menu::se_fingerprint(&key));
     }
 
     #[test]

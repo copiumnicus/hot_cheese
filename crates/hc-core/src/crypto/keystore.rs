@@ -16,9 +16,15 @@ pub struct CryptoJson {
     pub cipherparams: CipherparamsJson,
     #[serde(with = "bytes_hex")]
     pub ciphertext: Vec<u8>,
+    #[serde(default = "scrypt_name")]
+    pub kdf: String,
     pub kdfparams: KdfparamsType,
     #[serde(with = "bytes_hex")]
     pub mac: Vec<u8>,
+}
+
+fn scrypt_name() -> String {
+    "scrypt".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize)]

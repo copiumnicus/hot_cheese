@@ -13,8 +13,9 @@
 //! collected so far between devices, and [`qr`] frames one for a camera.
 //!
 //! The key itself is reachable through exactly one function, [`sign::sign_with_grant`]: it
-//! demands a [`grant::SignGrant`] by value, decrypts under the DEK for one signature, and
-//! zeroizes. Everything else here decides WHAT may be signed.
+//! demands a [`grant::SignGrant`] and the keystore container the caller validated before the
+//! approval, both by value, decrypts under the DEK for one signature, and zeroizes. Everything
+//! else here decides WHAT may be signed.
 pub mod adapter;
 pub mod bundle;
 pub mod grant;
@@ -50,7 +51,9 @@ create_err_with_impls!(
     Ecdsa(k256::ecdsa::Error),
     Se(hc_core::mac::secure_enclave::SeErr)
     ;
-    GrantKeyMismatch { grant: String, key: String }
+    GrantKeyMismatch { grant: String, key: String },
+    GrantTermsMismatch { approved: B256, granted: B256 },
+    PolicyKeyMismatch { policy: String, intent: String }
 );
 
 /// The recoverable ECDSA signature plus the address it recovers to.
@@ -75,5 +78,5 @@ pub struct SignResponse {
 /// same derivation, so they are the same code.
 pub(crate) fn address_of(key: &k256::ecdsa::VerifyingKey) -> Address {
     let point = key.to_encoded_point(false);
-    Address::from_slice(&hc_core::crypto::keccak256(point.as_bytes()[1..].to_vec())[12..])
+    Address::from_slice(&hc_core::crypto::keccak256(&point.as_bytes()[1..])[12..])
 }

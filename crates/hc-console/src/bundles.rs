@@ -20,7 +20,7 @@ use hc_core::config::{home_dir, Config};
 use hc_daemon::bundle_poll::Poke;
 use hc_daemon::live::Live;
 use hc_daemon::{OpContext, Operation};
-use hc_sign::bundle::SafeTxBundle;
+use hc_sign::bundle::{Quorum, SafeTxBundle};
 use hc_sign::grant::now_secs;
 use hc_sign::intent::Intent;
 use hc_sign::SignResponse;
@@ -43,6 +43,9 @@ const HOUR_MS: u64 = 3_600_000;
 
 /// Files one directory contributes to a JSON picker.
 const MAX_FILES: usize = 40;
+/// Directory entries inspected before the picker gives up looking for those files. The working
+/// directory is not a trusted store and can contain arbitrarily much unrelated material.
+const MAX_JSON_ENUM_ENTRIES: usize = hc_core::MAX_STORE_ENUM_ENTRIES;
 
 menu_enum!(BundleAction {
     Sign => "Sign with a local key",
@@ -161,7 +164,9 @@ enum Source {
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Source::File(path) => write!(f, "{}", path.display()),
+            Source::File(path) => {
+                f.write_str(&hc_core::safe_diagnostic_text(&path.display().to_string()))
+            }
             Source::Paste => f.write_str("Paste the JSON instead"),
         }
     }
@@ -181,6 +186,18 @@ impl Pick for Source {
 fn short(bytes: &[u8]) -> String {
     let hex = hex::encode(bytes);
     format!("0x{}", &hex[..SHORT.min(hex.len())])
+}
+
+/// Signatures held over what the LOCAL `safes.toml` requires, naming the peer file's figure only
+/// where it disagrees, so a hostile peer's number is never shown as the requirement.
+fn collected(quorum: &Quorum) -> String {
+    match quorum.stated {
+        None => format!("{}/{}", quorum.have, quorum.threshold),
+        Some(stated) => format!(
+            "{}/{} (file claims {stated})",
+            quorum.have, quorum.threshold
+        ),
+    }
 }
 
 /// Take at most [`MAX_LINES`] of a list onto a frame, then say how many were left off it.
@@ -205,11 +222,10 @@ fn row(one: &Loaded, slot: &Slot, rival: bool, signers: &HashMap<Address, String
         }
     }
     format!(
-        "{:<6}{}/{} {:<4}{}  safe {}  chain {}  nonce {}  you: {}",
+        "{:<6}{} {:<4}{}  safe {}  chain {}  nonce {}  you: {}",
         if rival { "RIVAL" } else { "" },
-        one.bundle.signatures.len(),
-        one.bundle.threshold,
-        if one.bundle.met() { "met" } else { "" },
+        collected(&one.quorum),
+        if one.quorum.met { "met" } else { "" },
         short(one.hash.as_slice()),
         short(slot.safe.as_slice()),
         slot.chain_id,
@@ -354,6 +370,7 @@ fn sign(console: &mut Console, hash: B256) -> Result<Step, MenuErr> {
     );
     let intent = hc_bundle::intent_to_sign(SyncMode::Off, hash, &key)?;
     let ctx = OpContext::local(key.clone(), Operation::Sign);
+    let _stable_store = console.rt.git.mutation();
     let response = console
         .rt
         .api
@@ -361,11 +378,11 @@ fn sign(console: &mut Console, hash: B256) -> Result<Step, MenuErr> {
     let signer = response.signer;
     let after = hc_bundle::collect(SyncMode::Off, hash, response)?;
     console.rt.bundles.poke(Poke::Push { hash })?;
+    let quorum = hc_bundle::quorum(&after)?;
     let notice = format!(
-        "signed as {signer} with \"{key}\": {}/{} collected{}",
-        after.signatures.len(),
-        after.threshold,
-        if after.met() { ", threshold met" } else { "" }
+        "signed as {signer} with \"{key}\": {} collected{}",
+        collected(&quorum),
+        if quorum.met { ", threshold met" } else { "" }
     );
     console.signers.insert(signer, key);
     Ok(Step {
@@ -395,29 +412,21 @@ fn status_view(hash: B256) -> Result<String, MenuErr> {
             intent.operation
         ),
         format!(
-            "collected {}/{}{}  packed {} bytes",
-            s.bundle.signatures.len(),
-            s.bundle.threshold,
-            if s.bundle.met() { "  met" } else { "" },
+            "collected {}{}  packed {} bytes",
+            collected(&s.quorum),
+            if s.quorum.met { "  met" } else { "" },
             s.bundle.packed().len()
         ),
     ];
-    if s.safes_threshold != s.bundle.threshold {
+    if let Some(stated) = s.quorum.stated {
         lines.push(format!(
-            "THRESHOLD CHANGED: this bundle was built for {}, safes.toml states {}",
-            s.bundle.threshold, s.safes_threshold
+            "THRESHOLD DISAGREES: safes.toml requires {}, this bundle's file states {stated}",
+            s.quorum.threshold
         ));
     }
     let mut rows = Vec::new();
     for sig in &s.bundle.signatures {
-        rows.push(format!(
-            "  signed  {}{}",
-            sig.signer,
-            match s.not_owners.contains(&sig.signer) {
-                true => "  NOT AN OWNER in safes.toml: the assembled blob reverts",
-                false => "",
-            }
-        ));
+        rows.push(format!("  signed  {}", sig.signer));
     }
     capped(&mut lines, rows);
     let mut rows = Vec::new();
@@ -472,20 +481,19 @@ fn import(console: &Console, hash: B256) -> Result<Step, MenuErr> {
         pick_json(&console.rt.live, "Signature or bundle JSON"),
         MenuChoice::Bundles
     );
-    if let Ok(response) = serde_json::from_slice::<SignResponse>(&bytes) {
+    if let Ok(response) = hc_core::wire::strict_json_from_slice::<SignResponse>(&bytes) {
         let signer = response.signer;
         let after = hc_bundle::collect(SyncMode::Off, hash, response)?;
         console.rt.bundles.poke(Poke::Push { hash })?;
         return Ok(Step {
             choice: MenuChoice::Bundles,
             notice: format!(
-                "took {signer}'s signature: {}/{} collected",
-                after.signatures.len(),
-                after.threshold
+                "took {signer}'s signature: {} collected",
+                collected(&hc_bundle::quorum(&after)?)
             ),
         });
     }
-    let incoming: SafeTxBundle = serde_json::from_slice(&bytes)?;
+    let incoming: SafeTxBundle = hc_core::wire::strict_json_from_slice(&bytes)?;
     let merged = hc_bundle::merge(SyncMode::Off, hash, incoming)?;
     console.rt.bundles.poke(Poke::Push { hash })?;
     let mut added = Vec::new();
@@ -495,11 +503,10 @@ fn import(console: &Console, hash: B256) -> Result<Step, MenuErr> {
     Ok(Step {
         choice: MenuChoice::Bundles,
         notice: format!(
-            "merged {} new signature(s) [{}]: {}/{} collected",
+            "merged {} new signature(s) [{}]: {} collected",
             merged.added.len(),
             added.join(", "),
-            merged.union.signatures.len(),
-            merged.union.threshold
+            collected(&merged.quorum)
         ),
     })
 }
@@ -509,7 +516,7 @@ fn new_bundle(console: &Console) -> Result<Step, MenuErr> {
         pick_json(&console.rt.live, "Intent JSON for the new bundle"),
         MenuChoice::Bundles
     );
-    let intent = match serde_json::from_slice(&bytes)? {
+    let intent = match hc_core::wire::strict_json_from_slice(&bytes)? {
         Intent::SafeTx(intent) => intent,
         Intent::TypedData(_) => {
             return Err(MenuErr::NotBundleable {
@@ -552,20 +559,18 @@ fn remove(hash: B256) -> Result<Step, MenuErr> {
 
 /// Every `.json` file the operator could plausibly mean, so nobody types a path: the hot_cheese
 /// home dir and the directory the console was started in.
-fn json_files() -> Vec<PathBuf> {
-    let mut dirs = vec![home_dir()];
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd);
-    }
+fn json_files_in(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut found = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries.take(MAX_JSON_ENUM_ENTRIES).flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
+            if entry.file_type().is_ok_and(|kind| kind.is_file())
+                && path.extension().is_some_and(|e| e == "json")
+            {
                 found.push(path);
             }
         }
@@ -575,6 +580,14 @@ fn json_files() -> Vec<PathBuf> {
     }
     out.dedup();
     out
+}
+
+fn json_files() -> Vec<PathBuf> {
+    let mut dirs = vec![home_dir()];
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    json_files_in(dirs)
 }
 
 /// A JSON body from a file the operator picks, or from a paste. Both are bytes; nothing here
@@ -591,7 +604,10 @@ fn pick_json(live: &Live, prompt: &str) -> Result<Nav<Vec<u8>>, MenuErr> {
         Nav::Quit => return Ok(Nav::Quit),
     };
     match chosen {
-        Source::File(path) => Ok(Nav::Chose(std::fs::read(&path)?)),
+        Source::File(path) => Ok(Nav::Chose(hc_core::read_regular_file_bounded(
+            &path,
+            hc_bundle::ingest::MAX_FILE_BYTES,
+        )?)),
         Source::Paste => match nav(Text::new("JSON")
             .with_help_message("one line; pick a file for anything pretty-printed")
             .prompt())?
@@ -778,4 +794,33 @@ pub(crate) fn peers_screen(console: &Console) -> Result<Step, MenuErr> {
         choice: MenuChoice::BundlePeers,
         notice,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_picker_is_bounded_and_excludes_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot-cheese-json-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("make picker directory");
+        for i in 0..(MAX_FILES + 8) {
+            std::fs::write(dir.join(format!("{i:03}.json")), b"{}").expect("write fixture");
+        }
+        std::os::unix::fs::symlink(dir.join("000.json"), dir.join("linked.json"))
+            .expect("make symlink fixture");
+
+        let found = json_files_in(vec![dir.clone()]);
+        assert_eq!(found.len(), MAX_FILES);
+        assert!(!found.iter().any(|path| path.ends_with("linked.json")));
+
+        std::fs::remove_dir_all(dir).expect("remove picker directory");
+    }
 }

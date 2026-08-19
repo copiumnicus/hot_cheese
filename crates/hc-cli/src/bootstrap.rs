@@ -44,26 +44,36 @@
 //!   Secure Enclave enrollment on A (see [`select_authority_unlocker`]).
 //! - **B re-wraps under its OWN keys.** A's keyring enrollments (A's `se_pub` /
 //!   stored `eph_pub`) are device-bound and meaningless on B, so B builds a FRESH
-//!   keyring enrolling the DEK under B's SE (and, if `HOT_CHEESE_BOOTSTRAP_PASSPHRASE`
-//!   is set, a recovery passphrase). A's `keyring.json` is never copied. The one thing
+//!   keyring enrolling the DEK under B's SE (and, with `--recovery-passphrase`, a
+//!   recovery passphrase read from a masked prompt or stdin). A's `keyring.json` is
+//!   never copied. The one thing
 //!   B does copy from it is A's vault id, carried in `OFFER`: B holds the SAME DEK, so
 //!   it is the same vault and must back up into the same remote subtree.
 //! - The plaintext DEK exists transiently in A's and B's process memory during the
 //!   ritual; it is zeroized as soon as it is no longer needed.
 use err_mac::create_err_with_impls;
 use hc_core::config::Config;
-use hc_core::crypto::envelope::{self, Dek, EncFile};
+use hc_core::crypto::envelope::{
+    self, atomic_write_new, enforce_store_modes, Dek, EncFile, MAX_KEYSTORE_FILE_BYTES,
+};
+use hc_core::is_valid_key_name;
 use hc_core::keyring::{Keyring, VaultId, KEYRING_FILE};
 use hc_core::mac::secure_enclave;
 use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
+use hc_sign::policy::{Policy, MAX_POLICY_BYTES};
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;
 use p256::{PublicKey, SecretKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::io::{Read, Write};
+use sha2::{Digest, Sha256};
+use std::io::{IsTerminal, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Keychain label for this host's Secure Enclave bootstrap key. Stable per machine.
@@ -74,14 +84,22 @@ const PROTO: u32 = 1;
 const HKDF_INFO: &[u8] = b"hotcheese/bootstrap/v1";
 /// Uncompressed SEC1 P-256 public key length (`0x04 || X || Y`).
 const SEC1_LEN: usize = 65;
-/// Hard cap on a single frame payload (defends the reader against a hostile peer
-/// claiming a huge length). Keystore files are tiny; 16 MiB is generous.
-const MAX_FRAME: u32 = 16 * 1024 * 1024;
-/// Env var: if set, B also enrolls a recovery passphrase from this value so the
-/// restored envelope survives loss of B's Secure Enclave key.
-const PASSPHRASE_ENV: &str = "HOT_CHEESE_BOOTSTRAP_PASSPHRASE";
+/// Hard cap on a single frame payload. A maximum-sized keystore is hex encoded inside JSON,
+/// so 512 KiB leaves ample framing room while bounding allocation before deserialization.
+const MAX_FRAME: u32 = 512 * 1024;
+/// Same whole-store ceilings used by backup-tree validation.
+const MAX_BOOTSTRAP_FILES: usize = hc_core::MAX_STORE_FILES;
+const MAX_BOOTSTRAP_BYTES: u64 = hc_core::MAX_STORE_BYTES;
 /// Touch ID sheet text for B's enclave ECDH that opens the DEK sealed by the authority.
 const ECDH_REASON: &str = "Unlock this machine's hot_cheese enclave key for bootstrap";
+/// Ceiling on a piped passphrase: the enrolment maximum plus its trailing newline.
+const MAX_PIPED_PASSPHRASE_BYTES: u64 = hc_core::unlock::pass::MAX_NEW_PASSPHRASE_BYTES as u64 + 1;
+const SSH_CONNECT_TIMEOUT_SECS: u64 = 5;
+const SSH_ALIVE_INTERVAL_SECS: u64 = 5;
+const SSH_ALIVE_COUNT_MAX: u64 = 3;
+/// The whole explicit, interactive ritual, including Touch ID on both machines.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MAX_SSH_STDERR_BYTES: u64 = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -95,6 +113,7 @@ const ECDH_REASON: &str = "Unlock this machine's hot_cheese enclave key for boot
 //   NoSeAuthority  A has no Secure Enclave enrollment, so it cannot authorize headless
 //   DekOpenFailed  sealed-DEK AEAD open failed (wrong key / tamper / relay); nothing saved
 //   Ssh            the ssh child could not be spawned or exited non-zero
+//   SshTimeout     the complete SSH bootstrap ritual exceeded its wall-clock deadline
 create_err_with_impls!(
     #[derive(Debug)]
     pub BootstrapErr,
@@ -105,15 +124,26 @@ create_err_with_impls!(
     NoSeAuthority,
     DekOpenFailed,
     Ssh,
+    SshTimeout,
     StdIo(std::io::Error),
     SerdeJson(serde_json::Error),
+    Passphrase(crate::PassphraseErr),
     Config(hc_core::config::ConfigErr),
+    SshTarget(hc_core::config::SshTargetErr),
     Keyring(hc_core::keyring::KeyringErr),
     Unlock(hc_core::unlock::UnlockErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
+    Policy(hc_sign::policy::PolicyErr),
     Se(hc_core::mac::secure_enclave::SeErr),
     P256(p256::elliptic_curve::Error)
     ;
+    UnsafeFileName { name: String },
+    DuplicateFile { name: String },
+    TooManyFiles { found: usize, max: usize },
+    FileTooLarge { name: String, size: u64, max: u64 },
+    StoreTooLarge { size: u64, max: u64 },
+    ManifestMismatch { expected: String, found: String },
+    DestinationExists { path: PathBuf },
 );
 
 // ---------------------------------------------------------------------------
@@ -225,6 +255,7 @@ impl Tag {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Hello {
     proto: u32,
     #[serde(with = "hex::serde")]
@@ -232,6 +263,7 @@ struct Hello {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Offer {
     #[serde(with = "hex::serde")]
     eph_pub: Vec<u8>,
@@ -244,6 +276,7 @@ struct Offer {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileMsg {
     name: String,
     /// Raw on-disk bytes of the keystore `EncFile` JSON, shipped verbatim.
@@ -252,18 +285,48 @@ struct FileMsg {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Done {
     count: u32,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Ack {
     ok: bool,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ErrorMsg {
     msg: String,
+}
+
+/// Cancels the process-global authority deadline on every ordinary return. The hidden
+/// `bootstrap-serve` command is a single-purpose process; the default SIGALRM action is a safe
+/// last resort when a custom SSH caller stops mid-protocol while this process holds the store
+/// claim. The client has its own independently enforced watchdog as well.
+struct AuthorityAlarm;
+
+impl AuthorityAlarm {
+    fn start() -> Self {
+        let seconds = u32::try_from(BOOTSTRAP_TIMEOUT.as_secs()).unwrap_or(u32::MAX);
+        // SAFETY: `alarm` only schedules SIGALRM for this single-purpose process. No signal
+        // handler or shared memory is installed, and Drop cancels it on every ordinary return.
+        unsafe {
+            libc::alarm(seconds);
+        }
+        Self
+    }
+}
+
+impl Drop for AuthorityAlarm {
+    fn drop(&mut self) {
+        // SAFETY: cancelling a process alarm has no pointer or lifetime preconditions.
+        unsafe {
+            libc::alarm(0);
+        }
+    }
 }
 
 /// Serialize `payload` as JSON and write one framed message.
@@ -305,14 +368,14 @@ fn read_frame<R: Read>(r: &mut R) -> Result<(Tag, Vec<u8>), BootstrapErr> {
 fn read_expect<R: Read, T: DeserializeOwned>(r: &mut R, expect: Tag) -> Result<T, BootstrapErr> {
     let (tag, body) = read_frame(r)?;
     if tag == Tag::Error {
-        let e: ErrorMsg = serde_json::from_slice(&body)?;
-        tracing::error!(peer_msg = %e.msg, "bootstrap peer aborted");
+        let e: ErrorMsg = hc_core::wire::strict_json_from_slice(&body)?;
+        tracing::error!(peer_msg = %hc_core::safe_diagnostic_text(&e.msg), "bootstrap peer aborted");
         return Err(BootstrapErr::PeerAbort);
     }
     if tag != expect {
         return Err(BootstrapErr::Protocol);
     }
-    Ok(serde_json::from_slice(&body)?)
+    Ok(hc_core::wire::strict_json_from_slice(&body)?)
 }
 
 /// Best-effort `ERROR` frame so the peer aborts cleanly instead of seeing a dropped
@@ -331,24 +394,169 @@ fn send_error<W: Write>(w: &mut W, msg: &str) {
 // Store-file enumeration
 // ---------------------------------------------------------------------------
 
-/// Names of keystore files A should ship: every regular file in the store dir
-/// EXCEPT `keyring.json` (A's enrollments are device-bound and rebuilt on B) and
-/// transient `*.hctmp` writes. Sorted for deterministic framing.
+/// The only two relative path shapes bootstrap may carry. Keeping this grammar identical to
+/// the backup tree prevents a peer-controlled name from escaping `store` at persistence time.
+#[derive(Clone, Copy)]
+enum StoreFile<'a> {
+    Keystore(&'a str),
+    Policy,
+}
+
+fn store_file(name: &str) -> Result<StoreFile<'_>, BootstrapErr> {
+    if !name.contains('/') && is_valid_key_name(name) {
+        return Ok(StoreFile::Keystore(name));
+    }
+    if let Some(file) = name.strip_prefix("policies/") {
+        if !file.contains('/') {
+            if let Some(key) = file.strip_suffix(".toml") {
+                if is_valid_key_name(key) {
+                    return Ok(StoreFile::Policy);
+                }
+            }
+        }
+    }
+    Err(BootstrapErr::UnsafeFileName {
+        name: hc_core::safe_diagnostic_text(name),
+    })
+}
+
+fn max_file_bytes(name: &str) -> Result<u64, BootstrapErr> {
+    Ok(match store_file(name)? {
+        StoreFile::Keystore(_) => MAX_KEYSTORE_FILE_BYTES,
+        StoreFile::Policy => MAX_POLICY_BYTES,
+    })
+}
+
+/// Validate bytes before they are accepted from or sent to a peer. When `dek` is available,
+/// opening a keystore also proves its AEAD, filename AAD, and DEK all agree.
+fn validate_store_file(name: &str, body: &[u8], dek: Option<&Dek>) -> Result<(), BootstrapErr> {
+    let max = max_file_bytes(name)?;
+    if body.len() as u64 > max {
+        return Err(BootstrapErr::FileTooLarge {
+            name: name.to_string(),
+            size: body.len() as u64,
+            max,
+        });
+    }
+    match store_file(name)? {
+        StoreFile::Keystore(key) => {
+            let parsed = envelope::parse_keystore(body)?;
+            if let Some(dek) = dek {
+                let _plaintext = parsed.open(key, dek)?;
+            }
+        }
+        StoreFile::Policy => {
+            Policy::parse(body)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_total(total: &mut u64, size: u64) -> Result<(), BootstrapErr> {
+    *total = total.checked_add(size).ok_or(BootstrapErr::StoreTooLarge {
+        size: u64::MAX,
+        max: MAX_BOOTSTRAP_BYTES,
+    })?;
+    if *total > MAX_BOOTSTRAP_BYTES {
+        return Err(BootstrapErr::StoreTooLarge {
+            size: *total,
+            max: MAX_BOOTSTRAP_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn check_manifest(names: &[String]) -> Result<(), BootstrapErr> {
+    if names.len() > MAX_BOOTSTRAP_FILES {
+        return Err(BootstrapErr::TooManyFiles {
+            found: names.len(),
+            max: MAX_BOOTSTRAP_FILES,
+        });
+    }
+    let mut previous: Option<&str> = None;
+    for name in names {
+        store_file(name)?;
+        if previous.is_some_and(|prior| prior >= name.as_str()) {
+            if previous == Some(name.as_str()) {
+                return Err(BootstrapErr::DuplicateFile { name: name.clone() });
+            }
+            return Err(BootstrapErr::Protocol);
+        }
+        previous = Some(name.as_str());
+    }
+    Ok(())
+}
+
+/// Names A should ship: root keystores plus per-key policies. A's device-bound keyring is
+/// rebuilt on B, transient writes and every unknown path are excluded. Sorted and bounded.
 fn shippable_files(store: &Path) -> Result<Vec<String>, BootstrapErr> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(store)? {
+    for (at, entry) in std::fs::read_dir(store)?.enumerate() {
+        if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+            return Err(BootstrapErr::TooManyFiles {
+                found: at + 1,
+                max: hc_core::MAX_STORE_ENUM_ENTRIES,
+            });
+        }
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == KEYRING_FILE || name.ends_with(".hctmp") {
-            continue;
+        if let Some(name) = entry.file_name().to_str() {
+            if is_valid_key_name(name) {
+                names.push(name.to_string());
+            }
         }
-        names.push(name);
+    }
+    let policies = store.join("policies");
+    if std::fs::symlink_metadata(&policies).is_ok_and(|m| m.file_type().is_dir()) {
+        for (at, entry) in std::fs::read_dir(policies)?.enumerate() {
+            if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+                return Err(BootstrapErr::TooManyFiles {
+                    found: at + 1,
+                    max: hc_core::MAX_STORE_ENUM_ENTRIES,
+                });
+            }
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if let Some(file) = entry.file_name().to_str() {
+                if let Some(key) = file.strip_suffix(".toml") {
+                    if is_valid_key_name(key) {
+                        names.push(format!("policies/{file}"));
+                    }
+                }
+            }
+        }
     }
     names.sort();
+    check_manifest(&names)?;
+
+    let mut total = 0u64;
+    for name in &names {
+        let size = std::fs::metadata(store.join(name))?.len();
+        let max = max_file_bytes(name)?;
+        if size > max {
+            return Err(BootstrapErr::FileTooLarge {
+                name: name.clone(),
+                size,
+                max,
+            });
+        }
+        add_total(&mut total, size)?;
+    }
     Ok(names)
+}
+
+fn read_store_file(store: &Path, name: &str, dek: &Dek) -> Result<Vec<u8>, BootstrapErr> {
+    let max = max_file_bytes(name)?;
+    let mut body = Vec::new();
+    hc_core::open_regular_file(&store.join(name))?
+        .take(max + 1)
+        .read_to_end(&mut body)?;
+    validate_store_file(name, &body, Some(dek))?;
+    Ok(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -372,28 +580,36 @@ fn select_authority_unlocker(keyring: &Keyring) -> Result<SecureEnclaveUnlocker,
     }
 }
 
-/// Authority handshake over an arbitrary transport. `serve_dek` supplies A's DEK
-/// (gated behind whatever authorization A requires) and `store` is A's keystore dir.
-/// Separated from [`bootstrap_serve`] so tests can drive it over an in-memory pipe.
-fn serve<R: Read, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    dek: &Dek,
-    store: &Path,
-    vault_id: Option<&VaultId>,
-) -> Result<(), BootstrapErr> {
-    // 1. HELLO from B.
+/// Parse every public fact needed to identify a bootstrap recipient before the authority is asked
+/// to unlock anything. Garbage, a version mismatch, and malformed SEC1 all fail without Touch ID.
+fn receive_hello<R: Read, W: Write>(r: &mut R, w: &mut W) -> Result<Vec<u8>, BootstrapErr> {
     let hello: Hello = read_expect(r, Tag::Hello)?;
     if hello.proto != PROTO {
         send_error(w, "unsupported proto version");
         return Err(BootstrapErr::ProtoMismatch);
     }
-    if let Err(e) = check_sec1(&hello.b_se_pub) {
+    if let Err(error) = check_sec1(&hello.b_se_pub) {
         send_error(w, "bad b_se_pub");
-        return Err(e);
+        return Err(error);
     }
-    let b_se_pub = hello.b_se_pub;
+    // Parse the point now as well. A length/tag check is only framing; rejecting a point that is
+    // not on P-256 before Touch ID keeps every deterministic refusal ahead of authorization.
+    if let Err(error) = PublicKey::from_sec1_bytes(&hello.b_se_pub) {
+        send_error(w, "invalid b_se_pub point");
+        return Err(error.into());
+    }
+    Ok(hello.b_se_pub)
+}
 
+/// Authority handshake after a validated recipient has already been identified and authorized.
+fn serve_after_hello<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    dek: &Dek,
+    store: &Path,
+    vault_id: Option<&VaultId>,
+    b_se_pub: Vec<u8>,
+) -> Result<(), BootstrapErr> {
     // 2. Ephemeral P-256 keypair E; seal the DEK to B under HKDF(ECDH(E, b_se_pub)).
     let eph = EcdhKey::Software(SecretKey::random(&mut rand::rngs::OsRng));
     let eph_pub = match eph.public_sec1() {
@@ -446,8 +662,10 @@ fn serve<R: Read, W: Write>(
     )?;
 
     let mut count: u32 = 0;
+    let mut total = 0u64;
     for name in &names {
-        let body = std::fs::read(store.join(name))?;
+        let body = read_store_file(store, name, dek)?;
+        add_total(&mut total, body.len() as u64)?;
         write_frame(
             w,
             Tag::File,
@@ -469,28 +687,53 @@ fn serve<R: Read, W: Write>(
     Ok(())
 }
 
+/// Authority handshake over an arbitrary transport. `dek` is already available in tests; the
+/// production entry point performs the public HELLO preflight before unlocking it.
+#[cfg(test)]
+fn serve<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    dek: &Dek,
+    store: &Path,
+    vault_id: Option<&VaultId>,
+) -> Result<(), BootstrapErr> {
+    let b_se_pub = receive_hello(r, w)?;
+    serve_after_hello(r, w, dek, store, vault_id, b_se_pub)
+}
+
 /// Run on the AUTHORITY machine (invoked over SSH as `hot_cheese bootstrap-serve`):
 /// serve the handshake over this process's own stdin/stdout.
 pub fn bootstrap_serve() -> Result<(), BootstrapErr> {
+    let _deadline = AuthorityAlarm::start();
     let config = Config::load()?;
     let store: PathBuf = config.store_path();
     let keyring = Keyring::load(&store.join(KEYRING_FILE))?;
 
     let unlocker = select_authority_unlocker(&keyring)?;
-    // Touch ID on A authorizes the transfer here.
-    let dek = unlocker.unlock(
-        "authorize hot_cheese bootstrap to a new machine",
-        &keyring,
-        None,
-    )?;
-
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut r = stdin.lock();
     let mut w = stdout.lock();
-    let res = serve(&mut r, &mut w, &dek, &store, keyring.vault_id.as_ref());
+    let b_se_pub = receive_hello(&mut r, &mut w)?;
+    let fingerprint = hex::encode(&Sha256::digest(&b_se_pub)[..8]);
+    tracing::warn!(recipient_key_sha256 = %fingerprint, "authorizing bootstrap recipient");
+    // Touch ID on A authorizes the transfer only after the sheet can name B's key fingerprint.
+    let dek = unlocker.unlock(
+        &format!("authorize bootstrap to recipient {fingerprint}"),
+        &keyring,
+        None,
+    )?;
+
+    let res = serve_after_hello(
+        &mut r,
+        &mut w,
+        &dek,
+        &store,
+        keyring.vault_id.as_ref(),
+        b_se_pub,
+    );
     if let Err(ref e) = res {
-        tracing::error!(err = ?e, "bootstrap serve failed");
+        tracing::error!(error = %hc_core::safe_diagnostic_text(&e.to_string()), "bootstrap serve failed");
     }
     res
 }
@@ -531,6 +774,7 @@ fn client<R: Read, W: Write>(
 
     // 2. OFFER → recover the DEK via ECDH on B's key.
     let offer: Offer = read_expect(r, Tag::Offer)?;
+    check_manifest(&offer.manifest)?;
     if let Err(e) = check_sec1(&offer.eph_pub) {
         send_error(w, "bad eph_pub");
         return Err(e);
@@ -569,24 +813,38 @@ fn client<R: Read, W: Write>(
 
     // 3. Collect FILE frames into memory until DONE.
     let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(offer.manifest.len());
+    let mut total = 0u64;
     loop {
         let (tag, body) = read_frame(r)?;
         match tag {
             Tag::File => {
-                let f: FileMsg = serde_json::from_slice(&body)?;
+                let f: FileMsg = hc_core::wire::strict_json_from_slice(&body)?;
+                let Some(expected) = offer.manifest.get(files.len()) else {
+                    send_error(w, "more files than manifest entries");
+                    return Err(BootstrapErr::Protocol);
+                };
+                if &f.name != expected {
+                    send_error(w, "file does not match manifest order");
+                    return Err(BootstrapErr::ManifestMismatch {
+                        expected: expected.clone(),
+                        found: hc_core::safe_diagnostic_text(&f.name),
+                    });
+                }
+                validate_store_file(expected, &f.body, Some(&dek))?;
+                add_total(&mut total, f.body.len() as u64)?;
                 files.push((f.name, f.body));
             }
             Tag::Done => {
-                let done: Done = serde_json::from_slice(&body)?;
-                if done.count as usize != files.len() {
+                let done: Done = hc_core::wire::strict_json_from_slice(&body)?;
+                if done.count as usize != files.len() || files.len() != offer.manifest.len() {
                     send_error(w, "file count mismatch");
                     return Err(BootstrapErr::Protocol);
                 }
                 break;
             }
             Tag::Error => {
-                let e: ErrorMsg = serde_json::from_slice(&body)?;
-                tracing::error!(peer_msg = %e.msg, "bootstrap authority aborted");
+                let e: ErrorMsg = hc_core::wire::strict_json_from_slice(&body)?;
+                tracing::error!(peer_msg = %hc_core::safe_diagnostic_text(&e.msg), "bootstrap authority aborted");
                 return Err(BootstrapErr::PeerAbort);
             }
             _ => {
@@ -603,93 +861,432 @@ fn client<R: Read, W: Write>(
     })
 }
 
+/// The recovery passphrase `--recovery-passphrase` enrolls on B: a masked, confirmed prompt on a
+/// terminal, and stdin otherwise, so automation never puts this KEK in argv or the environment
+/// where any same-uid process reads it back out.
+fn read_new_passphrase() -> Result<Zeroizing<String>, crate::PassphraseErr> {
+    if std::io::stdin().is_terminal() {
+        return crate::prompt_new_passphrase();
+    }
+    let piped = passphrase_from_reader(std::io::stdin().lock())?;
+    crate::check_new_passphrase(&piped)?;
+    Ok(piped)
+}
+
+/// One passphrase, bounded, minus a single trailing newline. An empty read is a refusal, never
+/// an empty passphrase.
+fn passphrase_from_reader<R: Read>(reader: R) -> Result<Zeroizing<String>, crate::PassphraseErr> {
+    let bytes = Zeroizing::new(hc_core::read_bounded(reader, MAX_PIPED_PASSPHRASE_BYTES)?);
+    let text = std::str::from_utf8(&bytes)?;
+    let text = match text.strip_suffix('\n') {
+        Some(stripped) => stripped.strip_suffix('\r').unwrap_or(stripped),
+        None => text,
+    };
+    if text.is_empty() {
+        return Err(crate::PassphraseErr::Empty);
+    }
+    Ok(Zeroizing::new(text.to_string()))
+}
+
 /// Write each staged keystore file into `store` (atomically), build a FRESH keyring
 /// enrolling the DEK under B's own SE (plus an optional recovery passphrase), and
 /// save it to `<store>/keyring.json`. A's `keyring.json` is intentionally NOT copied.
-fn persist<F>(store: &Path, received: &Received, enroll_se: F) -> Result<(), BootstrapErr>
+fn persist<F>(
+    store: &Path,
+    received: &Received,
+    passphrase: Option<Zeroizing<String>>,
+    enroll_se: F,
+) -> Result<(), BootstrapErr>
 where
     F: Fn(&Dek) -> Result<hc_core::keyring::Enrollment, BootstrapErr>,
 {
+    // Bootstrap is a provisioning operation, not a merge. Refuse a mixed store before enrolling
+    // or prompting on this machine; otherwise an unlisted local ciphertext could survive beside
+    // a keyring for a different DEK and fail only when somebody later tries to use it.
+    preflight_empty_destination(store)?;
+
     // Build the keyring FIRST: enrolling under B's Secure Enclave prompts Touch ID and can
     // fail, so do it before writing any keystore file — a failure then leaves the store
     // untouched rather than orphaning unkeyed ciphertext.
     let mut keyring = Keyring::new();
     keyring.vault_id = received.vault_id.clone();
     keyring.add(enroll_se(&received.dek)?);
-    if let Ok(pass) = std::env::var(PASSPHRASE_ENV) {
-        if !pass.is_empty() {
-            let pu = PassphraseUnlocker::new(pass);
-            keyring.add(pu.enroll("bootstrap recovery", &received.dek)?);
-        }
+    if let Some(passphrase) = passphrase {
+        keyring.add(
+            PassphraseUnlocker::from_secret(passphrase)
+                .enroll("bootstrap recovery", &received.dek)?,
+        );
     }
 
-    // Write the keystore files and the keyring; on any error remove whatever we wrote this
-    // run so we never leave a partial (unkeyed or unrecoverable) store behind.
+    // Every destination is created exclusively. A pre-existing key, policy, keyring or symlink
+    // is never replaced, even if another process races this bootstrap after its preflight.
     std::fs::create_dir_all(store)?;
-    if let Err(e) = write_store_and_keyring(store, received, &keyring) {
-        for (name, _) in &received.files {
-            let _ = std::fs::remove_file(store.join(name));
+    write_store_and_keyring(store, received, &keyring)
+}
+
+fn preflight_empty_destination(store: &Path) -> Result<(), BootstrapErr> {
+    match std::fs::symlink_metadata(store) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(BootstrapErr::DestinationExists {
+                path: store.to_path_buf(),
+            })
         }
-        let _ = std::fs::remove_file(store.join(KEYRING_FILE));
-        return Err(e);
+    }
+    if let Some(entry) = std::fs::read_dir(store)?.next() {
+        return Err(BootstrapErr::DestinationExists {
+            path: entry?.path(),
+        });
     }
     Ok(())
 }
 
-/// Write every received keystore file (atomically) and then the fresh keyring.
+fn destination_absent(path: &Path) -> Result<(), BootstrapErr> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(BootstrapErr::DestinationExists {
+            path: path.to_path_buf(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Validate the complete set before any write, then create every file atomically and
+/// exclusively. On failure, remove only paths this invocation successfully created.
+struct CreatedFile {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl CreatedFile {
+    fn record(path: PathBuf) -> Result<Self, std::io::Error> {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "new bootstrap destination is not a regular file",
+            ));
+        }
+        Ok(Self {
+            path,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    fn remove(self) {
+        let ours = std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && metadata.dev() == self.dev
+                && metadata.ino() == self.ino
+        });
+        if ours {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
 fn write_store_and_keyring(
     store: &Path,
     received: &Received,
     keyring: &Keyring,
 ) -> Result<(), BootstrapErr> {
-    for (name, body) in &received.files {
-        envelope::atomic_write(&store.join(name), body)?;
+    if received.files.len() > MAX_BOOTSTRAP_FILES {
+        return Err(BootstrapErr::TooManyFiles {
+            found: received.files.len(),
+            max: MAX_BOOTSTRAP_FILES,
+        });
     }
-    keyring.save(&store.join(KEYRING_FILE))?;
+    let mut names = Vec::with_capacity(received.files.len());
+    let mut total = 0u64;
+    for (name, body) in &received.files {
+        validate_store_file(name, body, Some(&received.dek))?;
+        add_total(&mut total, body.len() as u64)?;
+        names.push(name.clone());
+    }
+    names.sort();
+    check_manifest(&names)?;
+    let mut created_policies = false;
+    if names.iter().any(|name| name.starts_with("policies/")) {
+        let policies = store.join("policies");
+        match std::fs::symlink_metadata(&policies) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err(BootstrapErr::DestinationExists { path: policies }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&policies)?;
+                created_policies = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for name in &names {
+        destination_absent(&store.join(name))?;
+    }
+    let keyring_path = store.join(KEYRING_FILE);
+    destination_absent(&keyring_path)?;
+
+    keyring.validate()?;
+    let keyring_json = serde_json::to_vec_pretty(keyring)?;
+    let mut created: Vec<CreatedFile> = Vec::with_capacity(received.files.len() + 1);
+    let result: Result<(), BootstrapErr> = (|| {
+        for (name, body) in &received.files {
+            let path = store.join(name);
+            atomic_write_new(&path, body)?;
+            created.push(CreatedFile::record(path)?);
+        }
+        atomic_write_new(&keyring_path, &keyring_json)?;
+        created.push(CreatedFile::record(keyring_path)?);
+        enforce_store_modes(store)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for path in created.into_iter().rev() {
+            path.remove();
+        }
+        if created_policies {
+            let _ = std::fs::remove_dir(store.join("policies"));
+        }
+        return Err(error);
+    }
     Ok(())
+}
+
+/// Result produced by the thread that exclusively owns and reaps the SSH child. The child joins
+/// the watchdog sentinel's live process group, so the sentinel keeps that group identity reserved
+/// while this thread waits and can terminate every descendant without a reused numeric PID.
+enum ManagedExit {
+    Exited(std::io::Result<ExitStatus>),
+    TimedOut,
+    Aborted,
+}
+
+#[derive(Clone, Copy)]
+enum ManagerControl {
+    Complete,
+    Abort,
+}
+
+fn kill_child_group(child: &mut Child, watchdog: &mut hc_core::ParentDeathGuard) {
+    let _ = watchdog.terminate_group();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn manage_ssh_child(
+    mut child: Child,
+    mut watchdog: hc_core::ParentDeathGuard,
+    control: mpsc::Receiver<ManagerControl>,
+    timeout: Duration,
+) -> ManagedExit {
+    let started = Instant::now();
+    let mut completed = false;
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => status = Some(exit),
+                Err(error) => {
+                    kill_child_group(&mut child, &mut watchdog);
+                    return ManagedExit::Exited(Err(error));
+                }
+                Ok(None) => {}
+            }
+        }
+        if completed {
+            if let Some(status) = status.take() {
+                // The protocol owner has closed its pipe handles and the direct ssh process has
+                // exited. No descendant is still part of the operation; kill any process-group
+                // residue so inherited stderr/stdout descriptors cannot block cleanup.
+                kill_child_group(&mut child, &mut watchdog);
+                return ManagedExit::Exited(Ok(status));
+            }
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            kill_child_group(&mut child, &mut watchdog);
+            return ManagedExit::TimedOut;
+        }
+        match control.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(ManagerControl::Complete) => completed = true,
+            Ok(ManagerControl::Abort) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                kill_child_group(&mut child, &mut watchdog);
+                return ManagedExit::Aborted;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Render remote diagnostics without allowing control bytes, newlines, or terminal escape
+/// sequences into the operator's terminal. The retained stderr itself is already bounded.
+fn ssh_stderr_for_log(bytes: &[u8]) -> String {
+    hc_core::safe_diagnostic(bytes)
+}
+
+/// Owns the SSH manager and stderr-drain threads. Dropping it on any early protocol or
+/// persistence error aborts the complete child process group and reaps it.
+struct BootstrapSsh {
+    control: Option<mpsc::Sender<ManagerControl>>,
+    manager: Option<JoinHandle<ManagedExit>>,
+    stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+}
+
+impl BootstrapSsh {
+    fn spawn(target: &str) -> Result<(Self, ChildStdin, ChildStdout), BootstrapErr> {
+        let mut command = Command::new("/usr/bin/ssh");
+        // `ssh` resolves `~` from the passwd database, not $HOME.
+        command.env_clear();
+        if let Some(agent) = std::env::var_os("SSH_AUTH_SOCK") {
+            command.env("SSH_AUTH_SOCK", agent);
+        }
+        command
+            .arg("-T")
+            .arg("-F")
+            .arg("/dev/null")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg("UserKnownHostsFile=~/.ssh/known_hosts")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ClearAllForwardings=yes")
+            .arg("-o")
+            .arg("PermitLocalCommand=no")
+            .arg("-o")
+            .arg("ForkAfterAuthentication=no")
+            .arg("-o")
+            .arg("ControlMaster=no")
+            .arg("-o")
+            .arg("ControlPath=none")
+            .arg("-o")
+            .arg("ConnectionAttempts=1")
+            .arg("-o")
+            .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
+            .arg("-o")
+            .arg(format!("ServerAliveInterval={SSH_ALIVE_INTERVAL_SECS}"))
+            .arg("-o")
+            .arg(format!("ServerAliveCountMax={SSH_ALIVE_COUNT_MAX}"))
+            .arg(target)
+            .arg("hot_cheese")
+            .arg("bootstrap-serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut watchdog = hc_core::ParentDeathGuard::start().map_err(|_| BootstrapErr::Ssh)?;
+        watchdog.configure(&mut command);
+        let mut child = command.spawn().map_err(|_| BootstrapErr::Ssh)?;
+        let Some(stdin) = child.stdin.take() else {
+            kill_child_group(&mut child, &mut watchdog);
+            return Err(BootstrapErr::Ssh);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            kill_child_group(&mut child, &mut watchdog);
+            return Err(BootstrapErr::Ssh);
+        };
+        let Some(stderr) = child.stderr.take() else {
+            kill_child_group(&mut child, &mut watchdog);
+            return Err(BootstrapErr::Ssh);
+        };
+
+        let (control_tx, control_rx) = mpsc::channel();
+        let manager = std::thread::spawn(move || {
+            manage_ssh_child(child, watchdog, control_rx, BOOTSTRAP_TIMEOUT)
+        });
+        let stderr =
+            std::thread::spawn(move || hc_core::read_bounded(stderr, MAX_SSH_STDERR_BYTES));
+        Ok((
+            Self {
+                control: Some(control_tx),
+                manager: Some(manager),
+                stderr: Some(stderr),
+            },
+            stdin,
+            stdout,
+        ))
+    }
+
+    fn take_stderr(&mut self) -> Result<Vec<u8>, BootstrapErr> {
+        let Some(reader) = self.stderr.take() else {
+            return Err(BootstrapErr::Ssh);
+        };
+        reader.join().map_err(|_| BootstrapErr::Ssh)?.map_err(|error| {
+            tracing::error!(%error, max = MAX_SSH_STDERR_BYTES, "ssh stderr exceeded its boundary");
+            BootstrapErr::Ssh
+        })
+    }
+
+    fn wait(mut self) -> Result<ExitStatus, BootstrapErr> {
+        if let Some(control) = self.control.take() {
+            let _ = control.send(ManagerControl::Complete);
+        }
+        let Some(manager) = self.manager.take() else {
+            return Err(BootstrapErr::Ssh);
+        };
+        let outcome = manager.join().map_err(|_| BootstrapErr::Ssh)?;
+        let stderr = self.take_stderr()?;
+        if !stderr.is_empty() {
+            tracing::warn!(stderr = %ssh_stderr_for_log(&stderr), "ssh bootstrap diagnostic");
+        }
+        match outcome {
+            ManagedExit::Exited(status) => Ok(status.map_err(|_| BootstrapErr::Ssh)?),
+            ManagedExit::TimedOut => Err(BootstrapErr::SshTimeout),
+            ManagedExit::Aborted => Err(BootstrapErr::Ssh),
+        }
+    }
+}
+
+impl Drop for BootstrapSsh {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.take() {
+            let _ = control.send(ManagerControl::Abort);
+        }
+        if let Some(manager) = self.manager.take() {
+            let _ = manager.join();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
 }
 
 /// Run on the NEW machine: spawn `ssh <target> hot_cheese bootstrap-serve`, recover
 /// the DEK (ECIES-sealed to this machine's SE key), receive the store, re-wrap the
 /// DEK under this machine's own keyring, and persist everything.
-pub fn bootstrap_from(target: &str) -> Result<(), BootstrapErr> {
-    use std::process::{Command, Stdio};
-
+pub fn bootstrap_from(target: &str, recovery_passphrase: bool) -> Result<(), BootstrapErr> {
+    hc_core::config::validate_ssh_target(target)?;
     let config = Config::load()?;
     let store: PathBuf = config.store_path();
+    preflight_empty_destination(&store)?;
+
+    // Collected before the ritual opens, so a mistyped confirmation costs nobody a Touch ID.
+    let passphrase = if recovery_passphrase {
+        Some(read_new_passphrase()?)
+    } else {
+        None
+    };
 
     // B's Secure Enclave key (created idempotently); its public point is the HELLO id.
     secure_enclave::ensure_se_key(LABEL)?;
     let b_se_pub = secure_enclave::se_public_key(LABEL)?;
+    tracing::warn!(
+        recipient_key_sha256 = %hex::encode(&Sha256::digest(&b_se_pub)[..8]),
+        "bootstrap recipient key; compare this fingerprint with the authority's Touch ID prompt"
+    );
     let my_key = EcdhKey::SecureEnclave(LABEL.to_string());
-
-    let mut child = Command::new("ssh")
-        .arg(target)
-        .arg("hot_cheese")
-        .arg("bootstrap-serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|_| BootstrapErr::Ssh)?;
 
     // Keep both pipe halves alive for the whole ritual: we must send ACK back to A
     // over `w` only AFTER B has safely persisted the DEK.
-    let mut w = child.stdin.take().ok_or(BootstrapErr::Ssh)?;
-    let mut rd = child.stdout.take().ok_or(BootstrapErr::Ssh)?;
-
-    let received = match client(&mut rd, &mut w, &my_key, &b_se_pub) {
-        Ok(r) => r,
-        Err(e) => {
-            // client() already sent an ERROR frame on protocol/AEAD failures.
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
+    let (ssh, mut w, mut rd) = BootstrapSsh::spawn(target)?;
+    let received = client(&mut rd, &mut w, &my_key, &b_se_pub)?;
 
     // Re-wrap under B's own SE and persist BEFORE acknowledging, so we only ACK once
     // the DEK is durably stored on B. The DEK is zeroized when `received` drops.
-    match persist(&store, &received, |dek| {
+    match persist(&store, &received, passphrase, |dek| {
         Ok(SecureEnclaveUnlocker::new(LABEL).enroll("bootstrap (this machine SE)", dek)?)
     }) {
         Ok(()) => {
@@ -697,14 +1294,14 @@ pub fn bootstrap_from(target: &str) -> Result<(), BootstrapErr> {
         }
         Err(e) => {
             send_error(&mut w, "failed to persist on new machine");
-            let _ = child.wait();
             return Err(e);
         }
     }
     drop(received); // DEK zeroized here
     drop(w); // close B→A so A's serve() reader unblocks after its ACK read
+    drop(rd);
 
-    let status = child.wait().map_err(|_| BootstrapErr::Ssh)?;
+    let status = ssh.wait()?;
     if !status.success() {
         return Err(BootstrapErr::Ssh);
     }
@@ -716,6 +1313,7 @@ pub fn bootstrap_from(target: &str) -> Result<(), BootstrapErr> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A software ECDH key plus its 65-byte SEC1 public point, standing in for a
     /// Secure Enclave endpoint in tests.
@@ -734,6 +1332,78 @@ mod tests {
         assert_eq!(tag, Tag::Done);
         let d: Done = serde_json::from_slice(&body).unwrap();
         assert_eq!(d.count, 7);
+    }
+
+    #[test]
+    fn authority_rejects_an_invalid_curve_point_before_authorization() {
+        // Correct SEC1 length and tag are not enough: this is not a valid P-256 point. The
+        // public HELLO preflight must reject it and return an ERROR frame before callers unlock
+        // the authority keyring or present a Touch ID sheet.
+        let mut inbound = Vec::new();
+        write_frame(
+            &mut inbound,
+            Tag::Hello,
+            &Hello {
+                proto: PROTO,
+                b_se_pub: vec![0x04; SEC1_LEN],
+            },
+        )
+        .unwrap();
+        let mut outbound = Vec::new();
+        assert!(matches!(
+            receive_hello(&mut Cursor::new(inbound), &mut outbound),
+            Err(BootstrapErr::P256(_))
+        ));
+        let (tag, _) = read_frame(&mut Cursor::new(outbound)).unwrap();
+        assert_eq!(tag, Tag::Error);
+    }
+
+    #[test]
+    fn ssh_manager_enforces_deadline_and_reaps_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let watchdog = hc_core::ParentDeathGuard::start().unwrap();
+        watchdog.configure(&mut command);
+        let child = command.spawn().unwrap();
+        let (_control_tx, control_rx) = mpsc::channel();
+        let started = Instant::now();
+        assert!(matches!(
+            manage_ssh_child(child, watchdog, control_rx, Duration::from_millis(100)),
+            ManagedExit::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ssh_manager_keeps_deadline_after_direct_child_exits() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "(sleep 30) & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let watchdog = hc_core::ParentDeathGuard::start().unwrap();
+        watchdog.configure(&mut command);
+        let child = command.spawn().unwrap();
+        let (_control_tx, control_rx) = mpsc::channel();
+        let started = Instant::now();
+        assert!(matches!(
+            manage_ssh_child(child, watchdog, control_rx, Duration::from_millis(100)),
+            ManagedExit::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ssh_diagnostics_cannot_emit_terminal_controls() {
+        let rendered = ssh_stderr_for_log(b"line one\n\x1b[31mred\x07");
+        assert_eq!(rendered, "line one\\n\\u{1b}[31mred\\u{7}");
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]
@@ -775,13 +1445,164 @@ mod tests {
         assert!(envelope::open(&b_wrap, &bind_aad(&other_pub, &eph_pub), &enc).is_err());
     }
 
+    /// A piped passphrase is the secret minus exactly one trailing newline, and nothing at all
+    /// is a refusal rather than an empty KEK.
+    #[test]
+    fn piped_passphrase_keeps_the_secret_and_refuses_an_empty_pipe() {
+        assert_eq!(
+            passphrase_from_reader(&b"correct horse battery staple\n"[..])
+                .unwrap()
+                .as_str(),
+            "correct horse battery staple"
+        );
+        assert_eq!(
+            passphrase_from_reader(&b"no newline at all"[..])
+                .unwrap()
+                .as_str(),
+            "no newline at all"
+        );
+        assert_eq!(
+            passphrase_from_reader(&b"kept blank line\n\n"[..])
+                .unwrap()
+                .as_str(),
+            "kept blank line\n"
+        );
+        assert_eq!(
+            passphrase_from_reader(&b"written on windows\r\n"[..])
+                .unwrap()
+                .as_str(),
+            "written on windows"
+        );
+        assert!(matches!(
+            passphrase_from_reader(&b""[..]),
+            Err(crate::PassphraseErr::Empty)
+        ));
+        assert!(matches!(
+            passphrase_from_reader(&b"\n"[..]),
+            Err(crate::PassphraseErr::Empty)
+        ));
+        let oversize = vec![b'x'; MAX_PIPED_PASSPHRASE_BYTES as usize + 1];
+        assert!(matches!(
+            passphrase_from_reader(&oversize[..]),
+            Err(crate::PassphraseErr::StdIo(_))
+        ));
+    }
+
+    #[test]
+    fn bootstrap_paths_cannot_escape_the_store() {
+        for name in [
+            "../ESCAPE",
+            "policies/../../ESCAPE.toml",
+            "/tmp/ESCAPE",
+            "policies/KEY/extra.toml",
+            "keyring.json",
+        ] {
+            assert!(
+                matches!(store_file(name), Err(BootstrapErr::UnsafeFileName { .. })),
+                "accepted hostile bootstrap path {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_persistence_never_replaces_an_existing_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot_cheese_bootstrap_existing_{}_{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("EVM_HOT"), b"keep-me").unwrap();
+
+        let dek = Dek::random();
+        let body = envelope::seal_keystore("EVM_HOT", &dek, envelope::KeyUse::SignOnly, &[7u8; 32])
+            .unwrap();
+        let mut keyring = Keyring::new();
+        keyring.add(
+            PassphraseUnlocker::new("test recovery phrase".to_string())
+                .enroll("recovery", &dek)
+                .unwrap(),
+        );
+        let received = Received {
+            dek,
+            files: vec![("EVM_HOT".to_string(), body)],
+            vault_id: None,
+        };
+
+        assert!(matches!(
+            write_store_and_keyring(&dir, &received, &keyring),
+            Err(BootstrapErr::DestinationExists { .. })
+        ));
+        assert_eq!(std::fs::read(dir.join("EVM_HOT")).unwrap(), b"keep-me");
+        assert!(!dir.join(KEYRING_FILE).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_nonempty_destination_before_enrollment() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot_cheese_bootstrap_nonempty_{}_{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unlisted-ciphertext"), b"leave-me-alone").unwrap();
+
+        let enrollment_attempted = AtomicBool::new(false);
+        let received = Received {
+            dek: Dek::random(),
+            files: Vec::new(),
+            vault_id: None,
+        };
+        let error = persist(&dir, &received, None, |_| {
+            enrollment_attempted.store(true, Ordering::SeqCst);
+            Err(BootstrapErr::Protocol)
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, BootstrapErr::DestinationExists { .. }));
+        assert!(!enrollment_attempted.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(dir.join("unlisted-ciphertext")).unwrap(),
+            b"leave-me-alone"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Error rollback owns the inode it created, not an indefinitely reusable pathname. A
+    /// same-uid replacement survives, while the unchanged create-only output is removed.
+    #[test]
+    fn bootstrap_rollback_removes_only_the_created_inode() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot_cheese_bootstrap_rollback_{}_{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let unchanged = dir.join("unchanged");
+        std::fs::write(&unchanged, b"created").unwrap();
+        CreatedFile::record(unchanged.clone()).unwrap().remove();
+        assert!(!unchanged.exists());
+
+        let replaced = dir.join("replaced");
+        let original = std::fs::File::create(&replaced).unwrap();
+        let created = CreatedFile::record(replaced.clone()).unwrap();
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::write(&replaced, b"replacement").unwrap();
+        created.remove();
+        assert_eq!(std::fs::read(&replaced).unwrap(), b"replacement");
+        drop(original);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// FULL handshake over two `std::io::pipe()` channels, A and B in separate
     /// threads, using SOFTWARE P-256 keys for both endpoints. Asserts B recovers
     /// A's exact DEK and vault id, and that every shipped FILE byte transfers intact.
     #[test]
     fn full_handshake_over_pipes_transfers_dek_and_files() {
-        // A's keystore dir with two encrypted-looking blobs (opaque bytes; A ships
-        // them verbatim and B never decrypts them during bootstrap).
+        // A's store with two real envelope keystores and one validated policy.
         let dir = std::env::temp_dir().join(format!(
             "hot_cheese_bootstrap_test_{}_{}",
             std::process::id(),
@@ -789,15 +1610,26 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file_a = vec![0xABu8; 200];
-        let file_b = vec![0xCDu8; 137];
+        let dek = Dek::random();
+        let file_a = envelope::seal_keystore(
+            "SOLANA_MAIN",
+            &dek,
+            envelope::KeyUse::SignOnly,
+            &[0xABu8; 64],
+        )
+        .unwrap();
+        let file_b =
+            envelope::seal_keystore("EVM_HOT", &dek, envelope::KeyUse::SignOnly, &[0xCDu8; 32])
+                .unwrap();
         std::fs::write(dir.join("SOLANA_MAIN"), &file_a).unwrap();
         std::fs::write(dir.join("EVM_HOT"), &file_b).unwrap();
+        std::fs::create_dir(dir.join("policies")).unwrap();
+        let policy = b"safe = \"0x1111111111111111111111111111111111111111\"\nchain_id = 1\n";
+        std::fs::write(dir.join("policies/EVM_HOT.toml"), policy).unwrap();
         // A decoy that must NOT be shipped.
         std::fs::write(dir.join("ignored.hctmp"), b"temp").unwrap();
         std::fs::write(dir.join("keyring.json"), b"{}").unwrap();
 
-        let dek = Dek::random();
         let dek_expected = *dek.expose();
 
         // B's stand-in SE key.
@@ -840,6 +1672,10 @@ mod tests {
             Some(file_a.as_slice())
         );
         assert_eq!(got.remove("EVM_HOT").as_deref(), Some(file_b.as_slice()));
+        assert_eq!(
+            got.remove("policies/EVM_HOT.toml").as_deref(),
+            Some(policy.as_slice())
+        );
         assert!(
             got.is_empty(),
             "unexpected extra files shipped: {:?}",

@@ -7,17 +7,20 @@ use super::{bundles, readtest, status, Console};
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType};
 use err_mac::create_err_with_impls;
-use hc_core::crypto::envelope::{encrypt_file, read_keystore, Dek, KeyUse};
-use hc_core::is_valid_string_name;
+use hc_core::crypto::envelope::{
+    encrypt_file_new, read_keystore, Dek, EnvErr, KeyUse, MAX_SECRET_BYTES,
+};
+use hc_core::is_valid_key_name;
 use hc_core::keyring::{EnrollParams, Keyring};
 use hc_core::mac::secure_enclave::{ensure_se_key, SE_KEY_LABEL};
 use hc_core::mac::MacBackend;
-use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
+use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker};
 use hc_daemon::exposure::{TunnelId, TunnelSpec};
 use hc_daemon::git_store;
 use hc_daemon::live::Live;
 use hc_daemon::runtime::{Runtime, Serving, UnlockGate};
 use hc_daemon::{OpContext, Operation};
+use hc_sign::grant::now_secs;
 use inquire::{Confirm, CustomType, InquireError, Password, PasswordDisplayMode, Text};
 use std::fmt;
 use std::io::Write;
@@ -34,6 +37,9 @@ const READ_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The question every creation screen asks, spelling out that one answer is permanent.
 const USE_PROMPT: &str = "Use (sign_only can never be exported, and never loosened)";
+
+/// Store file names one pull question lists before it counts the rest.
+const PULL_FILES_SHOWN: usize = 8;
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -69,9 +75,21 @@ create_err_with_impls!(
     ;
     InvalidKeyName { name: String },
     KeyExists { name: String },
+    SecretInputTooLarge { size: usize, max: usize },
     NotBundleable { kind: hc_sign::grant::IntentKind },
     NotATerminal { source: std::io::Error }
 );
+
+/// Hex is the widest supported textual encoding; this also bounds base58 decoding work.
+const MAX_ENCODED_SECRET_BYTES: usize = MAX_SECRET_BYTES * 2 + 2;
+
+fn path_is_occupied(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 
 /// Which screen the console is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,12 +295,12 @@ menu_enum!(BackupAction {
     Push => "Push the store to every remote",
         "Pushes this install's commits to every configured remote, ciphertext as it sits on \
          disk. A remote that does not answer is a warning; all of them failing is an error.",
-    Fetch => "Fetch and fast-forward",
-        "Fetches every remote and takes its commits only when they are a fast-forward. A fork \
-         is reported and left alone.",
+    Fetch => "Fetch and inspect",
+        "Fetches and validates every remote without changing the active store. Remote commits \
+         become active only through an explicit forced pull.",
     Pull => "Forced pull from the first remote (DESTRUCTIVE)",
-        "Throws away this machine's commits and takes the first remote's, DELETING every \
-         keystore made here and never pushed. It names them before it asks.",
+        "Explicitly trusts the first remote and replaces this machine's history, changing or \
+         deleting the local files it names before asking.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -547,10 +565,10 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
     ));
     let name = ask!(nav(Text::new("New key name (a-z A-Z 0-9 _)").prompt()));
     let name = name.trim().to_string();
-    if name.is_empty() || !is_valid_string_name(&name) {
+    if name.is_empty() || !is_valid_key_name(&name) {
         return Err(MenuErr::InvalidKeyName { name });
     }
-    if console.rt.config.store_path().join(&name).exists() {
+    if path_is_occupied(&console.rt.config.store_path().join(&name))? {
         return Err(MenuErr::KeyExists { name });
     }
     let key_use = ask!(pick(
@@ -559,6 +577,10 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
         KeyUse::ALL.to_vec(),
         Filter::Off
     ));
+    let mutation = console.rt.git.mutation();
+    if path_is_occupied(&console.rt.config.store_path().join(&name))? {
+        return Err(MenuErr::KeyExists { name });
+    }
     let ctx = OpContext::local(
         name.clone(),
         match chain {
@@ -570,7 +592,7 @@ fn generate(console: &Console) -> Result<Step, MenuErr> {
         Chain::Evm => console.rt.api.generate(&ctx, key_use)?,
         Chain::Solana => console.rt.api.generate_solana(&ctx, key_use)?,
     }
-    console.rt.git.after_mutation()?;
+    mutation.commit()?;
     Ok(Step {
         choice: MenuChoice::Keys,
         notice: format!("generated {chain} key \"{name}\" ({key_use})"),
@@ -597,6 +619,7 @@ fn address(console: &Console) -> Result<Step, MenuErr> {
             Chain::Solana => Operation::SolanaAddress,
         },
     );
+    let _stable_store = console.rt.git.mutation();
     let addr = match chain {
         Chain::Evm => console.rt.api.address(&ctx)?,
         Chain::Solana => console.rt.api.address_solana(&ctx)?,
@@ -610,11 +633,11 @@ fn address(console: &Console) -> Result<Step, MenuErr> {
 fn add(console: &Console) -> Result<Step, MenuErr> {
     let name = ask!(nav(Text::new("Key name (a-z A-Z 0-9 _)").prompt()));
     let name = name.trim().to_string();
-    if name.is_empty() || !is_valid_string_name(&name) {
+    if name.is_empty() || !is_valid_key_name(&name) {
         return Err(MenuErr::InvalidKeyName { name });
     }
     let store = console.rt.config.store_path();
-    if store.join(&name).exists() {
+    if path_is_occupied(&store.join(&name))? {
         return Err(MenuErr::KeyExists { name });
     }
     let kind = ask!(pick(
@@ -634,14 +657,24 @@ fn add(console: &Console) -> Result<Step, MenuErr> {
         .without_confirmation()
         .prompt())));
     let secret = Zeroizing::new(decode_secret(kind, entered.trim())?);
+    let mutation = console.rt.git.mutation();
+    if path_is_occupied(&store.join(&name))? {
+        return Err(MenuErr::KeyExists { name });
+    }
     let keyring = keyring_of(console)?;
     let dek = ask!(dek_for(
         console,
         &keyring,
         &format!("Unlock \"{name}\" to import a key")
     ));
-    encrypt_file(&store, &name, &dek, key_use, &secret)?;
-    console.rt.git.after_mutation()?;
+    match encrypt_file_new(&store, &name, &dek, key_use, &secret) {
+        Err(EnvErr::StdIo(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(MenuErr::KeyExists { name })
+        }
+        Err(error) => return Err(error.into()),
+        Ok(()) => {}
+    }
+    mutation.commit()?;
     Ok(Step {
         choice: MenuChoice::Keys,
         notice: format!("imported \"{name}\" as {kind} ({key_use})"),
@@ -649,11 +682,31 @@ fn add(console: &Console) -> Result<Step, MenuErr> {
 }
 
 fn decode_secret(kind: SecretKind, entered: &str) -> Result<Vec<u8>, MenuErr> {
-    match kind {
-        SecretKind::Ethereum => df_share::from_hex_str(entered).ok_or(MenuErr::BadHexSecret),
+    if entered.len() > MAX_ENCODED_SECRET_BYTES {
+        return Err(MenuErr::SecretInputTooLarge {
+            size: entered.len(),
+            max: MAX_ENCODED_SECRET_BYTES,
+        });
+    }
+    let decoded = match kind {
+        SecretKind::Ethereum => hex::decode(
+            entered
+                .strip_prefix("0x")
+                .or_else(|| entered.strip_prefix("0X"))
+                .unwrap_or(entered),
+        )
+        .map_err(|_| MenuErr::BadHexSecret),
         SecretKind::Solana => Ok(bs58::decode(entered).into_vec()?),
         SecretKind::Bytes => Ok(entered.as_bytes().to_vec()),
+    }?;
+    if decoded.len() > MAX_SECRET_BYTES {
+        return Err(EnvErr::PlaintextTooLarge {
+            size: decoded.len(),
+            max: MAX_SECRET_BYTES,
+        }
+        .into());
     }
+    Ok(decoded)
 }
 
 fn exposure_screen(console: &mut Console) -> Result<Step, MenuErr> {
@@ -837,7 +890,10 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
                 return Err(git_store::GitErr::NoBackupRemote.into());
             };
             let vault = git_store::pull_vault(&console.rt.config, remote, None)?;
-            let doomed = console.rt.git.pull_preview(remote, &vault)?;
+            let mut doomed = console.rt.git.pull_preview(remote, &vault)?;
+            let mut out = std::io::stderr();
+            writeln!(out, "{}\n", pull_report(&doomed, now_secs()?))?;
+            out.flush()?;
             let confirmed = ask!(nav(Confirm::new(&doomed_prompt(&doomed))
                 .with_default(false)
                 .prompt()));
@@ -846,6 +902,18 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
                     choice: MenuChoice::Backup,
                     notice: "pull declined".to_string(),
                 });
+            }
+            if let Some(rewind) = doomed.rewind {
+                let question =
+                    rewind_prompt(rewind, doomed.local_only, &doomed.changed, &doomed.removed);
+                let accepted = ask!(nav(Confirm::new(&question).with_default(false).prompt()));
+                if !accepted {
+                    return Ok(Step {
+                        choice: MenuChoice::Backup,
+                        notice: "rollback declined; the store is unchanged".to_string(),
+                    });
+                }
+                doomed.accept_rewind();
             }
             console.rt.git.pull_apply(&doomed)?;
             format!("pulled vault {vault} from {}", remote.host)
@@ -857,23 +925,116 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
     })
 }
 
-/// A forced pull is the one action here that can destroy key material, so the question names
-/// every file it will delete: "discards local history" cannot tell an operator whether that
-/// means commits or keys.
-fn doomed_prompt(doomed: &git_store::Doomed) -> String {
-    let mut lost: Vec<&str> = doomed.tracked.iter().map(String::as_str).collect();
-    lost.extend(doomed.untracked.iter().map(String::as_str));
-    if lost.is_empty() {
-        return "Pull replaces this machine's history with the remote's. \
-                Nothing on this machine is lost. Continue?"
-            .to_string();
+/// At most [`PULL_FILES_SHOWN`] names, then a count of the rest, so a large diff cannot bury the
+/// question underneath it.
+fn names(files: &[String]) -> String {
+    let mut shown = Vec::new();
+    for name in files.iter().take(PULL_FILES_SHOWN) {
+        shown.push(name.as_str());
     }
+    match files.len().saturating_sub(PULL_FILES_SHOWN) {
+        0 => shown.join(", "),
+        rest => format!("{}, … and {rest} more", shown.join(", ")),
+    }
+}
+
+/// One line per class of store file the incoming tip touches, absent where that class is empty.
+fn touched(mark: &str, label: &str, files: &[String]) -> Option<String> {
+    match files.is_empty() {
+        true => None,
+        false => Some(format!(
+            "  {mark} {label} {}: {}",
+            files.len(),
+            names(files)
+        )),
+    }
+}
+
+/// What the incoming tip is, against what this machine holds. Ancestry proves neither authorship
+/// nor freshness, so both sides are counted and the remote's stamp is labelled as its own claim
+/// rather than as truth.
+fn pull_report(doomed: &git_store::Doomed, now: u64) -> String {
+    let mut lines = vec![
+        format!("incoming {} — {}", doomed.remote_head, doomed.relation),
+        format!(
+            "  local  {} commit(s) the incoming tip does not have{}",
+            doomed.local_only,
+            match doomed.local_at {
+                Some(at) => format!(", HEAD committed {} ago", status::age(at, now)),
+                None => ", no local commit yet".to_string(),
+            }
+        ),
+        format!(
+            "  remote {} commit(s) this machine does not have, stamped {} ago by the remote's \
+             own clock",
+            doomed.remote_only,
+            status::age(doomed.remote_at, now)
+        ),
+    ];
+    if let Some(line) = touched("+", "adds", &doomed.added) {
+        lines.push(line);
+    }
+    if let Some(line) = touched("~", "replaces", &doomed.changed) {
+        lines.push(line);
+    }
+    if let Some(line) = touched("!!", "REMOVES", &doomed.removed) {
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// The second question a rollback costs, naming the specific loss. A backup host chooses the
+/// history it serves, so accepting a fast-forward is not accepting this.
+fn rewind_prompt(
+    rewind: git_store::Rewind,
+    local_only: u64,
+    changed: &[String],
+    removed: &[String],
+) -> String {
+    let danger = match rewind {
+        git_store::Rewind::Backwards => format!(
+            "ROLLBACK: the incoming tip is older history this machine already moved past, and \
+             applying it discards {local_only} local commit(s)"
+        ),
+        git_store::Rewind::Fork => format!(
+            "FORK: the incoming tip does not contain {local_only} commit(s) made on this machine, \
+             and applying it discards them"
+        ),
+        git_store::Rewind::Deletes => format!(
+            "DELETES {} store file(s) — {}",
+            removed.len(),
+            names(removed)
+        ),
+        git_store::Rewind::Contents => format!(
+            "OLDER CONTENT: nothing is deleted and no local commit is discarded — the incoming tip \
+             REPLACES {} security-relevant file(s) with older content — {}",
+            changed.len(),
+            names(changed)
+        ),
+    };
     format!(
-        "Pull DELETES {} file(s) that exist only here — {} — and replaces this machine's \
-         history with the remote's. Continue?",
-        lost.len(),
-        lost.join(", ")
+        "{danger}. Ancestry proves neither who wrote this history nor that it is current, so a \
+         hostile backup host can serve exactly it: this can revive a retired keystore, restore an \
+         older keyring.json, or reinstate a looser policy. Accept this rollback?"
     )
+}
+
+/// A forced pull is the one action here that can replace key material and policy, so the
+/// question names every tracked file it changes and every untracked file it deletes.
+fn doomed_prompt(doomed: &git_store::Doomed) -> String {
+    let mut affected = doomed.tracked.clone();
+    affected.extend_from_slice(&doomed.untracked);
+    match affected.is_empty() {
+        true => "Pull explicitly trusts the remote and replaces this machine's history. \
+                 The working tree is already identical. Continue?"
+            .to_string(),
+        false => format!(
+            "Pull explicitly trusts the remote and changes or deletes {} local file(s) — {}. \
+             Continue?",
+            affected.len(),
+            names(&affected)
+        ),
+    }
 }
 
 /// One line per remote: how it stood at the last fetch, and why it last failed.
@@ -933,21 +1094,16 @@ fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
                 Box::new(SecureEnclaveUnlocker::new(SE_KEY_LABEL)),
             )
         }
-        EnrollAction::Passphrase => {
-            let new = ask!(nav(Password::new("New recovery passphrase")
-                .with_display_mode(PasswordDisplayMode::Masked)
-                .with_custom_confirmation_message("Confirm the new recovery passphrase")
-                .prompt()));
-            (
-                "recovery passphrase",
-                "recovery",
-                Box::new(PassphraseUnlocker::new(new)),
-            )
-        }
+        EnrollAction::Passphrase => (
+            "recovery passphrase",
+            "recovery",
+            Box::new(PassphraseUnlocker::from_secret(ask!(new_passphrase()))),
+        ),
     };
     let label = ask!(nav(Text::new("Enrollment label")
         .with_default(default_label)
         .prompt()));
+    let mutation = console.rt.git.mutation();
     let mut keyring = keyring_of(console)?;
     let dek = ask!(dek_for(
         console,
@@ -956,12 +1112,35 @@ fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
     ));
     let enrollment = unlocker.enroll(label.trim(), &dek)?;
     let id = enrollment.id.clone();
+    let mut change = String::new();
+    if let EnrollParams::SecureEnclave { se_pub, .. } = &enrollment.params {
+        let mut adopted = false;
+        for enrolled in &keyring.enrollments {
+            if let EnrollParams::SecureEnclave {
+                se_pub: recorded, ..
+            } = &enrolled.params
+            {
+                adopted |= recorded == se_pub;
+            }
+        }
+        let se_key = se_fingerprint(se_pub);
+        change = match adopted {
+            true => format!(
+                "\nADOPTED the Secure Enclave key se_key {se_key} already on this disk; stop \
+                 unless this is the fingerprint you enrolled"
+            ),
+            false => format!(
+                "\nMINTED a new Secure Enclave key se_key {se_key}: the set of enclave keys this \
+                 store trusts CHANGED"
+            ),
+        };
+    }
     keyring.add(enrollment);
     keyring.save(&MacBackend::keyring_path(&console.rt.config.store))?;
-    console.rt.git.after_mutation()?;
+    mutation.commit()?;
     Ok(Step {
         choice: MenuChoice::Enroll,
-        notice: format!("enrolled {kind} as {id}"),
+        notice: format!("enrolled {kind} as {id}{change}"),
     })
 }
 
@@ -1006,6 +1185,40 @@ fn serve_screen(console: &mut Console) -> Result<Step, MenuErr> {
     }
 }
 
+/// The rule an enrollment applies, run here against a throwaway DEK so the prompt and the
+/// enrollment can never disagree about what a new recovery passphrase is.
+fn check_new_passphrase(entered: &Zeroizing<String>) -> Result<(), UnlockErr> {
+    PassphraseUnlocker::from_secret(entered.clone()).enroll("preflight", &Dek::random())?;
+    Ok(())
+}
+
+/// Prompt twice, and refuse here what the enrollment would refuse later — before [`dek_for`]
+/// spends a Touch ID on a passphrase that was never going to be accepted. A refusal costs a
+/// re-prompt, not the screen.
+fn new_passphrase() -> Result<Nav<Zeroizing<String>>, MenuErr> {
+    let mut out = std::io::stderr();
+    loop {
+        let entered = Zeroizing::new(
+            match nav(Password::new("New recovery passphrase")
+                .with_display_mode(PasswordDisplayMode::Masked)
+                .with_custom_confirmation_message("Confirm the new recovery passphrase")
+                .prompt())?
+            {
+                Nav::Chose(entered) => entered,
+                Nav::Back => return Ok(Nav::Back),
+                Nav::Quit => return Ok(Nav::Quit),
+            },
+        );
+        match check_new_passphrase(&entered) {
+            Ok(()) => return Ok(Nav::Chose(entered)),
+            Err(error) => {
+                writeln!(out, "passphrase refused: {error}; enter a different one")?;
+                out.flush()?;
+            }
+        }
+    }
+}
+
 fn keyring_of(console: &Console) -> Result<Keyring, MenuErr> {
     Ok(Keyring::load(&MacBackend::keyring_path(
         &console.rt.config.store,
@@ -1036,13 +1249,20 @@ fn dek_for(console: &Console, keyring: &Keyring, reason: &str) -> Result<Nav<Dek
 pub(crate) fn keystore_names(console: &Console) -> Result<Vec<String>, MenuErr> {
     let keyring = MacBackend::keyring_path(&console.rt.config.store);
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(console.rt.config.store_path())? {
+    for (at, entry) in std::fs::read_dir(console.rt.config.store_path())?.enumerate() {
+        if at >= hc_core::MAX_STORE_ENUM_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "store directory has too many entries",
+            )
+            .into());
+        }
         let entry = entry?;
         if !entry.file_type()?.is_file() || entry.path() == keyring {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_valid_string_name(&name) {
+        if is_valid_key_name(&name) {
             names.push(name);
         }
     }
@@ -1051,6 +1271,13 @@ pub(crate) fn keystore_names(console: &Console) -> Result<Vec<String>, MenuErr> 
     }
     names.sort();
     Ok(names)
+}
+
+/// The 16 lowercase hex characters of SHA-256 over a SEC1 enclave public key, the form the
+/// bootstrap ritual and the `/read` prompt already name an enclave key by.
+pub fn se_fingerprint(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(public_key)[..8])
 }
 
 fn list_notice(console: &Console) -> Result<String, MenuErr> {
@@ -1068,14 +1295,18 @@ fn list_notice(console: &Console) -> Result<String, MenuErr> {
         Err(e) => return Err(e),
     }
     for enrollment in &keyring.enrollments {
-        let kind = match enrollment.params {
-            EnrollParams::SecureEnclave { .. } => "secure_enclave",
-            EnrollParams::Passphrase { .. } => "passphrase",
-        };
-        lines.push(format!(
-            "enrollment {} {} \"{}\"",
-            enrollment.id, kind, enrollment.label
-        ));
+        match &enrollment.params {
+            EnrollParams::SecureEnclave { se_pub, .. } => lines.push(format!(
+                "enrollment {} secure_enclave \"{}\" se_key {}",
+                enrollment.id,
+                enrollment.label,
+                se_fingerprint(se_pub)
+            )),
+            EnrollParams::Passphrase { .. } => lines.push(format!(
+                "enrollment {} passphrase \"{}\"",
+                enrollment.id, enrollment.label
+            )),
+        }
     }
     if !keyring.has_passphrase() {
         lines.push(
@@ -1103,6 +1334,66 @@ mod tests {
         MenuState::ServeAndApprove,
         MenuState::Quit,
     ];
+
+    #[test]
+    fn secret_decoding_is_bounded_before_unlock() {
+        assert!(matches!(
+            decode_secret(SecretKind::Bytes, &"x".repeat(MAX_SECRET_BYTES + 1)),
+            Err(MenuErr::Envelope(EnvErr::PlaintextTooLarge { .. }))
+        ));
+        assert!(matches!(
+            decode_secret(
+                SecretKind::Solana,
+                &"1".repeat(MAX_ENCODED_SECRET_BYTES + 1)
+            ),
+            Err(MenuErr::SecretInputTooLarge { .. })
+        ));
+    }
+
+    /// The second confirmation is the operator's last chance to notice they are being rolled back,
+    /// so each ground has to say what is actually happening. A hostile child that reverts blob
+    /// contents deletes nothing and discards no commit, and sharing the `Backwards` arm made the
+    /// question claim both — "discards 0 local commit(s)" over the one danger that was real.
+    #[test]
+    fn each_rollback_ground_names_the_loss_it_is() {
+        let changed = vec!["TREASURY".to_string(), "keyring.json".to_string()];
+        let removed = vec!["OPS".to_string()];
+        let backwards = rewind_prompt(git_store::Rewind::Backwards, 3, &changed, &[]);
+        let fork = rewind_prompt(git_store::Rewind::Fork, 3, &changed, &[]);
+        let deletes = rewind_prompt(git_store::Rewind::Deletes, 0, &changed, &removed);
+        let contents = rewind_prompt(git_store::Rewind::Contents, 0, &changed, &[]);
+
+        assert!(backwards.contains("discards 3 local commit(s)"));
+        assert!(fork.contains("does not contain 3 commit(s)"));
+        assert!(deletes.contains("DELETES 1 store file(s)") && deletes.contains("OPS"));
+        assert!(contents.contains("REPLACES 2 security-relevant file(s) with older content"));
+        assert!(contents.contains("TREASURY, keyring.json"));
+        assert!(contents.contains("revive a retired keystore"));
+        assert!(
+            !contents.contains("discards 0 local commit(s)"),
+            "the shared variant reported the harmless fact as the danger: {contents}"
+        );
+        for other in [&backwards, &fork, &deletes] {
+            assert_ne!(other, &contents);
+        }
+    }
+
+    /// The strength rule has to refuse at the prompt, where a re-prompt is free — not after
+    /// `dek_for` has already spent a Touch ID on a passphrase the enrollment was always going to
+    /// reject.
+    #[test]
+    fn a_weak_passphrase_is_refused_before_anything_is_unlocked() {
+        assert!(matches!(
+            check_new_passphrase(&Zeroizing::new("x".repeat(64))),
+            Err(UnlockErr::PassphraseTooSimple { .. })
+        ));
+        assert!(matches!(
+            check_new_passphrase(&Zeroizing::new("too short".to_string())),
+            Err(UnlockErr::PassphraseTooShort { .. })
+        ));
+        check_new_passphrase(&Zeroizing::new("correct horse battery staple".to_string()))
+            .expect("what the enrollment accepts must pass the prompt");
+    }
 
     /// A session that cannot serve must not reach the two screens that publish this machine or
     /// read a key off-process: a passphrase session has no per-request biometric to gate a

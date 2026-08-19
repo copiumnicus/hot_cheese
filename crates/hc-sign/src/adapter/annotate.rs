@@ -5,7 +5,7 @@
 //! amount always carries the integer that was actually submitted, and an unconfigured
 //! `(address, chain_id)` renders exactly the bytes an empty table renders. So a wrong or hostile
 //! table entry can add noise to the text a human reads, and can never subtract truth from it.
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, I256, U256};
 use hc_core::config::{Config, TokenAnnotation};
 
 /// Bit width past which an amount exceeds any plausible token supply.
@@ -25,6 +25,12 @@ fn marked(body: String, v: U256) -> String {
 /// it is past anything a real payment carries.
 pub(super) fn count(v: U256) -> String {
     marked(v.to_string(), v)
+}
+
+/// A signed quantity, marked at the same magnitude an unsigned one is. The rule language can
+/// only ever leave a signed integer `unbounded`, so this marking is the only bound it carries.
+pub(super) fn signed(v: I256) -> String {
+    marked(v.to_string(), v.unsigned_abs())
 }
 
 fn find(config: &Config, address: Address, chain_id: U256) -> Option<&TokenAnnotation> {
@@ -161,5 +167,10 @@ mod tests {
             count(U256::MAX),
             amount(U256::MAX, TOKEN, chain, &config(""))
         );
+
+        // A signed integer is only ever unbounded, so its magnitude carries the same marking.
+        assert_eq!(signed(-I256::ONE), "-1");
+        assert!(signed(I256::MIN).ends_with(&format!(" \u{26a0} HUGE (>2^{HUGE_AMOUNT_BITS})")));
+        assert!(signed(I256::MAX).ends_with(&format!(" \u{26a0} HUGE (>2^{HUGE_AMOUNT_BITS})")));
     }
 }

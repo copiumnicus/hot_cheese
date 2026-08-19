@@ -18,7 +18,7 @@ hot_cheese is a native macOS daemon that holds signing keys (EVM/Solana) encrypt
 - When moving code, DON'T reexport shims. Fix the whole path. Reexport shims are lazy spaghetti of deps.
 - When replacing code, fix the ENTIRE path. No shims.
 - NEVER run rayon inside the tokio async runtime. It deadlocks the thread.
-- NEVER format an error to a string. Every failure is a variant in a typed error enum (this repo uses `err_mac::create_err_with_impls!`, thiserror-style).
+- NEVER format an error to a string. Every failure is a variant in a typed error enum (this repo's workspace-owned `err_mac::create_err_with_impls!` provides the shared declaration macro).
 - NEVER return Option. Return Result with a typed error. Option is allowed only when None is a genuine and correct value.
 - Serialize U256 as decimal. Accept decimal OR hex on deserialize.
 - For Ethereum types use the real Rust counterparts (alloy: Address, U256, Bytes, TxKind), never strings or Vec<u8>.

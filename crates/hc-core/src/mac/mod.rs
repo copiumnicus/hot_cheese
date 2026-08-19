@@ -2,7 +2,6 @@ use crate::crypto::envelope::Dek;
 use crate::keyring::{Keyring, KeyringErr};
 use crate::resolve_path;
 use crate::unlock::{UnlockErr, Unlocker};
-use std::fs::create_dir_all;
 use std::path::PathBuf;
 
 mod get_password;
@@ -26,13 +25,11 @@ pub trait BackendImpl: Send + Sync {
     fn store(&self) -> &str;
 
     fn store_path(&self) -> PathBuf {
-        let buf = resolve_path(self.store());
-        if !buf.exists() {
-            if let Err(e) = create_dir_all(buf.clone()) {
-                tracing::error!(error = %e, "failed to create keys dir");
-            }
-        }
-        buf
+        // Path resolution is deliberately side-effect free. A missing store means the loaded
+        // configuration/keyring is inconsistent and must fail at the operation that opens it;
+        // silently recreating the directory here would turn a read-looking accessor into a
+        // mutation and could mask deletion or an unsafe parent-path replacement.
+        resolve_path(self.store())
     }
 }
 

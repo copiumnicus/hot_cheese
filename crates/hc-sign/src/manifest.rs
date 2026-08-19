@@ -13,8 +13,8 @@
 use crate::grant::IntentKind;
 use crate::intent::{Operation, SafeTxIntent, TypedDataIntent};
 use crate::policy::{
-    match_call, match_refunds, no_duplicate_rules, AllowRule, CallDenied, Policy, RefundDenied,
-    RefundPolicy,
+    check_refunds, match_call, match_refunds, no_duplicate_rules, AllowRule, CallDenied, Policy,
+    RefundDenied, RefundPolicy,
 };
 use crate::schema::{CallRule, FieldRule, Site};
 use alloy_primitives::{Address, B256, U256};
@@ -23,10 +23,14 @@ use hc_core::config::{adapter_socket, AdapterPin, Config};
 use hc_core::is_valid_string_name;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The only manifest schema this build understands.
 pub const SCHEMA: &str = "hotcheese.adapter/v1";
+pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_GRANTS: usize = 64;
+const MAX_GRANT_VALUES: usize = 64;
 
 /// One adapter's whole authority. An unknown key anywhere in here is a refusal, not a
 /// silently dropped term: a manifest the daemon does not fully understand grants nothing.
@@ -115,7 +119,11 @@ create_err_with_impls!(
     PinMismatch { id: String, pinned: B256, found: B256 },
     IdMismatch { pinned: String, declared: String },
     UnknownSchema { id: String, schema: String },
+    TooLarge { size: u64, max: u64 },
     DuplicateId { id: String },
+    TooManyGrants { id: String, found: usize, max: usize },
+    DuplicateGrant { id: String, key: String },
+    InvalidGrantField { id: String, key: String, field: String, reason: String },
     Widens { adapter: String, key: String, source: Widened }
 );
 
@@ -169,7 +177,16 @@ pub fn load_pinned(pin: &AdapterPin) -> Result<LoadedManifest, ManifestErr> {
         });
     }
     let path = pin.manifest_path();
-    let bytes = std::fs::read(&path)?;
+    let mut bytes = Vec::new();
+    hc_core::open_regular_file(&path)?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(ManifestErr::TooLarge {
+            size: bytes.len() as u64,
+            max: MAX_MANIFEST_BYTES,
+        });
+    }
     let found = B256::from_slice(&Sha256::digest(&bytes));
     if found != B256::from_slice(&pinned) {
         return Err(ManifestErr::PinMismatch {
@@ -192,20 +209,154 @@ pub fn load_pinned(pin: &AdapterPin) -> Result<LoadedManifest, ManifestErr> {
             declared: manifest.id,
         });
     }
-    for grant in &manifest.grants {
-        if !is_valid_string_name(&grant.key) {
+    if manifest.grants.len() > MAX_GRANTS {
+        return Err(ManifestErr::TooManyGrants {
+            id: manifest.id.clone(),
+            found: manifest.grants.len(),
+            max: MAX_GRANTS,
+        });
+    }
+    for (at, grant) in manifest.grants.iter().enumerate() {
+        if !hc_core::is_valid_key_name(&grant.key) {
             return Err(ManifestErr::InvalidKey {
                 id: manifest.id.clone(),
                 key: grant.key.clone(),
             });
         }
+        if manifest.grants[at + 1..]
+            .iter()
+            .any(|other| other.key == grant.key)
+        {
+            return Err(ManifestErr::DuplicateGrant {
+                id: manifest.id.clone(),
+                key: grant.key.clone(),
+            });
+        }
+        check_grant(grant, &manifest.id)?;
         no_duplicate_rules(&grant.calls)?;
+        if let Some(refunds) = &grant.refunds {
+            check_refunds(refunds)?;
+        }
     }
     Ok(LoadedManifest {
         manifest,
         digest: found,
         path,
     })
+}
+
+fn invalid_grant(id: &str, grant: &Grant, field: &str, reason: impl Into<String>) -> ManifestErr {
+    ManifestErr::InvalidGrantField {
+        id: id.to_string(),
+        key: grant.key.clone(),
+        field: field.to_string(),
+        reason: reason.into(),
+    }
+}
+
+fn check_list<T: PartialEq + std::fmt::Debug>(
+    values: &[T],
+    id: &str,
+    grant: &Grant,
+    field: &str,
+) -> Result<(), ManifestErr> {
+    if values.is_empty() {
+        return Err(invalid_grant(id, grant, field, "must not be empty"));
+    }
+    if values.len() > MAX_GRANT_VALUES {
+        return Err(invalid_grant(
+            id,
+            grant,
+            field,
+            format!(
+                "has {} entries; maximum is {MAX_GRANT_VALUES}",
+                values.len()
+            ),
+        ));
+    }
+    for (at, value) in values.iter().enumerate() {
+        if values[at + 1..].contains(value) {
+            return Err(invalid_grant(
+                id,
+                grant,
+                field,
+                format!("contains duplicate {value:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_grant(grant: &Grant, id: &str) -> Result<(), ManifestErr> {
+    check_list(&grant.intent_kinds, id, grant, "intent_kinds")?;
+    check_list(&grant.chain_ids, id, grant, "chain_ids")?;
+    let safe_tx = grant.intent_kinds.contains(&IntentKind::SafeTx);
+    let typed_data = grant.intent_kinds.contains(&IntentKind::TypedData);
+
+    match (safe_tx, grant.safes.is_empty(), grant.calls.is_empty()) {
+        (true, true, _) => return Err(invalid_grant(id, grant, "safes", "safe_tx needs a Safe")),
+        (true, _, true) => return Err(invalid_grant(id, grant, "calls", "safe_tx needs a call")),
+        (false, false, _) => {
+            return Err(invalid_grant(
+                id,
+                grant,
+                "safes",
+                "has entries without the safe_tx intent kind",
+            ))
+        }
+        (false, _, false) => {
+            return Err(invalid_grant(
+                id,
+                grant,
+                "calls",
+                "has entries without the safe_tx intent kind",
+            ))
+        }
+        _ => {}
+    }
+    if safe_tx {
+        check_list(&grant.safes, id, grant, "safes")?;
+    }
+    if !safe_tx && grant.refunds.is_some() {
+        return Err(invalid_grant(
+            id,
+            grant,
+            "refunds",
+            "is present without the safe_tx intent kind",
+        ));
+    }
+
+    match (typed_data, grant.typed_data.is_empty()) {
+        (true, true) => {
+            return Err(invalid_grant(
+                id,
+                grant,
+                "typed_data",
+                "typed_data needs a schema name",
+            ))
+        }
+        (false, false) => {
+            return Err(invalid_grant(
+                id,
+                grant,
+                "typed_data",
+                "has entries without the typed_data intent kind",
+            ))
+        }
+        (true, false) => check_list(&grant.typed_data, id, grant, "typed_data")?,
+        (false, true) => {}
+    }
+    for schema in &grant.typed_data {
+        if !is_valid_string_name(schema) {
+            return Err(invalid_grant(
+                id,
+                grant,
+                "typed_data",
+                format!("invalid schema name {schema:?}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Every adapter `config.toml` pins, loaded, pin-checked and intersected with the policies in

@@ -9,8 +9,8 @@
 //! else, so a bundle a hostile peer injected is never redistributed unattended. Signatures still
 //! converge because every device pulls [`Scope::All`] from every peer it enrolled — which makes
 //! enrolment load-bearing in BOTH directions.
-use crate::ingest::{Ingest, Verdict};
-use crate::sync::{self, SyncErr};
+use crate::ingest::{Delivered, Ingest, Verdict};
+use crate::sync::{self, SyncErr, Truncated};
 use crate::{bundle_dir, loaded, Arrival, Scope};
 use alloy_primitives::{Address, B256};
 use err_mac::create_err_with_impls;
@@ -24,7 +24,8 @@ create_err_with_impls!(
     Config(hc_core::config::ConfigErr),
     Ingest(crate::ingest::IngestErr),
     Bundle(crate::BundleErr),
-    Grant(hc_sign::grant::GrantErr)
+    Grant(hc_sign::grant::GrantErr),
+    Lock(crate::lock::LockErr)
     ;
     PokeTimedOut { secs: u64 }
 );
@@ -45,6 +46,8 @@ pub struct Stock {
 pub struct PeerTick {
     /// The one [`Scope::All`] pull.
     pub pull: Result<(), SyncErr>,
+    /// What that peer offered which this pull left for the next one.
+    pub truncated: Truncated,
     /// Every contributed bundle pushed to this peer: the first failure, or `Ok` for all.
     pub push: Result<(), SyncErr>,
     /// Bundles pushed to this peer this tick.
@@ -94,28 +97,39 @@ impl Poller {
     /// it ecrecovers every signature it holds, and a signature cannot appear in a file whose
     /// local identity did not move.
     pub fn stock(&mut self) -> Result<Stock, PollErr> {
-        let verdict = self.ingest.validate(Scope::All, &self.contributed)?;
+        self.take_stock(Delivered::Locally)
+    }
+
+    /// One pass, crediting whatever appeared since the last one to `from`, which is what bounds
+    /// one peer's share of the tree across every tick rather than within one.
+    fn take_stock(&mut self, from: Delivered<'_>) -> Result<Stock, PollErr> {
+        let verdict = self.ingest.validate(Scope::All, &self.contributed, from)?;
         let mut arrivals = Vec::new();
-        if verdict.judged > 0 || verdict.dirs != self.bundles {
+        if verdict.changed || verdict.judged > 0 || verdict.dirs != self.bundles {
             let mut ready = 0usize;
             let mut present = HashSet::new();
             for one in loaded(Scope::All)? {
                 present.insert(one.hash);
-                if one.bundle.met() {
+                if one.quorum.met {
                     ready += 1;
                 }
+                let current: HashSet<Address> = one
+                    .bundle
+                    .signatures
+                    .iter()
+                    .map(|signature| signature.signer)
+                    .collect();
                 let seen = self.seen.entry(one.hash).or_default();
                 for sig in &one.bundle.signatures {
-                    if seen.insert(sig.signer) {
+                    if !seen.contains(&sig.signer) {
                         arrivals.push(Arrival {
                             hash: one.hash,
                             signer: sig.signer,
-                            have: one.bundle.signatures.len(),
-                            threshold: one.bundle.threshold,
-                            met: one.bundle.met(),
+                            quorum: one.quorum,
                         });
                     }
                 }
+                *seen = current;
             }
             self.seen.retain(|hash, _| present.contains(hash));
             self.ready = ready;
@@ -135,12 +149,21 @@ impl Poller {
     /// scope can name it. The push runs even when the judging failed, because a signature that
     /// never leaves this disk is the one failure this loop must not have.
     pub fn pull_from(&mut self, peer: &BundlePeer) -> Result<PeerTick, PollErr> {
-        let pull = sync::pull_from(peer, Scope::All);
-        let stock = match pull.is_ok() {
-            true => Some(self.stock()),
-            false => None,
+        // The transfer runs with no local claim held. A peer may stall for the whole rsync
+        // timeout, and a claim held across that is one a `collect` behind a biometric cannot take.
+        let pulled = sync::pull_from(peer, Scope::All);
+        let truncated = match &pulled {
+            Ok(truncated) => *truncated,
+            Err(_) => Truncated::default(),
         };
+        let pull = pulled.map(|_| ());
+        let mutation = crate::lock::Lock::take()?;
+        // rsync can install some files and then exit non-zero. Judge after every attempt, not
+        // only a successful one, or a peer could leave a partially transferred poison file in
+        // the live union until the next poll.
+        let stock = Some(self.take_stock(Delivered::By(&peer.host)));
         self.contributed.retain(|hash| bundle_dir(*hash).is_dir());
+        drop(mutation);
         let mut push = Ok(());
         let mut pushed = 0usize;
         for hash in &self.contributed {
@@ -155,6 +178,7 @@ impl Poller {
         }
         Ok(PeerTick {
             pull,
+            truncated,
             push,
             pushed,
             stock: stock.transpose()?,

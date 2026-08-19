@@ -7,7 +7,12 @@ use alloy_primitives::{Address, FixedBytes, B256, U256};
 use err_mac::create_err_with_impls;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
+
+pub const MAX_POLICY_BYTES: u64 = 64 * 1024;
+const MAX_ALLOW_RULES: usize = 128;
+const MAX_REFUND_CHOICES: usize = 64;
 
 /// One key's policy: which Safe, the mandatory chain pin, allowed contract calls, whether
 /// owner/threshold rotations are permitted, any opt-in refund allowance, and the EIP-712
@@ -37,7 +42,7 @@ pub struct RefundPolicy {
     /// Gas tokens a refund may be paid in (`0x0` denotes native ETH).
     #[serde(default)]
     pub gas_tokens: Vec<Address>,
-    /// Addresses a refund may be paid to.
+    /// Addresses a refund may be paid to; never `0x0`, which a Safe pays to `tx.origin`.
     #[serde(default)]
     pub refund_receivers: Vec<Address>,
     /// Ceiling on the intent's `gasPrice`.
@@ -123,9 +128,21 @@ create_err_with_impls!(
     Denied(PolicyDenied),
     Io(std::io::Error),
     Rule(RuleErr),
-    Toml(toml::de::Error)
+    Toml(toml::de::Error),
+    Utf8(std::string::FromUtf8Error),
+    InactiveOwnerManagementTerms,
+    EmptyOwnerManagementCalls
     ;
-    DuplicateRule { to: Address, operation: Operation }
+    DuplicateRule { to: Address, operation: Operation },
+    TooManyEntries { location: String, found: usize, max: usize },
+    EmptyCallSet { to: Address, operation: Operation },
+    GeneralRuleTargetsSafe { safe: Address },
+    UnsupportedOwnerManagementCall { signature: String },
+    EmptyRefundChoices { field: String },
+    DuplicateRefundChoice { field: String, address: Address },
+    RefundReceiverResolvesToOrigin { field: String },
+    InvalidName { name: String },
+    TooLarge { size: u64, max: u64 }
 );
 
 /// A policy and the digest of the exact bytes it was parsed from.
@@ -134,23 +151,96 @@ pub struct LoadedPolicy {
     pub policy: Policy,
     /// SHA-256 of the file bytes `policy` came from.
     pub digest: B256,
+    /// Keystore name the policy filename bound these bytes to. `None` means [`Policy::parse`]
+    /// validated transport bytes without granting them signing authority for any keystore.
+    key_name: Option<String>,
+}
+
+impl LoadedPolicy {
+    /// Keystore this policy was loaded for. Parsed transport bytes are deliberately unbound.
+    pub fn key_name(&self) -> Option<&str> {
+        self.key_name.as_deref()
+    }
 }
 
 impl Policy {
-    /// Load `<store>/policies/<name>.toml`. A missing file is an error (deny by default).
-    /// The digest is of the bytes actually read, so it names the policy in force for the
-    /// signature this load is serving — a policy edited afterwards is a different digest.
-    pub fn load(store: &Path, name: &str) -> Result<LoadedPolicy, PolicyErr> {
-        let path = store.join("policies").join(format!("{name}.toml"));
-        let text = std::fs::read_to_string(&path)?;
+    /// Parse and validate policy bytes received through a bounded external transport.
+    pub fn parse(bytes: &[u8]) -> Result<LoadedPolicy, PolicyErr> {
+        if bytes.len() as u64 > MAX_POLICY_BYTES {
+            return Err(PolicyErr::TooLarge {
+                size: bytes.len() as u64,
+                max: MAX_POLICY_BYTES,
+            });
+        }
+        let text = String::from_utf8(bytes.to_vec())?;
         let policy: Policy = toml::from_str(&text)?;
+        if policy.allow.len() > MAX_ALLOW_RULES {
+            return Err(PolicyErr::TooManyEntries {
+                location: "allow".to_string(),
+                found: policy.allow.len(),
+                max: MAX_ALLOW_RULES,
+            });
+        }
+        if policy.allow.iter().any(|rule| rule.to == policy.safe) {
+            return Err(PolicyErr::GeneralRuleTargetsSafe { safe: policy.safe });
+        }
         no_duplicate_rules(&policy.allow)?;
         check_call_rules(&policy.owner_management.call)?;
+        match policy.owner_management.allow {
+            false
+                if !policy.owner_management.call.is_empty()
+                    || policy.owner_management.max_value != U256::ZERO =>
+            {
+                return Err(PolicyErr::InactiveOwnerManagementTerms)
+            }
+            true if policy.owner_management.call.is_empty() => {
+                return Err(PolicyErr::EmptyOwnerManagementCalls)
+            }
+            true => {
+                for call in &policy.owner_management.call {
+                    if !OWNER_MGMT.contains(&call.signature.canonical()) {
+                        return Err(PolicyErr::UnsupportedOwnerManagementCall {
+                            signature: call.signature.canonical().to_string(),
+                        });
+                    }
+                }
+            }
+            false => {}
+        }
+        if let Some(refunds) = &policy.refunds {
+            check_refunds(refunds)?;
+        }
         check_schemas(&policy.typed_data)?;
         Ok(LoadedPolicy {
             digest: B256::from_slice(&Sha256::digest(text.as_bytes())),
             policy,
+            key_name: None,
         })
+    }
+
+    /// Load `<store>/policies/<name>.toml`. A missing file is an error (deny by default).
+    /// The digest is of the bytes actually read, so it names the policy in force for the
+    /// signature this load is serving — a policy edited afterwards is a different digest.
+    pub fn load(store: &Path, name: &str) -> Result<LoadedPolicy, PolicyErr> {
+        if !hc_core::is_valid_key_name(name) {
+            return Err(PolicyErr::InvalidName {
+                name: hc_core::safe_diagnostic_text(name),
+            });
+        }
+        let path = store.join("policies").join(format!("{name}.toml"));
+        let mut bytes = Vec::new();
+        hc_core::open_regular_file(&path)?
+            .take(MAX_POLICY_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_POLICY_BYTES {
+            return Err(PolicyErr::TooLarge {
+                size: bytes.len() as u64,
+                max: MAX_POLICY_BYTES,
+            });
+        }
+        let mut loaded = Self::parse(&bytes)?;
+        loaded.key_name = Some(name.to_string());
+        Ok(loaded)
     }
 }
 
@@ -160,7 +250,20 @@ impl Policy {
 /// `grants.calls` are checked with this, at load, before anything can be evaluated against them —
 /// and with it every rule's declared signatures and argument bounds.
 pub(crate) fn no_duplicate_rules(rules: &[AllowRule]) -> Result<(), PolicyErr> {
+    if rules.len() > MAX_ALLOW_RULES {
+        return Err(PolicyErr::TooManyEntries {
+            location: "allow rules".to_string(),
+            found: rules.len(),
+            max: MAX_ALLOW_RULES,
+        });
+    }
     for (i, rule) in rules.iter().enumerate() {
+        if rule.call.is_empty() {
+            return Err(PolicyErr::EmptyCallSet {
+                to: rule.to,
+                operation: rule.operation,
+            });
+        }
         for other in &rules[i + 1..] {
             if other.to == rule.to && other.operation == rule.operation {
                 return Err(PolicyErr::DuplicateRule {
@@ -170,6 +273,45 @@ pub(crate) fn no_duplicate_rules(rules: &[AllowRule]) -> Result<(), PolicyErr> {
             }
         }
         check_call_rules(&rule.call)?;
+    }
+    Ok(())
+}
+
+/// Refuse an allowance whose terms do not mean what they read. `refundReceiver = 0x0` is the one
+/// address a Safe does not pay literally — `execTransaction` sends that refund to `tx.origin`, an
+/// account the submitter chooses — while the approval sheet renders it as the zero address, so
+/// allow-listing it is an allow-list on nobody in particular. It is refused where a policy or a
+/// manifest is PARSED, so no such term ever reaches a prompt.
+pub(crate) fn check_refunds(refunds: &RefundPolicy) -> Result<(), PolicyErr> {
+    if refunds.refund_receivers.contains(&Address::ZERO) {
+        return Err(PolicyErr::RefundReceiverResolvesToOrigin {
+            field: "refunds.refund_receivers".to_string(),
+        });
+    }
+    for (field, choices) in [
+        ("gas_tokens", refunds.gas_tokens.as_slice()),
+        ("refund_receivers", refunds.refund_receivers.as_slice()),
+    ] {
+        if choices.is_empty() {
+            return Err(PolicyErr::EmptyRefundChoices {
+                field: field.to_string(),
+            });
+        }
+        if choices.len() > MAX_REFUND_CHOICES {
+            return Err(PolicyErr::TooManyEntries {
+                location: format!("refunds.{field}"),
+                found: choices.len(),
+                max: MAX_REFUND_CHOICES,
+            });
+        }
+        for (at, address) in choices.iter().enumerate() {
+            if choices[at + 1..].contains(address) {
+                return Err(PolicyErr::DuplicateRefundChoice {
+                    field: field.to_string(),
+                    address: *address,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -261,8 +403,8 @@ pub fn match_site<'p>(site: &Site, policy: &'p Policy) -> Result<&'p CallRule, P
 }
 
 /// Match an intent's gas-refund fields against an allowance. An absent allowance denies any
-/// refund activity at all, which is why an intent that leaves all three refund fields at their
-/// zero value passes without one. A per-key policy's `refunds` and an adapter grant's `refunds`
+/// refund/gas activity at all, which is why an intent that leaves all five fields at their zero
+/// value passes without one. A per-key policy's `refunds` and an adapter grant's `refunds`
 /// are both allowances, and this is the only code that reads one.
 pub fn match_refunds(
     allowance: Option<&RefundPolicy>,
@@ -270,7 +412,9 @@ pub fn match_refunds(
 ) -> Result<(), RefundDenied> {
     let quiet = i.gas_price == U256::ZERO
         && i.gas_token == Address::ZERO
-        && i.refund_receiver == Address::ZERO;
+        && i.refund_receiver == Address::ZERO
+        && i.base_gas == U256::ZERO
+        && i.safe_tx_gas == U256::ZERO;
     if quiet {
         return Ok(());
     }
@@ -485,6 +629,16 @@ mod tests {
             evaluate(&drain, &no_refunds),
             Err(PolicyDenied::Refund(RefundDenied::RefundNotAllowed))
         ));
+        let mut base_only = base_intent();
+        base_only.base_gas = U256::from(1u64);
+        let mut safe_only = base_intent();
+        safe_only.safe_tx_gas = U256::from(1u64);
+        for gas_only in [base_only, safe_only] {
+            assert!(matches!(
+                evaluate(&gas_only, &no_refunds),
+                Err(PolicyDenied::Refund(RefundDenied::RefundNotAllowed))
+            ));
+        }
 
         let mut opt_in = contract_policy();
         opt_in.refunds = Some(RefundPolicy {
@@ -534,6 +688,41 @@ mod tests {
             evaluate(&over_safe_tx, &opt_in),
             Err(PolicyDenied::Refund(RefundDenied::SafeTxGasTooHigh { .. }))
         ));
+    }
+
+    /// `refundReceiver = 0x0` is the one refund address a Safe does not pay literally: it sends
+    /// that refund to `tx.origin`, whoever submits the transaction, while the sheet renders the
+    /// zero address. A policy may therefore not allow-list it, and the refusal is at PARSE so no
+    /// such term reaches a prompt. `gasToken = 0x0` is the chain's own asset and stays legal.
+    #[test]
+    fn a_refund_receiver_of_zero_is_refused_when_the_policy_is_parsed() {
+        let with_receiver = |receiver: &str| {
+            format!(
+                "safe = \"0x1111111111111111111111111111111111111111\"\nchain_id = 1\n\n\
+                 [refunds]\ngas_tokens = [\"0x0000000000000000000000000000000000000000\"]\n\
+                 refund_receivers = [\"{receiver}\"]\nmax_gas_price = \"1\"\n\
+                 max_base_gas = \"1\"\nmax_safe_tx_gas = \"1\"\n"
+            )
+        };
+        assert!(matches!(
+            Policy::parse(with_receiver("0x0000000000000000000000000000000000000000").as_bytes()),
+            Err(PolicyErr::RefundReceiverResolvesToOrigin { field })
+                if field == "refunds.refund_receivers"
+        ));
+        let named =
+            Policy::parse(with_receiver("0x5555555555555555555555555555555555555555").as_bytes())
+                .expect("a named receiver is a receiver a human can read");
+
+        let mut paying = base_intent();
+        paying.gas_price = U256::from(1u64);
+        paying.refund_receiver = Address::ZERO;
+        assert!(
+            matches!(
+                match_refunds(named.policy.refunds.as_ref(), &paying),
+                Err(RefundDenied::RefundReceiverNotAllowed { .. })
+            ),
+            "an intent refunding to tx.origin can no longer match any allowance"
+        );
     }
 
     /// chain_id is a mandatory pin: the exact scripts/demo.sh policy still loads, but a policy
@@ -660,5 +849,18 @@ mod tests {
             Err(PolicyErr::DuplicateRule { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_lookup_never_accepts_a_path_as_a_key_name() {
+        let dir = std::env::temp_dir().join("hot_cheese_policy_name_boundary");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("policies")).unwrap();
+        std::fs::write(dir.join("OUTSIDE.toml"), b"not a policy").unwrap();
+        assert!(matches!(
+            Policy::load(&dir, "../OUTSIDE"),
+            Err(PolicyErr::InvalidName { .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

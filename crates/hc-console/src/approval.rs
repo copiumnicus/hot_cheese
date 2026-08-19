@@ -232,7 +232,7 @@ pub fn serve_and_approve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hc_core::crypto::envelope::Dek;
+    use hc_core::crypto::envelope::{encrypt_file, Dek, KeyUse};
     use hc_core::mac::local_auth::LaContext;
     use hc_core::mac::BackendImpl;
     use hc_core::unlock::UnlockErr;
@@ -314,6 +314,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("policies")).expect("make the store");
         std::fs::write(dir.join("policies").join("CONSOLE_DRAIN.toml"), POLICY)
             .expect("write the policy");
+        encrypt_file(
+            dir,
+            "CONSOLE_DRAIN",
+            &Dek::from_bytes([9u8; 32]),
+            KeyUse::SignOnly,
+            &[0x33u8; 32],
+        )
+        .expect("write the keystore");
         let store = dir.to_string_lossy().to_string();
         let api = HotApi::new(
             Box::new(FakeBackend {
@@ -323,6 +331,7 @@ mod tests {
         );
         let (tx, ops) = mpsc::channel(PENDING_OPS);
         let mut answers = Vec::new();
+        let pending = Arc::new(hc_daemon::live::Pending::default());
         for _ in 0..PENDING_OPS {
             let (reply, answer) = oneshot::channel();
             tx.try_send(PrivilegedOp {
@@ -333,6 +342,7 @@ mod tests {
                 },
                 body: Bytes::from_static(INTENT.as_bytes()),
                 reply,
+                outstanding: hc_daemon::live::Outstanding::new(pending.clone()),
             })
             .expect("the queue holds PENDING_OPS");
             answers.push(answer);

@@ -4,15 +4,20 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 create_err_with_impls!(
     #[derive(Debug)]
     pub TunnelErr,
     NoSuchTunnel,
     NotBound,
+    InvalidRemotePort,
+    TunnelIdsExhausted,
     StdIo(std::io::Error)
     ;
+    TooManyTunnels { max: usize },
     TargetIsOption { target: String },
+    TargetTooLong { bytes: usize, max: usize },
     MalformedTarget { target: String },
     ProcessTable { status: ExitStatus }
 );
@@ -25,6 +30,8 @@ const REMOTE_BIND: &str = "localhost";
 
 /// The hosts a reverse forward names when it points back into this machine's loopback.
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const MAX_TUNNELS: usize = 16;
+const MAX_TARGET_BYTES: usize = 255;
 
 /// Handle for one open tunnel, unique for the console's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +55,8 @@ pub struct Tunnel {
     pub spec: TunnelSpec,
     /// The `ssh -N -R` process; killed and reaped on close.
     pub child: Child,
+    /// Kills the isolated SSH process group if this process exits without running destructors.
+    watchdog: Option<hc_core::ParentDeathGuard>,
 }
 
 /// Owns every `ssh` child the console spawned, so none outlives the console.
@@ -67,12 +76,36 @@ pub struct StrandedTunnel {
     pub argv: String,
 }
 
-/// The exact `ssh` argv for a reverse tunnel: no shell, the remote end pinned to the remote's
-/// loopback, fail on a taken remote port, and drop the tunnel within ~45s of the link dying
-/// rather than leaving a black hole open.
+/// The exact `ssh` argv for a reverse tunnel: no shell, no user or system `ssh_config` (which is
+/// where a same-uid attacker would otherwise attach a `ProxyCommand` and sit in the middle of the
+/// tunnel), the far end authenticated by a host key checked against the invoking user's own
+/// known-hosts file, the remote end pinned to the remote's loopback, fail on a taken remote port,
+/// and drop the tunnel within ~45s of the link dying rather than leaving a black hole open.
+/// `ssh` expands `~` from the passwd database, never from `$HOME`.
 pub fn ssh_reverse_args(spec: &TunnelSpec) -> Vec<String> {
     vec![
         "-N".to_string(),
+        "-T".to_string(),
+        "-F".to_string(),
+        "/dev/null".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=~/.ssh/known_hosts".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=5".to_string(),
+        "-o".to_string(),
+        "ConnectionAttempts=1".to_string(),
+        "-o".to_string(),
+        "PermitLocalCommand=no".to_string(),
+        "-o".to_string(),
+        "ForkAfterAuthentication=no".to_string(),
+        "-o".to_string(),
+        "ControlMaster=no".to_string(),
+        "-o".to_string(),
+        "ControlPath=none".to_string(),
         "-o".to_string(),
         "ExitOnForwardFailure=yes".to_string(),
         "-o".to_string(),
@@ -96,6 +129,12 @@ fn is_target_char(c: char) -> bool {
 /// target starting with `-` is an option: `-oProxyCommand=...` pasted into the prompt would
 /// run that command.
 pub fn validate_target(target: &str) -> Result<(), TunnelErr> {
+    if target.len() > MAX_TARGET_BYTES {
+        return Err(TunnelErr::TargetTooLong {
+            bytes: target.len(),
+            max: MAX_TARGET_BYTES,
+        });
+    }
     if target.starts_with('-') {
         return Err(TunnelErr::TargetIsOption {
             target: target.to_string(),
@@ -146,7 +185,13 @@ pub fn stranded_tunnels(ps_output: &str, local_port: u16) -> Vec<StrandedTunnel>
             if !matches!(port.parse::<u16>(), Ok(p) if p == local_port) {
                 continue;
             }
-            if LOOPBACK_HOSTS.into_iter().any(|h| host.ends_with(h)) {
+            // `host` still includes the remote bind/port prefix. Require a component boundary
+            // before the destination instead of a bare suffix: `notlocalhost` is not loopback.
+            let loopback = LOOPBACK_HOSTS
+                .into_iter()
+                .any(|destination| host.ends_with(&format!(":{destination}")))
+                || host.ends_with(":[::1]");
+            if loopback {
                 found.push(StrandedTunnel {
                     pid,
                     argv: argv.to_string(),
@@ -163,9 +208,16 @@ pub fn stranded_tunnels(ps_output: &str, local_port: u16) -> Vec<StrandedTunnel>
 /// remote side is invisible here. `-ww` is load-bearing — without it BSD `ps` cuts every line at
 /// 79 columns and the `-R` token of a real tunnel sits past column 90.
 pub fn scan_stranded(local_port: u16) -> Result<Vec<StrandedTunnel>, TunnelErr> {
-    let ps = Command::new("/bin/ps")
-        .args(["-ww", "-axo", "pid=,args="])
-        .output()?;
+    const MAX_PS_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_PS_ERROR_BYTES: u64 = 256 * 1024;
+    let mut command = Command::new("/bin/ps");
+    command.args(["-ww", "-axo", "pid=,args="]);
+    let ps = hc_core::output_bounded_timeout(
+        &mut command,
+        MAX_PS_BYTES,
+        MAX_PS_ERROR_BYTES,
+        Duration::from_secs(5),
+    )?;
     if !ps.status.success() {
         return Err(TunnelErr::ProcessTable { status: ps.status });
     }
@@ -188,6 +240,9 @@ impl TunnelManager {
         if spec.local_port == 0 {
             return Err(TunnelErr::NotBound);
         }
+        if spec.remote_port == 0 {
+            return Err(TunnelErr::InvalidRemotePort);
+        }
         validate_target(&spec.target)?;
         tracing::warn!(
             target = %spec.target,
@@ -197,7 +252,11 @@ impl TunnelManager {
             "reverse tunnel pinned to the remote's loopback; a remote sshd set to \
              GatewayPorts=yes overrides that and publishes it on every interface"
         );
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new("/usr/bin/ssh");
+        cmd.env_clear();
+        if let Some(agent) = std::env::var_os("SSH_AUTH_SOCK") {
+            cmd.env("SSH_AUTH_SOCK", agent);
+        }
         cmd.args(ssh_reverse_args(&spec));
         let id = self.track(cmd, spec)?;
         tracing::info!(id = id.0, "opened reverse tunnel");
@@ -206,13 +265,35 @@ impl TunnelManager {
 
     /// Spawn `cmd` detached from this console's terminal and record it under a fresh id.
     fn track(&self, mut cmd: Command, spec: TunnelSpec) -> Result<TunnelId, TunnelErr> {
-        let child = cmd
+        if self.list().len() >= MAX_TUNNELS {
+            return Err(TunnelErr::TooManyTunnels { max: MAX_TUNNELS });
+        }
+        let id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(TunnelId)
+            .map_err(|_| TunnelErr::TunnelIdsExhausted)?;
+        let mut watchdog = hc_core::ParentDeathGuard::start()?;
+        watchdog.configure(&mut cmd);
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
-        let id = TunnelId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.tunnels.lock().insert(id, Tunnel { spec, child });
+        let mut tunnels = self.tunnels.lock();
+        if tunnels.len() >= MAX_TUNNELS {
+            drop(tunnels);
+            let _ = terminate(&mut child, &mut watchdog);
+            return Err(TunnelErr::TooManyTunnels { max: MAX_TUNNELS });
+        }
+        tunnels.insert(
+            id,
+            Tunnel {
+                spec,
+                child,
+                watchdog: Some(watchdog),
+            },
+        );
         Ok(id)
     }
 
@@ -245,10 +326,11 @@ impl TunnelManager {
         let Some(mut tunnel) = removed else {
             return Err(TunnelErr::NoSuchTunnel);
         };
-        if let Err(e) = tunnel.child.kill() {
-            tracing::warn!(id = id.0, error = %e, "could not kill tunnel");
-        }
-        tunnel.child.wait()?;
+        let watchdog = tunnel
+            .watchdog
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("tunnel lost its process-group sentinel"))?;
+        terminate(&mut tunnel.child, watchdog)?;
         Ok(())
     }
 
@@ -256,14 +338,36 @@ impl TunnelManager {
     pub fn close_all(&self) {
         let drained: Vec<(TunnelId, Tunnel)> = self.tunnels.lock().drain().collect();
         for (id, mut tunnel) in drained {
-            if let Err(e) = tunnel.child.kill() {
-                tracing::warn!(id = id.0, error = %e, "could not kill tunnel");
-            }
-            if let Err(e) = tunnel.child.wait() {
-                tracing::warn!(id = id.0, error = %e, "could not reap tunnel");
+            let Some(watchdog) = tunnel.watchdog.as_mut() else {
+                tracing::warn!(id = id.0, "tunnel lost its process-group sentinel");
+                let _ = tunnel.child.kill();
+                let _ = tunnel.child.wait();
+                continue;
+            };
+            match terminate(&mut tunnel.child, watchdog) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(id = id.0, error = %e, "could not reap tunnel");
+                }
             }
         }
     }
+}
+
+/// Ask the still-live sentinel to kill its complete SSH group before reaping the direct child.
+/// The sentinel holds the group id throughout this operation, so no numeric pid can be recycled
+/// into an unrelated group between observation and termination.
+fn terminate(
+    child: &mut Child,
+    watchdog: &mut hc_core::ParentDeathGuard,
+) -> std::io::Result<ExitStatus> {
+    let group_result = watchdog.terminate_group();
+    // If the sentinel itself failed, still make the best possible direct-child cleanup before
+    // returning its error.
+    let _ = child.kill();
+    let child_result = child.wait();
+    group_result?;
+    child_result
 }
 
 impl Default for TunnelManager {
@@ -282,11 +386,11 @@ impl Drop for TunnelManager {
 mod tests {
     use super::*;
 
-    /// The exposure surface is exactly these flags in this order: `-N` (no shell), the
-    /// fail-closed forward option, the two keepalive options, then the `-R` binding that maps
-    /// the remote's LOOPBACK port onto this console's loopback port, then the target. Without
-    /// the `localhost:` prefix a remote sshd set to `GatewayPorts clientspecified` publishes
-    /// the key-release API on every interface it has.
+    /// The exposure surface pins noninteractive/no-fork/no-multiplex behavior and refuses the
+    /// `ssh_config` a same-uid attacker would put a `ProxyCommand` in, then maps the remote's
+    /// LOOPBACK port onto this console's loopback port. Without the `localhost:` prefix a remote
+    /// sshd set to `GatewayPorts clientspecified` publishes the key-release API on every
+    /// interface it has.
     #[test]
     fn reverse_args_pin_both_ends_to_loopback() {
         let args = ssh_reverse_args(&TunnelSpec {
@@ -298,6 +402,27 @@ mod tests {
             args,
             vec![
                 "-N",
+                "-T",
+                "-F",
+                "/dev/null",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "UserKnownHostsFile=~/.ssh/known_hosts",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "ConnectionAttempts=1",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "ForkAfterAuthentication=no",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "-o",
                 "ExitOnForwardFailure=yes",
                 "-o",
@@ -346,6 +471,10 @@ mod tests {
                 "{bad} is not a target"
             );
         }
+        assert!(matches!(
+            validate_target(&"a".repeat(MAX_TARGET_BYTES + 1)),
+            Err(TunnelErr::TargetTooLong { .. })
+        ));
     }
 
     /// A tunnel that survived its console re-attaches to whoever binds its local port next,
@@ -365,12 +494,14 @@ mod tests {
             "  207 ssh -N -R 7777:otherhost:51234 ops@g\n",
             "  208 autossh -N -R 7777:localhost:51234 ops@h\n",
             "  209 ssh ops@i\n",
+            "  210 ssh -N -R 7777:notlocalhost:51234 ops@j\n",
+            "  211 ssh -N -R 7777:[::1]:51234 ops@k\n",
         );
         let mut pids = Vec::new();
         for tunnel in stranded_tunnels(ps, 51234) {
             pids.push(tunnel.pid);
         }
-        assert_eq!(pids, vec![201, 202, 203, 204, 208]);
+        assert_eq!(pids, vec![201, 202, 203, 204, 208, 211]);
         assert!(stranded_tunnels(ps, 51236).is_empty());
     }
 
@@ -383,7 +514,7 @@ mod tests {
         const LOCAL_PORT: u16 = 51237;
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
-            .arg("sleep 30")
+            .arg("sleep 30; exit 0")
             .args(ssh_reverse_args(&spec(LOCAL_PORT)));
         let mut child = cmd
             .stdin(Stdio::null())
@@ -487,5 +618,16 @@ mod tests {
         manager.close_all();
         assert!(manager.list().is_empty());
         assert!(!pid_in_process_table(last_pid));
+    }
+
+    #[test]
+    fn tunnel_ids_fail_closed_before_wrapping() {
+        let manager = TunnelManager::new();
+        manager.next_id.store(u64::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            manager.track(sleeper("300"), spec(5555)),
+            Err(TunnelErr::TunnelIdsExhausted)
+        ));
+        assert!(manager.list().is_empty());
     }
 }

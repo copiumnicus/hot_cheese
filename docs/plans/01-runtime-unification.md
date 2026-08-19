@@ -643,7 +643,7 @@ header, costing zero prompts and zero biometrics.
 `body_digest` (`hc-console/src/approval.rs:148-151`) and `DIGEST_CHARS` (`:42`) move to
 `hc-daemon` with it; hc-daemon gains the `sha2` dependency it currently has only as a
 dev-dependency. The digest is kept, not dropped in favour of the seq number, because it names
-*which* df-share client public key is about to be handed a key — two concurrent `/read`s for
+*which* ephemeral client public key is about to be handed a key — two concurrent `/read`s for
 one keystore differ in nothing else.
 
 ### Every call site that changes

@@ -2,13 +2,16 @@
 //!
 //! Replaces the old compile-time `include_bytes!("conf/cheese_config.json")` so the
 //! store path, port, certs, and backup remotes can change without a rebuild.
-use crate::resolve_path;
+use crate::{is_valid_key_name, is_valid_string_name, resolve_path};
 use alloy_primitives::{Address, U256};
 use err_mac::create_err_with_impls;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Legacy Keychain service name (used only by `migrate` to read the old master).
     pub service: String,
@@ -27,7 +30,7 @@ pub struct Config {
     /// Seconds the runtime waits between backup fetches; 0 disables the periodic fetch.
     #[serde(default)]
     pub backup_fetch_secs: Option<u64>,
-    /// Limits on what the MCP proposal server may leave in the review queue.
+    /// What an agent proposing over MCP may name, accumulate and spend.
     #[serde(default)]
     pub mcp: Option<Mcp>,
     #[serde(default)]
@@ -47,6 +50,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupRemote {
     /// SSH target, e.g. "user@1.2.3.4".
     pub host: String,
@@ -60,10 +64,40 @@ const DEFAULT_PEER_BUNDLES_DIR: &str = ".config/hot_cheese/bundles";
 /// Unsigned bundles an agent may leave waiting before the proposal server refuses to file
 /// another. The queue is read by a human, so it is bounded by what a human will read.
 const DEFAULT_MCP_MAX_PENDING: usize = 16;
+const MAX_MCP_PENDING: usize = 64;
 
-/// Seconds between backup fetches when `config.toml` does not say otherwise. A fetch is one
-/// `ls-remote` plus at most one transfer per remote, so it is cheap enough to run unattended
-/// and slow enough not to hammer a sleeping host.
+/// Keystore names, Safes or nonce anchors one `[mcp]` table may carry.
+const MAX_MCP_ENTRIES: usize = 256;
+
+/// Nonces above the anchor a proposal may claim when `[mcp]` does not say otherwise. A Safe
+/// executes nonces in order, so this is how many transactions an operator can be holding at once
+/// and still have every approval they give execute in the order they gave it.
+const DEFAULT_NONCE_WINDOW: u64 = 8;
+const MAX_NONCE_WINDOW: u64 = 1024;
+
+/// Minutes an unsigned proposal keeps its place by default. Long enough that a human working
+/// across a day never loses a row, short enough that a wedged queue heals without anyone.
+const DEFAULT_PROPOSAL_TTL_MINS: u64 = 1440;
+const MAX_PROPOSAL_TTL_MINS: u64 = 43_200;
+
+/// Proposals one agent session may file per hour by default; the same number the queue holds, so
+/// an agent can refill a queue the operator has just emptied and no faster.
+const DEFAULT_PROPOSALS_PER_HOUR: u32 = 16;
+const MAX_PROPOSALS_PER_HOUR: u32 = 1024;
+
+/// Milliseconds between one session's tool calls that take the exclusive bundle claim. The
+/// operator's CLI takes the same claim and fails outright when it loses, so this is what decides
+/// whether a human can run a command while an agent is working.
+const DEFAULT_LOCK_COOLDOWN_MS: u64 = 100;
+const MAX_LOCK_COOLDOWN_MS: u64 = 60_000;
+const MAX_BACKUP_REMOTES: usize = 64;
+const MAX_ADAPTERS: usize = 64;
+const MAX_BUNDLE_PEERS: usize = 64;
+const MAX_ANNOTATIONS: usize = 1024;
+const MAX_LEGACY_KEYCHAIN_FIELD_BYTES: usize = 256;
+
+/// Seconds between inspection-only backup fetches when `config.toml` does not say otherwise. A
+/// fetch is one `ls-remote` plus at most one transfer per remote; it never changes the worktree.
 const DEFAULT_BACKUP_FETCH_SECS: u64 = 300;
 
 /// Seconds between bundle polls when `config.toml` does not say otherwise. The poller is
@@ -75,16 +109,81 @@ const DEFAULT_BUNDLE_POLL_SECS: u64 = 30;
 /// as ssh can connect; 5 is one peer's own connect timeout.
 const MIN_BUNDLE_POLL_SECS: u64 = 5;
 
-/// What an agent proposing over MCP is allowed to accumulate.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// What an agent proposing over MCP is allowed to accumulate, to name, and to spend. The queue
+/// bounds are read by the CLI and the daemon too; the rest bound the agent alone — which keys and
+/// Safes it may name at all, how far ahead of the operator's own queue it may reserve a Safe
+/// nonce, how often it may write, how long what it wrote keeps holding a slot, and how often it
+/// may take the exclusive claim the operator's CLI needs to run at all. Every field defaults, so
+/// an install whose `[mcp]` table predates them is bounded exactly as it was.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mcp {
     /// Bundle directories that must already exist before a proposal is refused.
     #[serde(default)]
     pub max_pending: Option<usize>,
+    /// Keystore names the agent may propose with; empty is every key the store holds.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Safes the agent may propose against; empty is every Safe `safes.toml` describes.
+    #[serde(default)]
+    pub safes: Vec<Address>,
+    /// Nonces above the anchor a proposal may claim.
+    #[serde(default)]
+    pub nonce_window: Option<u64>,
+    /// Minutes an unsigned proposal keeps holding its slot and its place in the queue.
+    #[serde(default)]
+    pub proposal_ttl_mins: Option<u64>,
+    /// Proposals one agent session may file per hour.
+    #[serde(default)]
+    pub proposals_per_hour: Option<u32>,
+    /// Milliseconds one session must leave between tool calls that lock the bundle tree.
+    #[serde(default)]
+    pub lock_cooldown_ms: Option<u64>,
+    /// Safe nonces the operator read off-chain, each anchoring its Safe's window absolutely.
+    #[serde(default)]
+    pub anchor: Vec<NonceAnchor>,
+}
+
+impl Mcp {
+    pub fn max_pending(&self) -> usize {
+        self.max_pending.unwrap_or(DEFAULT_MCP_MAX_PENDING)
+    }
+    pub fn nonce_window(&self) -> u64 {
+        self.nonce_window.unwrap_or(DEFAULT_NONCE_WINDOW)
+    }
+    pub fn proposal_ttl_ms(&self) -> u64 {
+        self.proposal_ttl_mins
+            .unwrap_or(DEFAULT_PROPOSAL_TTL_MINS)
+            .saturating_mul(60_000)
+    }
+    pub fn proposals_per_hour(&self) -> usize {
+        self.proposals_per_hour
+            .unwrap_or(DEFAULT_PROPOSALS_PER_HOUR) as usize
+    }
+    pub fn lock_cooldown_ms(&self) -> u64 {
+        self.lock_cooldown_ms.unwrap_or(DEFAULT_LOCK_COOLDOWN_MS)
+    }
+}
+
+/// One Safe's next nonce as the operator last read it on chain. This machine has no RPC client,
+/// so a Safe's real nonce is not knowable here: this entry is the operator stating it, and
+/// without one the window is anchored on the local queue instead.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonceAnchor {
+    /// The Safe whose window this anchors.
+    pub safe: Address,
+    /// Chain the Safe is deployed on.
+    #[serde(with = "crate::wire::u256")]
+    pub chain_id: U256,
+    /// The Safe's next nonce.
+    #[serde(with = "crate::wire::u256")]
+    pub nonce: U256,
 }
 
 /// One tailnet machine this install exchanges Safe bundles with over rsync-on-ssh.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundlePeer {
     /// SSH target: the peer's MagicDNS name, optionally `user@`-prefixed.
     pub host: String,
@@ -108,6 +207,7 @@ impl BundlePeer {
 
 /// One trusted adapter: which manifest, and the exact bytes that manifest must be.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterPin {
     /// Adapter id: names its manifest, its socket, and the provenance on the approval prompt.
     pub id: String,
@@ -179,13 +279,37 @@ pub enum TextRefusal {
 
 create_err_with_impls!(
     #[derive(Debug)]
+    pub SshTargetErr,
+    ;
+    Invalid { target: String }
+);
+
+impl std::error::Error for SshTargetErr {}
+
+create_err_with_impls!(
+    #[derive(Debug)]
+    pub RemotePathErr,
+    ;
+    Invalid { path: String }
+);
+
+impl std::error::Error for RemotePathErr {}
+
+create_err_with_impls!(
+    #[derive(Debug)]
     pub ConfigErr,
     StdIo(std::io::Error),
     SerdeJson(serde_json::Error),
     Toml(toml::de::Error),
     TomlSer(toml::ser::Error),
-    Envelope(crate::crypto::envelope::EnvErr)
+    Envelope(crate::crypto::envelope::EnvErr),
+    SshTarget(SshTargetErr),
+    RemotePath(RemotePathErr),
+    InvalidGrantPublicKey
     ;
+    ConfigLocked { path: PathBuf },
+    UnsafeConfigLock { path: PathBuf },
+    UnsafeConfigFile { path: PathBuf, mode: u32 },
     AnnotationTextRefused {
         address: Address,
         text: String,
@@ -203,11 +327,202 @@ create_err_with_impls!(
     DuplicateLabel {
         address: Address,
         chain_id: U256,
-    }
+    },
+    StorePathNotAbsolute { path: PathBuf },
+    StorePathHasUnsafeComponent { path: PathBuf },
+    StorePathIsDangerous { path: PathBuf },
+    StorePathNotDirectory { path: PathBuf },
+    TooManyEntries { field: String, found: usize, max: usize },
+    InvalidMcpLimit { field: &'static str, found: u64, min: u64, max: u64 },
+    InvalidMcpKey { key: String },
+    DuplicateAnchor { safe: Address, chain_id: U256 },
+    InvalidAdapterId { id: String },
+    InvalidAdapterPin { id: String },
+    DuplicateAdapter { id: String },
+    DuplicateBackupRemote { host: String, folder: String },
+    DuplicateBundlePeer { host: String },
+    InvalidLegacyKeychainField { field: String }
 );
 
 /// Characters of annotation text an approval sheet has room for.
 const MAX_ANNOTATION_CHARS: usize = 32;
+
+const MAX_SSH_TARGET_BYTES: usize = 255;
+const MAX_REMOTE_PATH_BYTES: usize = 1024;
+/// Config is operator-authored and normally a few KiB; this bounds both TOML and legacy JSON.
+pub const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+const CONFIG_LOCK_FILE: &str = ".config.lock";
+
+/// Held across the complete load/edit/save cycle so concurrent commands cannot overwrite each
+/// other's unrelated configuration changes. The lock lives beside `config.toml`, is never
+/// followed through a symlink, and is accepted only when it is an owner-owned regular file.
+struct ConfigWriteLock {
+    _file: std::fs::File,
+}
+
+impl ConfigWriteLock {
+    fn take() -> Result<Self, ConfigErr> {
+        std::fs::create_dir_all(home_dir())?;
+        Self::take_at(&home_dir().join(CONFIG_LOCK_FILE))
+    }
+
+    fn take_at(path: &Path) -> Result<Self, ConfigErr> {
+        let file = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: `geteuid` has no preconditions and changes no process state.
+        let ours = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_file() || metadata.uid() != ours {
+            return Err(ConfigErr::UnsafeConfigLock {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(ConfigErr::ConfigLocked {
+                path: path.to_path_buf(),
+            }),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+/// Read a config at the same regular-file, owner-only, mode-0600 bar as key material: a daemon
+/// re-reads it, it pins the grant key authorizing every signature, and it names the backup remotes.
+fn owner_only_config_bytes(path: &Path) -> Result<Vec<u8>, ConfigErr> {
+    let file = crate::open_regular_file(path)?;
+    let metadata = file.metadata()?;
+    if !crate::is_owner_only_regular(&metadata) {
+        return Err(ConfigErr::UnsafeConfigFile {
+            path: path.to_path_buf(),
+            mode: metadata.mode(),
+        });
+    }
+    Ok(crate::read_bounded(file, MAX_CONFIG_BYTES)?)
+}
+
+fn canonical_with_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return Err(error);
+                };
+                cursor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn validate_store_path(configured: &str) -> Result<(), ConfigErr> {
+    let path = resolve_path(configured);
+    if !path.is_absolute() {
+        return Err(ConfigErr::StorePathNotAbsolute { path });
+    }
+    if configured
+        .split('/')
+        .any(|component| component == "." || component == "..")
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(ConfigErr::StorePathHasUnsafeComponent { path });
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(ConfigErr::StorePathNotDirectory { path });
+    }
+    let resolved = canonical_with_missing(&path)?;
+    if resolved.parent().is_none() {
+        return Err(ConfigErr::StorePathIsDangerous { path: resolved });
+    }
+    let mut protected = vec![home_dir()];
+    if let Ok(home) = std::env::var("HOME") {
+        protected.push(PathBuf::from(home));
+    }
+    for anchor in protected {
+        let anchor = canonical_with_missing(&anchor)?;
+        if resolved == anchor || anchor.starts_with(&resolved) {
+            return Err(ConfigErr::StorePathIsDangerous { path: resolved });
+        }
+    }
+    if path.exists() && !path.is_dir() {
+        return Err(ConfigErr::StorePathNotDirectory { path });
+    }
+    Ok(())
+}
+
+fn check_count(field: &str, found: usize, max: usize) -> Result<(), ConfigErr> {
+    if found > max {
+        return Err(ConfigErr::TooManyEntries {
+            field: field.to_string(),
+            found,
+            max,
+        });
+    }
+    Ok(())
+}
+
+fn ssh_word(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with('-')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+pub fn validate_ssh_target(target: &str) -> Result<(), SshTargetErr> {
+    let valid = !target.is_empty()
+        && target.len() <= MAX_SSH_TARGET_BYTES
+        && match target.split_once('@') {
+            Some((user, host)) => !host.contains('@') && ssh_word(user) && ssh_word(host),
+            None => ssh_word(target),
+        };
+    if valid {
+        return Ok(());
+    }
+    Err(SshTargetErr::Invalid {
+        target: target.to_string(),
+    })
+}
+
+pub fn validate_remote_path(path: &str) -> Result<(), RemotePathErr> {
+    let trimmed = path.trim_end_matches('/');
+    let valid = !trimmed.is_empty()
+        && path.len() <= MAX_REMOTE_PATH_BYTES
+        && !path
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+        && !path
+            .split('/')
+            .any(|component| component == ".." || component.starts_with('-'));
+    if valid {
+        return Ok(());
+    }
+    Err(RemotePathErr::Invalid {
+        path: path.to_string(),
+    })
+}
 
 /// Judge one piece of operator-authored text that an approval summary will print. It is
 /// operator-authored but frequently pasted from whoever asked to be paid, so it is untrusted
@@ -305,17 +620,155 @@ impl Config {
     pub fn backup_fetch_secs(&self) -> u64 {
         self.backup_fetch_secs.unwrap_or(DEFAULT_BACKUP_FETCH_SECS)
     }
-    pub fn mcp_max_pending(&self) -> usize {
-        match &self.mcp {
-            Some(mcp) => mcp.max_pending.unwrap_or(DEFAULT_MCP_MAX_PENDING),
-            None => DEFAULT_MCP_MAX_PENDING,
-        }
+    /// The `[mcp]` table, or every bound at its default when the config carries no such table.
+    pub fn mcp(&self) -> &Mcp {
+        static ABSENT: Mcp = Mcp {
+            max_pending: None,
+            keys: Vec::new(),
+            safes: Vec::new(),
+            nonce_window: None,
+            proposal_ttl_mins: None,
+            proposals_per_hour: None,
+            lock_cooldown_ms: None,
+            anchor: Vec::new(),
+        };
+        self.mcp.as_ref().unwrap_or(&ABSENT)
     }
-    /// Refuse an annotation table that could mislead the human reading an approval summary:
-    /// text that could forge structure in it, a `decimals` a non-fungible standard has no
-    /// meaning for, and a second entry for a `(address, chain_id)` the first already answers —
-    /// an entry that can never fire is one the operator wrongly believes in.
-    fn validate(&self) -> Result<(), ConfigErr> {
+    /// Validate an in-memory configuration before it is persisted or trusted.
+    pub fn validate(&self) -> Result<(), ConfigErr> {
+        validate_store_path(&self.store)?;
+        for (field, value) in [("service", &self.service), ("account", &self.account)] {
+            if value.len() > MAX_LEGACY_KEYCHAIN_FIELD_BYTES || value.contains('\0') {
+                return Err(ConfigErr::InvalidLegacyKeychainField {
+                    field: field.to_string(),
+                });
+            }
+        }
+        if let Some(pinned) = &self.grant_public_key {
+            let point = hex::decode(pinned).map_err(|_| ConfigErr::InvalidGrantPublicKey)?;
+            if point.len() != 65
+                || point.first() != Some(&4)
+                || p256::PublicKey::from_sec1_bytes(&point).is_err()
+            {
+                return Err(ConfigErr::InvalidGrantPublicKey);
+            }
+        }
+        let mcp = self.mcp();
+        check_count("mcp.keys", mcp.keys.len(), MAX_MCP_ENTRIES)?;
+        check_count("mcp.safes", mcp.safes.len(), MAX_MCP_ENTRIES)?;
+        check_count("mcp.anchor", mcp.anchor.len(), MAX_MCP_ENTRIES)?;
+        for key in &mcp.keys {
+            if !is_valid_key_name(key) {
+                return Err(ConfigErr::InvalidMcpKey { key: key.clone() });
+            }
+        }
+        for (at, anchor) in mcp.anchor.iter().enumerate() {
+            if mcp.anchor[at + 1..]
+                .iter()
+                .any(|other| other.safe == anchor.safe && other.chain_id == anchor.chain_id)
+            {
+                return Err(ConfigErr::DuplicateAnchor {
+                    safe: anchor.safe,
+                    chain_id: anchor.chain_id,
+                });
+            }
+        }
+        for (field, stated, min, max) in [
+            (
+                "max_pending",
+                mcp.max_pending.map(|found| found as u64),
+                1,
+                MAX_MCP_PENDING as u64,
+            ),
+            ("nonce_window", mcp.nonce_window, 0, MAX_NONCE_WINDOW),
+            (
+                "proposal_ttl_mins",
+                mcp.proposal_ttl_mins,
+                1,
+                MAX_PROPOSAL_TTL_MINS,
+            ),
+            (
+                "proposals_per_hour",
+                mcp.proposals_per_hour.map(u64::from),
+                1,
+                u64::from(MAX_PROPOSALS_PER_HOUR),
+            ),
+            (
+                "lock_cooldown_ms",
+                mcp.lock_cooldown_ms,
+                0,
+                MAX_LOCK_COOLDOWN_MS,
+            ),
+        ] {
+            let Some(found) = stated else {
+                continue;
+            };
+            if found < min || found > max {
+                return Err(ConfigErr::InvalidMcpLimit {
+                    field,
+                    found,
+                    min,
+                    max,
+                });
+            }
+        }
+        check_count(
+            "backup_remotes",
+            self.backup_remotes.len(),
+            MAX_BACKUP_REMOTES,
+        )?;
+        check_count("adapters", self.adapters.len(), MAX_ADAPTERS)?;
+        check_count("bundle_peers", self.bundle_peers.len(), MAX_BUNDLE_PEERS)?;
+        check_count("token", self.token.len(), MAX_ANNOTATIONS)?;
+        check_count("label", self.label.len(), MAX_ANNOTATIONS)?;
+
+        for (at, remote) in self.backup_remotes.iter().enumerate() {
+            validate_ssh_target(&remote.host)?;
+            validate_remote_path(&remote.folder)?;
+            if self.backup_remotes[at + 1..].iter().any(|other| {
+                other.host.eq_ignore_ascii_case(&remote.host) && other.folder == remote.folder
+            }) {
+                return Err(ConfigErr::DuplicateBackupRemote {
+                    host: remote.host.clone(),
+                    folder: remote.folder.clone(),
+                });
+            }
+        }
+        for (at, peer) in self.bundle_peers.iter().enumerate() {
+            validate_ssh_target(&peer.host)?;
+            validate_remote_path(peer.dir())?;
+            if self.bundle_peers[at + 1..]
+                .iter()
+                .any(|other| other.host.eq_ignore_ascii_case(&peer.host))
+            {
+                return Err(ConfigErr::DuplicateBundlePeer {
+                    host: peer.host.clone(),
+                });
+            }
+        }
+        for (at, adapter) in self.adapters.iter().enumerate() {
+            if !is_valid_string_name(&adapter.id) {
+                return Err(ConfigErr::InvalidAdapterId {
+                    id: adapter.id.clone(),
+                });
+            }
+            let pin = hex::decode(&adapter.sha256).map_err(|_| ConfigErr::InvalidAdapterPin {
+                id: adapter.id.clone(),
+            })?;
+            if pin.len() != 32 {
+                return Err(ConfigErr::InvalidAdapterPin {
+                    id: adapter.id.clone(),
+                });
+            }
+            if self.adapters[at + 1..]
+                .iter()
+                .any(|other| other.id == adapter.id)
+            {
+                return Err(ConfigErr::DuplicateAdapter {
+                    id: adapter.id.clone(),
+                });
+            }
+        }
         for (i, token) in self.token.iter().enumerate() {
             if let Err(refusal) = annotation_text(&token.symbol) {
                 return Err(ConfigErr::AnnotationTextRefused {
@@ -368,16 +821,35 @@ impl Config {
         if !path.exists() {
             let legacy = home_dir().join("config.json");
             if legacy.exists() {
-                let cfg: Config = serde_json::from_slice(&std::fs::read(&legacy)?)?;
+                let bytes = owner_only_config_bytes(&legacy)?;
+                let cfg: Config = crate::wire::strict_json_from_slice(&bytes)?;
                 cfg.validate()?;
                 cfg.save()?;
                 std::fs::remove_file(&legacy)?;
                 return Ok(cfg);
             }
         }
-        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        let bytes = owner_only_config_bytes(&path)?;
+        let cfg: Config = toml::from_str(
+            std::str::from_utf8(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        )?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Atomically serialize an existing-config read/modify/write transaction against every
+    /// other hot_cheese command using this API. The closure may return its caller's richer error
+    /// type; configuration and lock failures convert into it.
+    pub fn update<T, E>(edit: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<ConfigErr>,
+    {
+        let _lock = ConfigWriteLock::take().map_err(E::from)?;
+        let mut config = Self::load().map_err(E::from)?;
+        let result = edit(&mut config)?;
+        config.save().map_err(E::from)?;
+        Ok(result)
     }
     /// A config for tests that build a `HotApi` directly: the store, plus the P-256 base
     /// point standing in for a pinned grant key so the sign path reaches its approver (no
@@ -405,6 +877,7 @@ impl Config {
         })
     }
     pub fn save(&self) -> Result<(), ConfigErr> {
+        self.validate()?;
         let text = toml::to_string_pretty(self)?;
         let p = config_path();
         if let Some(parent) = p.parent() {
@@ -434,6 +907,69 @@ mod tests {
         ))
     }
 
+    fn with_store(path: &str) -> Result<Config, ConfigErr> {
+        let cfg: Config = toml::from_str(&format!(
+            "service = \"\"\naccount = \"\"\nstore = {path:?}\n"
+        ))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn config_update_lock_serializes_the_whole_transaction() {
+        let path = std::env::temp_dir().join(format!(
+            "hot-cheese-config-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = ConfigWriteLock::take_at(&path).expect("first writer claims the lock");
+        assert!(matches!(
+            ConfigWriteLock::take_at(&path),
+            Err(ConfigErr::ConfigLocked { .. })
+        ));
+        drop(first);
+        ConfigWriteLock::take_at(&path).expect("released lock is reusable");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A running daemon re-reads `config.toml` and obeys the grant key it pins and the remotes it
+    /// names, so a config another account can rewrite, or reach through a symlink, must not load.
+    #[test]
+    fn a_config_another_account_can_rewrite_does_not_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot-cheese-config-mode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("make the test dir");
+        let path = dir.join("config.toml");
+        crate::crypto::envelope::atomic_write(&path, HEAD.as_bytes()).expect("write it 0600");
+        assert_eq!(
+            owner_only_config_bytes(&path).expect("an owner-only config loads"),
+            HEAD.as_bytes()
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664))
+            .expect("loosen the mode");
+        assert!(matches!(
+            owner_only_config_bytes(&path),
+            Err(ConfigErr::UnsafeConfigFile { mode, .. }) if mode & 0o077 == 0o064
+        ));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore the mode");
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).expect("make a final-component symlink");
+        assert!(owner_only_config_bytes(&link).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A label is pasted text that a summary prints inside `address (name)`, so the shapes that
     /// could forge structure there — a newline that fakes a ⚠ line or pushes the real content off
     /// a three-line sheet, a paren that closes the renderer's and opens its own, an address-like
@@ -450,10 +986,7 @@ mod tests {
             &"a".repeat(33),
         ] {
             assert!(
-                matches!(
-                    label(forged),
-                    Err(ConfigErr::AnnotationTextRefused { .. })
-                ),
+                matches!(label(forged), Err(ConfigErr::AnnotationTextRefused { .. })),
                 "{forged:?} must not reach an approval sheet"
             );
         }
@@ -471,12 +1004,12 @@ mod tests {
             "[[label]]\naddress = \"0x2222222222222222222222222222222222222222\"\n",
             "chain_id = 1\nname = \"Attacker\"\n",
         );
-        assert!(matches!(
-            loaded(two),
-            Err(ConfigErr::DuplicateLabel { .. })
-        ));
+        assert!(matches!(loaded(two), Err(ConfigErr::DuplicateLabel { .. })));
 
-        let other_chain = two.replace("chain_id = 1\nname = \"Attacker\"", "chain_id = 10\nname = \"Attacker\"");
+        let other_chain = two.replace(
+            "chain_id = 1\nname = \"Attacker\"",
+            "chain_id = 10\nname = \"Attacker\"",
+        );
         assert!(loaded(&other_chain).is_ok());
 
         let token = |standard: &str, decimals: u8| {
@@ -494,6 +1027,153 @@ mod tests {
         assert!(matches!(
             token("erc1155", 6),
             Err(ConfigErr::DecimalsOnNonFungible { .. })
+        ));
+    }
+
+    #[test]
+    fn destructive_store_targets_are_refused_at_config_load() {
+        assert!(matches!(
+            with_store("relative/store"),
+            Err(ConfigErr::StorePathNotAbsolute { .. })
+        ));
+        assert!(matches!(
+            with_store("/"),
+            Err(ConfigErr::StorePathIsDangerous { .. })
+        ));
+        assert!(matches!(
+            with_store("/tmp/../etc"),
+            Err(ConfigErr::StorePathHasUnsafeComponent { .. })
+        ));
+        assert!(matches!(
+            with_store(&home_dir().display().to_string()),
+            Err(ConfigErr::StorePathIsDangerous { .. })
+        ));
+        assert!(with_store("/nonexistent/hot-cheese-dedicated-store").is_ok());
+
+        let file = std::env::temp_dir().join(format!(
+            "hot-cheese-config-store-file-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file, b"not a directory").expect("make a file-shaped store target");
+        assert!(matches!(
+            with_store(&file.display().to_string()),
+            Err(ConfigErr::StorePathNotDirectory { .. })
+        ));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn ssh_words_remote_paths_and_config_multiplicity_are_bounded() {
+        for target in ["host", "user@host.tailnet.ts.net", "user_name@10.0.0.1"] {
+            assert!(validate_ssh_target(target).is_ok(), "{target}");
+        }
+        for target in ["", "-oProxyCommand=x", "user@@host", "host;touch", "user@"] {
+            assert!(validate_ssh_target(target).is_err(), "{target}");
+        }
+        for path in ["vault.git", "folder/under_home", "/absolute/safe-dir/"] {
+            assert!(validate_remote_path(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "../escape",
+            "folder/../escape",
+            "folder;touch",
+            "-option",
+        ] {
+            assert!(validate_remote_path(path).is_err(), "{path}");
+        }
+
+        let too_many = (0..=MAX_BUNDLE_PEERS)
+            .map(|at| BundlePeer {
+                host: format!("peer{at}"),
+                dir: None,
+            })
+            .collect();
+        let mut cfg = loaded("").expect("base config");
+        cfg.bundle_peers = too_many;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::TooManyEntries { ref field, .. }) if field == "bundle_peers"
+        ));
+
+        let mut cfg = loaded("").expect("base config");
+        cfg.mcp = Some(Mcp {
+            max_pending: Some(MAX_MCP_PENDING + 1),
+            ..Mcp::default()
+        });
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::InvalidMcpLimit {
+                field: "max_pending",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            loaded("[mcp]\nnonce_window = 4096\n"),
+            Err(ConfigErr::InvalidMcpLimit {
+                field: "nonce_window",
+                ..
+            })
+        ));
+    }
+
+    /// Every `[mcp]` bound the agent is held to has a default, and folding the agent limits into
+    /// this one file must not move any of them: a config that names none of the new keys — the
+    /// only thing an install predating them has — is bounded by exactly the values the standalone
+    /// limits file used, and an empty allow-list still means every key and every Safe.
+    #[test]
+    fn an_mcp_table_naming_none_of_the_agent_limits_keeps_every_previous_default() {
+        for tables in ["", "[mcp]\n", "[mcp]\nmax_pending = 4\n"] {
+            let cfg = loaded(tables).expect("a config predating the agent limits still loads");
+            let mcp = cfg.mcp();
+            assert!(mcp.keys.is_empty(), "an empty allow-list is every key");
+            assert!(mcp.safes.is_empty(), "and every Safe");
+            assert!(mcp.anchor.is_empty());
+            assert_eq!(mcp.nonce_window(), 8);
+            assert_eq!(mcp.proposal_ttl_ms(), 1_440 * 60_000);
+            assert_eq!(mcp.proposals_per_hour(), 16);
+            assert_eq!(mcp.lock_cooldown_ms(), 100);
+        }
+        assert_eq!(loaded("").expect("no table").mcp().max_pending(), 16);
+        assert_eq!(
+            loaded("[mcp]\nmax_pending = 4\n")
+                .expect("a stated cap")
+                .mcp()
+                .max_pending(),
+            4
+        );
+    }
+
+    #[test]
+    fn adapter_and_grant_pins_are_validated_before_use() {
+        let mut cfg = loaded("").expect("base config");
+        cfg.grant_public_key = Some("04".to_string());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::InvalidGrantPublicKey)
+        ));
+
+        let mut cfg = loaded("").expect("base config");
+        cfg.adapters.push(AdapterPin {
+            id: "../socket".to_string(),
+            manifest: "adapter.toml".to_string(),
+            sha256: "00".repeat(32),
+        });
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::InvalidAdapterId { .. })
+        ));
+
+        let mut cfg = loaded("").expect("base config");
+        cfg.adapters.push(AdapterPin {
+            id: "adapter".to_string(),
+            manifest: "adapter.toml".to_string(),
+            sha256: "00".repeat(31),
+        });
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::InvalidAdapterPin { .. })
         ));
     }
 }

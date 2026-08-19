@@ -5,6 +5,12 @@
 //! an opaque `dataRepresentation` blob in a 0600 file under the home dir — no keychain,
 //! no entitlement, no provisioning profile. Each ECDH requires a live biometric.
 //!
+//! A blob carries its own access-control policy, and any process running as this user can mint
+//! an enclave key with no policy at all. So the blob file existing proves nothing: a key is
+//! adopted only when its public key is already recorded as this install's — `se_pub` in
+//! `keyring.json` for the KEK, `grant_public_key` in `config.toml` for the grant key. An
+//! unrecorded blob is refused outright rather than adopted or overwritten.
+//!
 //! Enrollment computes `ECDH(eph_priv, se_pub)` on the host (`p256`); unlock computes the
 //! mirror `ECDH(se_priv, eph_pub)` in the enclave. Standard P-256 ECDH is symmetric and
 //! both sides encode the raw big-endian X-coordinate (32 bytes, no KDF), so they must
@@ -16,12 +22,13 @@
 //! SHA-256 of a caller-supplied message, so a signature under the pinned public key is
 //! hardware-attested proof that a human approved exactly those bytes. Losing it costs
 //! nothing but a re-run of `hot_cheese enroll grant`.
-use crate::crypto::envelope::write_private_file;
+use crate::crypto::envelope::write_private_file_new;
+use crate::keyring::{EnrollParams, Keyring, KeyringErr};
 use crate::mac::local_auth::LaContext;
 use err_mac::create_err_with_impls;
 use std::ffi::{c_char, c_void, CString};
 use std::path::{Path, PathBuf};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -39,12 +46,20 @@ create_err_with_impls!(
     BadBlob,
     BufferTooSmall,
     Shim(i32),
-    StdIo(std::io::Error)
+    StdIo(std::io::Error),
+    Config(crate::config::ConfigErr),
+    Keyring(KeyringErr),
+    Hex(hex::FromHexError)
     ;
     Create { code: i32 },
     AccessControl { code: i32 },
     BadSignatureLen { len: usize },
     GrantReuseWindowExceeded { elapsed_ms: u64, window_ms: u64 },
+    InvalidLabel { label: String },
+    UnrecordedEnclaveKey { path: PathBuf, public_key: String },
+    EnclaveKeyPathOccupied { path: PathBuf },
+    BlobNotOwnerOnly { path: PathBuf },
+    BlobNotAKeyFile { path: PathBuf },
 );
 
 /// Raw P-256 ECDH result: the 32-byte field element (X-coordinate).
@@ -144,7 +159,25 @@ pub fn se_available() -> bool {
     unsafe { hc_se_available() == 1 }
 }
 
-/// Map a key label to a filesystem-safe stem shared by the SE-blob and demo-key schemes.
+/// Refuse labels whose on-disk spelling would be ambiguous. Within this alphabet replacing a
+/// dot with `_` is injective because an input underscore is not legal; the byte ceiling also
+/// keeps every derived filename comfortably within one filesystem component.
+fn validate_label(label: &str) -> Result<(), SeErr> {
+    let valid = !label.is_empty()
+        && label.len() <= crate::MAX_NAME_BYTES
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.');
+    if valid {
+        Ok(())
+    } else {
+        Err(SeErr::InvalidLabel {
+            label: crate::safe_diagnostic_text(label),
+        })
+    }
+}
+
+/// Map a validated key label to a filesystem-safe stem shared by the SE-blob and demo-key schemes.
 fn sanitize_label(label: &str) -> String {
     label
         .chars()
@@ -162,20 +195,57 @@ fn se_grant_blob_path(label: &str) -> PathBuf {
     crate::config::home_dir().join(format!("se_grant_{}.blob", sanitize_label(label)))
 }
 
-fn read_blob(path: &Path) -> Result<Vec<u8>, SeErr> {
-    match std::fs::read(path) {
-        Ok(b) => Ok(b),
+/// Read the key blob at `path`. Only an absent file is [`SeErr::KeyNotFound`]; a file that is
+/// there but is not this user's bounded 0600 regular file keeps its own variant, because "your
+/// key is gone, fall back to the passphrase" and "something else is squatting on your key path"
+/// call for opposite responses from the operator.
+fn read_blob(path: &Path) -> Result<Zeroizing<Vec<u8>>, SeErr> {
+    match crate::read_private_file_bounded(path, SE_BLOB_MAX as u64) {
+        Ok(bytes) => Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(SeErr::KeyNotFound),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(SeErr::BlobNotOwnerOnly {
+            path: path.to_path_buf(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(SeErr::BlobNotAKeyFile {
+            path: path.to_path_buf(),
+        }),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Create (idempotently) this machine's Touch-ID-bound SE key under `label`. No Touch ID.
-pub fn ensure_se_key(label: &str) -> Result<(), SeErr> {
-    if software_enclave_enabled() {
-        return ensure_software_key(label);
+/// The `se_pub` of every Secure Enclave enrollment this install has recorded — the only public
+/// keys a KEK blob may present. A store with no `keyring.json` yet has recorded none.
+fn enrolled_se_public_keys() -> Result<Vec<Vec<u8>>, SeErr> {
+    let config = crate::config::Config::load()?;
+    let keyring = match Keyring::load(&crate::mac::MacBackend::keyring_path(&config.store)) {
+        Ok(keyring) => keyring,
+        Err(KeyringErr::StdIo(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new())
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut enrolled = Vec::new();
+    for enrollment in &keyring.enrollments {
+        if let EnrollParams::SecureEnclave { se_pub, .. } = &enrollment.params {
+            enrolled.push(se_pub.clone());
+        }
     }
-    ensure_se_key_at(&se_blob_path(label))
+    Ok(enrolled)
+}
+
+/// The grant public key pinned in `config.toml` — the only one a grant blob may present.
+fn pinned_grant_public_key() -> Result<Vec<Vec<u8>>, SeErr> {
+    let Some(pinned) = crate::config::Config::load()?.grant_public_key else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![hex::decode(pinned)?])
+}
+
+/// Ensure this machine's Touch-ID-bound SE KEK under `label` exists. A blob already at the path
+/// is adopted only when `keyring.json` records its public key. No Touch ID.
+pub fn ensure_se_key(label: &str) -> Result<(), SeErr> {
+    validate_label(label)?;
+    ensure_kek_at(label, &enrolled_se_public_keys()?)
 }
 
 /// Shim entry point that mints an enclave key and writes its `dataRepresentation`.
@@ -183,12 +253,43 @@ type ShimCreate = unsafe extern "C" fn(*mut u8, usize, *mut usize, *mut i32) -> 
 /// Shim entry point that reloads a blob and writes the key's SEC1 public point.
 type ShimPublicKey = unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
 
+/// The two path-level operations one kind of enclave key supports.
+#[derive(Clone, Copy)]
+struct EnclaveKeyOps {
+    /// Mints a fresh key at the path, failing with `AlreadyExists` when the path is occupied.
+    mint: fn(&Path) -> Result<(), SeErr>,
+    /// Reads the SEC1 public key of whatever key blob is at the path. No Touch ID.
+    public_key: fn(&Path) -> Result<Vec<u8>, SeErr>,
+}
+
+const SE_KEK_OPS: EnclaveKeyOps = EnclaveKeyOps {
+    mint: |path| create_blob_at(path, hc_se_create),
+    public_key: |path| export_public_key(path, hc_se_public_key),
+};
+
+const SE_GRANT_OPS: EnclaveKeyOps = EnclaveKeyOps {
+    mint: |path| create_blob_at(path, hc_se_sign_create),
+    public_key: |path| export_public_key(path, hc_se_sign_public_key),
+};
+
+const SOFTWARE_OPS: EnclaveKeyOps = EnclaveKeyOps {
+    mint: mint_software_key,
+    public_key: software_pubkey,
+};
+
+fn checked_ffi_output(out: &[u8], out_len: usize) -> Result<&[u8], SeErr> {
+    if out_len == 0 {
+        return Err(SeErr::BadBlob);
+    }
+    out.get(..out_len).ok_or(SeErr::BufferTooSmall)
+}
+
 /// Mint an enclave key through `create` and persist its blob 0600 at `path`. No Touch ID.
 fn create_blob_at(path: &Path, create: ShimCreate) -> Result<(), SeErr> {
     if !se_available() {
         return Err(SeErr::Unavailable);
     }
-    let mut out = [0u8; SE_BLOB_MAX];
+    let mut out = Zeroizing::new([0u8; SE_BLOB_MAX]);
     let mut out_len: usize = 0;
     let mut detail: i32 = 0;
     let code = unsafe { create(out.as_mut_ptr(), out.len(), &mut out_len, &mut detail) };
@@ -201,21 +302,71 @@ fn create_blob_at(path: &Path, create: ShimCreate) -> Result<(), SeErr> {
         HC_ERR_ACCESS_CONTROL => return Err(SeErr::AccessControl { code: detail }),
         other => return Err(map_shim(other)),
     }
-    write_private_file(path, &out[..out_len])?;
+    write_private_file_new(path, checked_ffi_output(out.as_ref(), out_len)?)?;
     Ok(())
 }
 
-fn ensure_se_key_at(path: &Path) -> Result<(), SeErr> {
-    if path.exists() {
-        return Ok(());
+/// Take the key blob at `path` as this machine's, minting one only while the path is free. A
+/// blob already there is adopted ONLY when its public key is one of `recorded`: an enclave key's
+/// access-control policy travels inside its blob, so an unrecorded blob is an unproven key that
+/// may have been minted with no biometric gate at all. No Touch ID.
+fn ensure_enclave_key_at(
+    path: &Path,
+    recorded: &[Vec<u8>],
+    ops: EnclaveKeyOps,
+) -> Result<(), SeErr> {
+    match (ops.public_key)(path) {
+        Ok(present) => {
+            if recorded.iter().any(|known| known == &present) {
+                return Ok(());
+            }
+            let public_key = hex::encode(present);
+            tracing::error!(
+                path = %path.display(),
+                %public_key,
+                "an enclave key this install never recorded is sitting at the key path; refusing \
+                 to adopt it as this machine's key"
+            );
+            return Err(SeErr::UnrecordedEnclaveKey {
+                path: path.to_path_buf(),
+                public_key,
+            });
+        }
+        Err(SeErr::KeyNotFound) => {}
+        Err(e) => return Err(e),
     }
-    create_blob_at(path, hc_se_create)?;
-    tracing::info!(path = %path.display(), "created Secure Enclave P-256 key");
+    match (ops.mint)(path) {
+        Ok(()) => {}
+        Err(SeErr::StdIo(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SeErr::EnclaveKeyPathOccupied {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(e) => return Err(e),
+    }
+    tracing::info!(path = %path.display(), "minted this machine's enclave key");
     Ok(())
+}
+
+/// Route `label`'s KEK through the enclave, or through the demo software backend when it is on.
+fn ensure_kek_at(label: &str, recorded: &[Vec<u8>]) -> Result<(), SeErr> {
+    if software_enclave_enabled() {
+        return ensure_enclave_key_at(&software_key_path(label), recorded, SOFTWARE_OPS);
+    }
+    ensure_enclave_key_at(&se_blob_path(label), recorded, SE_KEK_OPS)
+}
+
+/// Route `label`'s grant key through the enclave, or through the demo software backend.
+fn ensure_grant_at(label: &str, recorded: &[Vec<u8>]) -> Result<(), SeErr> {
+    if software_enclave_enabled() {
+        return ensure_enclave_key_at(&software_grant_key_path(label), recorded, SOFTWARE_OPS);
+    }
+    ensure_enclave_key_at(&se_grant_blob_path(label), recorded, SE_GRANT_OPS)
 }
 
 /// Export the SE public key as uncompressed SEC1 (`0x04 || X || Y`, 65 bytes). No Touch ID.
 pub fn se_public_key(label: &str) -> Result<Vec<u8>, SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         return software_pubkey(&software_key_path(label));
     }
@@ -256,6 +407,7 @@ pub fn se_ecdh(
     auth: Option<&LaContext>,
     reason: &str,
 ) -> Result<Zeroizing<[u8; 32]>, SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         return software_se_ecdh(label, peer_pub_sec1, auth, reason);
     }
@@ -270,7 +422,7 @@ pub fn se_ecdh(
         Some(a) => a.as_raw_ptr(),
         None => std::ptr::null_mut(),
     };
-    let reason_c = CString::new(reason).unwrap_or_default();
+    let reason_c = CString::new(reason).map_err(|_| SeErr::TouchIdDenied)?;
     let mut out = Zeroizing::new([0u8; P256_SHARED_LEN]);
     let mut out_len: usize = 0;
     let code = unsafe {
@@ -295,23 +447,17 @@ pub fn se_ecdh(
     Ok(out)
 }
 
-/// Create (idempotently) this machine's Touch-ID-bound SE grant-signing key under `label`.
-/// Wraps nothing and unwraps nothing, so losing it costs only a re-run. No Touch ID.
+/// Ensure this machine's Touch-ID-bound SE grant-signing key under `label` exists. A blob already
+/// at the path is adopted only when `config.toml` pins its public key. Wraps nothing and unwraps
+/// nothing, so losing it costs only a re-run. No Touch ID.
 pub fn ensure_grant_key(label: &str) -> Result<(), SeErr> {
-    if software_enclave_enabled() {
-        return ensure_software_key_at(&software_grant_key_path(label));
-    }
-    let path = se_grant_blob_path(label);
-    if path.exists() {
-        return Ok(());
-    }
-    create_blob_at(&path, hc_se_sign_create)?;
-    tracing::info!(path = %path.display(), "created Secure Enclave P-256 grant key");
-    Ok(())
+    validate_label(label)?;
+    ensure_grant_at(label, &pinned_grant_public_key()?)
 }
 
 /// Export the grant key's public key as uncompressed SEC1 (65 bytes). No Touch ID.
 pub fn grant_public_key(label: &str) -> Result<Vec<u8>, SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         return software_pubkey(&software_grant_key_path(label));
     }
@@ -328,6 +474,7 @@ pub fn grant_sign(
     auth: Option<&LaContext>,
     reason: &str,
 ) -> Result<[u8; P256_SIGNATURE_LEN], SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         return software_grant_sign(label, msg, auth, reason);
     }
@@ -336,7 +483,7 @@ pub fn grant_sign(
         Some(a) => a.as_raw_ptr(),
         None => std::ptr::null_mut(),
     };
-    let reason_c = CString::new(reason).unwrap_or_default();
+    let reason_c = CString::new(reason).map_err(|_| SeErr::TouchIdDenied)?;
     let mut out = [0u8; P256_SIGNATURE_LEN];
     let mut out_len: usize = 0;
     let code = unsafe {
@@ -364,6 +511,7 @@ pub fn grant_sign(
 /// Delete the SE key (rotation / uninstall). Idempotent: removing the blob file makes the
 /// enclave key unrecoverable, since the blob is its only persistence.
 pub fn delete_se_key(label: &str) -> Result<(), SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         let _ = std::fs::remove_file(software_key_path(label));
         return Ok(());
@@ -381,6 +529,7 @@ pub fn delete_se_key(label: &str) -> Result<(), SeErr> {
 /// Delete the SE grant key. Idempotent, and benign: nothing is wrapped under it, so the
 /// operator recovers with `hot_cheese enroll grant` and a re-pin.
 pub fn delete_grant_key(label: &str) -> Result<(), SeErr> {
+    validate_label(label)?;
     if software_enclave_enabled() {
         let _ = std::fs::remove_file(software_grant_key_path(label));
         return Ok(());
@@ -399,7 +548,7 @@ pub fn delete_grant_key(label: &str) -> Result<(), SeErr> {
 /// swaps the Secure Enclave for an extractable on-disk P-256 key gated by a Touch ID
 /// prompt, reproducing the exact enroll/unlock/serve flow. NEVER for real keys.
 pub fn software_enclave_enabled() -> bool {
-    std::env::var_os("HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE").is_some()
+    std::env::var("HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE").as_deref() == Ok("1")
 }
 
 /// On-disk location of the demo software key for `label`. Per-label so the throwaway
@@ -414,19 +563,11 @@ fn software_grant_key_path(label: &str) -> PathBuf {
     crate::config::home_dir().join(format!("software_grant_{}.key", sanitize_label(label)))
 }
 
-fn ensure_software_key(label: &str) -> Result<(), SeErr> {
-    ensure_software_key_at(&software_key_path(label))
-}
-
-/// Create the demo software key if absent (idempotent).
-fn ensure_software_key_at(path: &Path) -> Result<(), SeErr> {
-    if path.exists() {
-        return Ok(());
-    }
+/// Mint the demo software key at `path`, 0600 and create-exclusive like the enclave blob.
+fn mint_software_key(path: &Path) -> Result<(), SeErr> {
     let sk = p256::SecretKey::random(&mut rand::rngs::OsRng);
-    let mut raw = sk.to_bytes();
-    write_private_file(path, &raw)?;
-    raw.as_mut_slice().zeroize();
+    let raw = Zeroizing::new(sk.to_bytes());
+    write_private_file_new(path, &raw)?;
     tracing::warn!(
         path = %path.display(),
         "DEMO: created a SOFTWARE 'enclave' key ON DISK (extractable, NOT hardware-backed)"
@@ -514,9 +655,8 @@ pub fn selftest(label: &str) -> Result<(), SeErr> {
 
     delete_se_key(label)?;
     delete_grant_key(label)?;
-    ensure_se_key(label)?;
-    ensure_se_key(label)?;
-    ensure_grant_key(label)?;
+    ensure_kek_at(label, &[])?;
+    ensure_grant_at(label, &[])?;
 
     let result = (|| {
         let pk = se_public_key(label)?;
@@ -596,8 +736,24 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// Proves the FFI create/persist/reload path on real SE hardware without a Touch ID prompt,
-    /// skipping when the SEP refuses because the login session's screen is locked.
+    #[test]
+    fn ffi_create_length_is_checked_before_slicing_the_output_buffer() {
+        assert!(matches!(
+            checked_ffi_output(&[0u8; 8], 9),
+            Err(SeErr::BufferTooSmall)
+        ));
+        assert!(matches!(
+            checked_ffi_output(&[0u8; 8], 0),
+            Err(SeErr::BadBlob)
+        ));
+        assert_eq!(
+            checked_ffi_output(&[1u8; 8], 3).expect("in bounds"),
+            &[1u8; 3]
+        );
+    }
+
+    /// Proves the FFI create/persist/reload path and the adoption gate on real SE hardware
+    /// without a Touch ID prompt, skipping when the SEP refuses because the screen is locked.
     #[test]
     fn se_key_creates_persists_and_exports_pubkey_without_touch_id() {
         if !se_available() {
@@ -607,7 +763,7 @@ mod tests {
         let path = dir.join("se_kek_smoke.blob");
         let _ = std::fs::remove_file(&path);
 
-        match ensure_se_key_at(&path) {
+        match ensure_enclave_key_at(&path, &[], SE_KEK_OPS) {
             Err(SeErr::ScreenLocked) => return,
             other => other.expect("create SE key blob"),
         }
@@ -618,13 +774,21 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "blob must be 0600");
 
-        ensure_se_key_at(&path).expect("second create is a no-op");
-
         let pk = export_public_key(&path, hc_se_public_key).expect("export public key");
         assert_eq!(pk.len(), SEC1_UNCOMPRESSED_LEN);
         assert_eq!(pk[0], SEC1_UNCOMPRESSED_TAG);
         let pk2 = export_public_key(&path, hc_se_public_key).expect("reload + export public key");
         assert_eq!(pk, pk2, "reloaded key must yield the same public key");
+
+        assert!(
+            matches!(
+                ensure_enclave_key_at(&path, &[], SE_KEK_OPS),
+                Err(SeErr::UnrecordedEnclaveKey { .. })
+            ),
+            "an enclave key no enrollment records must not be adopted"
+        );
+        ensure_enclave_key_at(&path, std::slice::from_ref(&pk), SE_KEK_OPS)
+            .expect("a recorded enclave key is adopted");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -669,8 +833,7 @@ mod tests {
     fn software_demo_key_persists_and_exports_uncompressed_pubkey() {
         let path = std::env::temp_dir().join(format!("hc_sw_se_{}.key", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        ensure_software_key_at(&path).expect("create");
-        ensure_software_key_at(&path).expect("idempotent second call");
+        mint_software_key(&path).expect("create");
         let sk1 = load_software_key_at(&path).expect("load");
         let sk2 = load_software_key_at(&path).expect("reload");
         assert_eq!(
@@ -684,18 +847,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A key blob planted at the key path is only ever adopted when its public key is one this
+    /// install already recorded: an unrecorded one is refused outright, and the refusal neither
+    /// re-mints over the blob nor leaves the caller a key it has not proven is biometry-gated.
+    #[test]
+    fn an_unrecorded_key_blob_is_refused_rather_than_adopted_or_overwritten() {
+        let path = std::env::temp_dir().join(format!("hc_planted_{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        ensure_enclave_key_at(&path, &[], SOFTWARE_OPS).expect("mint while the path is free");
+        let planted = std::fs::read(&path).expect("read the key that is now at the path");
+        let planted_pub = software_pubkey(&path).expect("public key of the planted key");
+
+        let refusal = ensure_enclave_key_at(&path, &[], SOFTWARE_OPS);
+        assert!(
+            matches!(
+                &refusal,
+                Err(SeErr::UnrecordedEnclaveKey { public_key, .. })
+                    if *public_key == hex::encode(&planted_pub)
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("blob survives the refusal"),
+            planted,
+            "a refusal must not re-mint over the key that is there"
+        );
+
+        let unrelated = p256::SecretKey::random(&mut rand::rngs::OsRng)
+            .public_key()
+            .to_sec1_bytes()
+            .into_vec();
+        assert!(matches!(
+            ensure_enclave_key_at(&path, std::slice::from_ref(&unrelated), SOFTWARE_OPS),
+            Err(SeErr::UnrecordedEnclaveKey { .. })
+        ));
+
+        ensure_enclave_key_at(&path, &[unrelated, planted_pub], SOFTWARE_OPS)
+            .expect("a recorded key is adopted");
+        assert_eq!(
+            std::fs::read(&path).expect("blob survives adoption"),
+            planted
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Full SE round-trip (create, pubkey, deterministic + host-equivalent ECDH, one-biometric
     /// ECDH + grant signature, delete) via `selftest`, the same check `hot_cheese se-selftest`
     /// runs.
     #[test]
     #[ignore = "requires Secure Enclave hardware + Touch ID (prompts biometrics)"]
     fn se_key_lifecycle_and_deterministic_ecdh() {
-        const TEST_LABEL: &str = "hotcheese.se.test_key";
+        const TEST_LABEL: &str = "hotcheese.se.test.key";
         selftest(TEST_LABEL).expect("SE self-test");
         assert!(matches!(se_public_key(TEST_LABEL), Err(SeErr::KeyNotFound)));
         assert!(matches!(
             grant_public_key(TEST_LABEL),
             Err(SeErr::KeyNotFound)
         ));
+    }
+
+    #[test]
+    fn enclave_labels_have_one_unambiguous_file_spelling() {
+        assert!(validate_label(SE_KEY_LABEL).is_ok());
+        assert!(validate_label(SE_GRANT_KEY_LABEL).is_ok());
+        for invalid in ["", "a_b", "../key", "key-name", "nul\0label"] {
+            assert!(
+                matches!(validate_label(invalid), Err(SeErr::InvalidLabel { .. })),
+                "{invalid:?} must not alias an enclave blob"
+            );
+        }
     }
 }

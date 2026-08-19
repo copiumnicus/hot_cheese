@@ -9,11 +9,14 @@
 //! Nothing here reads a clock, a config file or the filesystem. [`FieldWalk`] takes `now_secs`
 //! from its caller, which is what keeps this module free of [`grant`](crate::grant).
 use crate::intent::{Operation, SafeTxIntent};
-use alloy_dyn_abi::{DynSolType, DynSolValue, PropertyDef, Resolver, Specifier, TypeDef};
+use alloy_dyn_abi::{
+    DynSolType, DynSolValue, JsonAbiExt, PropertyDef, Resolver, Specifier, TypeDef,
+};
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy_sol_types::Eip712Domain;
 use err_mac::create_err_with_impls;
+use hc_core::is_valid_string_name;
 use serde::Deserialize;
 
 /// The four Safe owner/threshold management calls — the fail-closed rotation set. Compared
@@ -47,6 +50,26 @@ const DEADLINE_FAR_SECS: u64 = 86_400;
 /// before any plausible expiry.
 const DEADLINE_MIN_BITS: usize = 40;
 
+/// Explicit structural ceilings keep validation of a bounded policy file bounded too. Several
+/// checks compare entries pairwise, and the ABI resolver recursively follows declared types.
+pub const MAX_CALL_RULES: usize = 128;
+const MAX_SIGNATURE_BYTES: usize = 1024;
+const MAX_ARGUMENTS: usize = 64;
+const MAX_SCHEMAS: usize = 64;
+const MAX_SCHEMA_TYPES: usize = 64;
+const MAX_FIELDS_PER_TYPE: usize = 64;
+const MAX_RULE_CHOICES: usize = 256;
+const MAX_FIELD_RULE_DEPTH: usize = 16;
+/// A policy type is executable input to Alloy's recursive dynamic decoder. Keep both the
+/// declaration tree and every fixed-width expansion proportional to the largest calldata the
+/// daemon will accept, rather than letting a short string describe an enormous token tree.
+const MAX_ABI_TYPE_DEPTH: usize = 16;
+const MAX_ABI_TYPE_NODES: usize = 4_096;
+const MAX_ABI_WORDS: usize = 2_048;
+const MAX_ABI_INPUT_BYTES: usize = MAX_ABI_WORDS * 32;
+/// Includes the validated empty token tree and all templates cloned for dynamic arrays.
+const MAX_ABI_DECODE_NODES: usize = 8_192;
+
 create_err_with_impls!(
     #[derive(Debug)]
     pub RuleErr,
@@ -54,17 +77,28 @@ create_err_with_impls!(
     Abi(alloy_dyn_abi::Error)
     ;
     NotCanonical { declared: String, canonical: String },
+    SignatureTooLong { found: usize, max: usize },
+    TypeTooDeep { location: String, found: usize, max: usize },
+    TypeTooLarge { location: String, resource: String, found: usize, max: usize },
+    TooManyEntries { location: String, found: usize, max: usize },
+    FieldRuleTooDeep { location: String, max: usize },
+    DuplicateRuleChoice { location: String, value: String },
+    EmptyRuleChoice { location: String },
+    EmptyDeadlineWindow { location: String },
     DuplicateSelector { selector: FixedBytes<4>, first: String, second: String },
     ArgOutOfRange { signature: String, at: usize, arity: usize },
     ArgUnruled { signature: String, at: usize },
     ArgDuplicated { signature: String, at: usize },
     ArgNameEmpty { signature: String, at: usize },
+    ApprovalIdentifier { location: String, value: String },
+    ApprovalText { location: String, value: String },
     ArgNameNotUnique { signature: String, name: String },
     RuleTypeMismatch { signature: String, at: usize, declared: String, rule: FieldRuleKind },
     BatchRuleMisplaced { signature: String, at: usize },
     BatchRuleMissing { signature: String },
     DuplicateSchema { schema: String },
     DuplicateType { schema: String, name: String },
+    DuplicateField { schema: String, type_name: String, name: String },
     PrimaryTypeNotDeclared { schema: String, primary_type: String },
     SchemaNotResolvable { schema: String, primary_type: String },
     SchemaFieldTypeMismatch { schema: String, path: String, declared: String, rule: FieldRuleKind }
@@ -80,6 +114,7 @@ create_err_with_impls!(
     BoolNotExact { path: String, got: bool, want: bool },
     BytesNotExact { path: String, got: Bytes, want: Bytes },
     DeadlineTooFar { path: String, deadline: U256, now_secs: u64, within_secs: u64 },
+    DeadlineExpired { path: String, deadline: U256, now_secs: u64 },
     StringNotAllowed { path: String, got: String, allowed: Vec<String> },
     TooManyElements { path: String, got: usize, max_len: usize },
     StructNotDeclared { path: String, name: String },
@@ -95,6 +130,9 @@ create_err_with_impls!(
 pub struct Signature {
     /// The parsed function, whose `inputs` are the shape calldata is decoded against.
     function: Function,
+    /// Resolved once at policy load, after applying the local structural budget. Request bytes
+    /// are preflighted against these exact types before the third-party decoder sees them.
+    inputs: Vec<DynSolType>,
     /// `keccak256(canonical)[..4]`, derived here and never written by an operator.
     selector: FixedBytes<4>,
     /// The canonical text, which is also the text the policy file must contain.
@@ -105,6 +143,12 @@ impl TryFrom<String> for Signature {
     type Error = RuleErr;
 
     fn try_from(declared: String) -> Result<Self, RuleErr> {
+        if declared.len() > MAX_SIGNATURE_BYTES {
+            return Err(RuleErr::SignatureTooLong {
+                found: declared.len(),
+                max: MAX_SIGNATURE_BYTES,
+            });
+        }
         let function = Function::parse(&declared)?;
         let canonical = function.signature();
         if canonical != declared {
@@ -113,9 +157,24 @@ impl TryFrom<String> for Signature {
                 canonical,
             });
         }
+        check_len(
+            &format!("{canonical} arguments"),
+            function.inputs.len(),
+            MAX_ARGUMENTS,
+        )?;
+        let mut inputs = Vec::with_capacity(function.inputs.len());
+        let mut total = AbiStats::default();
+        for (at, input) in function.inputs.iter().enumerate() {
+            let ty = input.resolve()?;
+            let location = format!("{canonical} argument {at}");
+            let stats = abi_stats(&ty, &location, 0)?;
+            total.add(stats, &format!("{canonical} arguments"))?;
+            inputs.push(ty);
+        }
         let selector = function.selector();
         Ok(Signature {
             function,
+            inputs,
             selector,
             canonical,
         })
@@ -135,6 +194,354 @@ impl Signature {
     pub fn canonical(&self) -> &str {
         &self.canonical
     }
+
+    /// Decode only after a bounded, allocation-free walk has checked every offset and dynamic
+    /// length. Alloy 0.8 constructs token templates from both policy types and wire lengths; this
+    /// local boundary prevents either source from driving unchecked multiplication or allocation.
+    pub(crate) fn decode_input(&self, data: &[u8]) -> alloy_dyn_abi::Result<Vec<DynSolValue>> {
+        preflight_abi_input(&self.inputs, data)?;
+        self.function.abi_decode_input(data, true)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct AbiStats {
+    words: usize,
+    nodes: usize,
+}
+
+impl AbiStats {
+    fn add(&mut self, other: Self, location: &str) -> Result<(), RuleErr> {
+        self.words = bounded_add(
+            self.words,
+            other.words,
+            MAX_ABI_WORDS,
+            location,
+            "minimum ABI words",
+        )?;
+        self.nodes = bounded_add(
+            self.nodes,
+            other.nodes,
+            MAX_ABI_TYPE_NODES,
+            location,
+            "expanded ABI type nodes",
+        )?;
+        Ok(())
+    }
+}
+
+fn abi_stats(ty: &DynSolType, location: &str, depth: usize) -> Result<AbiStats, RuleErr> {
+    if depth > MAX_ABI_TYPE_DEPTH {
+        return Err(RuleErr::TypeTooDeep {
+            location: location.to_string(),
+            found: depth,
+            max: MAX_ABI_TYPE_DEPTH,
+        });
+    }
+    match ty {
+        DynSolType::Bool
+        | DynSolType::Int(_)
+        | DynSolType::Uint(_)
+        | DynSolType::FixedBytes(_)
+        | DynSolType::Address
+        | DynSolType::Function
+        | DynSolType::Bytes
+        | DynSolType::String => Ok(AbiStats { words: 1, nodes: 1 }),
+        DynSolType::Array(inner) => {
+            let inner = abi_stats(inner, location, depth + 1)?;
+            Ok(AbiStats {
+                words: 1,
+                nodes: bounded_add(
+                    1,
+                    inner.nodes,
+                    MAX_ABI_TYPE_NODES,
+                    location,
+                    "expanded ABI type nodes",
+                )?,
+            })
+        }
+        DynSolType::FixedArray(inner, size) => {
+            let inner = abi_stats(inner, location, depth + 1)?;
+            Ok(AbiStats {
+                words: bounded_mul(
+                    inner.words,
+                    *size,
+                    MAX_ABI_WORDS,
+                    location,
+                    "minimum ABI words",
+                )?,
+                nodes: bounded_add(
+                    1,
+                    bounded_mul(
+                        inner.nodes,
+                        *size,
+                        MAX_ABI_TYPE_NODES,
+                        location,
+                        "expanded ABI type nodes",
+                    )?,
+                    MAX_ABI_TYPE_NODES,
+                    location,
+                    "expanded ABI type nodes",
+                )?,
+            })
+        }
+        DynSolType::Tuple(items) | DynSolType::CustomStruct { tuple: items, .. } => {
+            let mut out = AbiStats { words: 0, nodes: 1 };
+            for item in items {
+                out.add(abi_stats(item, location, depth + 1)?, location)?;
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn bounded_add(
+    left: usize,
+    right: usize,
+    max: usize,
+    location: &str,
+    resource: &str,
+) -> Result<usize, RuleErr> {
+    let Some(found) = left.checked_add(right) else {
+        return Err(RuleErr::TypeTooLarge {
+            location: location.to_string(),
+            resource: resource.to_string(),
+            found: usize::MAX,
+            max,
+        });
+    };
+    if found > max {
+        return Err(RuleErr::TypeTooLarge {
+            location: location.to_string(),
+            resource: resource.to_string(),
+            found,
+            max,
+        });
+    }
+    Ok(found)
+}
+
+fn bounded_mul(
+    left: usize,
+    right: usize,
+    max: usize,
+    location: &str,
+    resource: &str,
+) -> Result<usize, RuleErr> {
+    let Some(found) = left.checked_mul(right) else {
+        return Err(RuleErr::TypeTooLarge {
+            location: location.to_string(),
+            resource: resource.to_string(),
+            found: usize::MAX,
+            max,
+        });
+    };
+    if found > max {
+        return Err(RuleErr::TypeTooLarge {
+            location: location.to_string(),
+            resource: resource.to_string(),
+            found,
+            max,
+        });
+    }
+    Ok(found)
+}
+
+const ABI_INPUT_BOUND: &str = "ABI input exceeds local resource bounds";
+
+fn abi_bound() -> alloy_dyn_abi::Error {
+    alloy_dyn_abi::Error::custom(ABI_INPUT_BOUND)
+}
+
+struct DecodeBudget {
+    nodes: usize,
+}
+
+impl DecodeBudget {
+    fn new(types: &[DynSolType]) -> alloy_dyn_abi::Result<Self> {
+        let mut nodes = 0usize;
+        for ty in types {
+            let stats = abi_stats(ty, "validated ABI input", 0).map_err(|_| abi_bound())?;
+            nodes = nodes.checked_add(stats.nodes).ok_or_else(abi_bound)?;
+        }
+        if nodes > MAX_ABI_DECODE_NODES {
+            return Err(abi_bound());
+        }
+        Ok(Self { nodes })
+    }
+
+    fn charge_array(&mut self, ty: &DynSolType, count: usize) -> alloy_dyn_abi::Result<()> {
+        let per_item = abi_stats(ty, "validated ABI array", 0)
+            .map_err(|_| abi_bound())?
+            .nodes;
+        let added = per_item.checked_mul(count).ok_or_else(abi_bound)?;
+        self.nodes = self.nodes.checked_add(added).ok_or_else(abi_bound)?;
+        if self.nodes > MAX_ABI_DECODE_NODES {
+            return Err(abi_bound());
+        }
+        Ok(())
+    }
+}
+
+fn preflight_abi_input(types: &[DynSolType], data: &[u8]) -> alloy_dyn_abi::Result<()> {
+    if data.len() > MAX_ABI_INPUT_BYTES || !data.len().is_multiple_of(32) {
+        return Err(abi_bound());
+    }
+    let mut budget = DecodeBudget::new(types)?;
+    preflight_sequence(types, data, 0, &mut budget)
+}
+
+fn preflight_sequence(
+    types: &[DynSolType],
+    data: &[u8],
+    base: usize,
+    budget: &mut DecodeBudget,
+) -> alloy_dyn_abi::Result<()> {
+    let mut head_words = 0usize;
+    for ty in types {
+        head_words = head_words
+            .checked_add(if abi_is_dynamic(ty) {
+                1
+            } else {
+                abi_min_words(ty)?
+            })
+            .ok_or_else(abi_bound)?;
+    }
+    require_region(data, base, words_to_bytes(head_words)?)?;
+
+    let mut cursor = base;
+    for ty in types {
+        if abi_is_dynamic(ty) {
+            let relative = read_abi_usize(data, cursor)?;
+            if relative % 32 != 0 {
+                return Err(abi_bound());
+            }
+            let target = base.checked_add(relative).ok_or_else(abi_bound)?;
+            if target > data.len() {
+                return Err(abi_bound());
+            }
+            preflight_value(ty, data, target, budget)?;
+            cursor = cursor.checked_add(32).ok_or_else(abi_bound)?;
+        } else {
+            preflight_value(ty, data, cursor, budget)?;
+            cursor = cursor
+                .checked_add(words_to_bytes(abi_min_words(ty)?)?)
+                .ok_or_else(abi_bound)?;
+        }
+    }
+    Ok(())
+}
+
+fn preflight_repeat(
+    ty: &DynSolType,
+    count: usize,
+    data: &[u8],
+    base: usize,
+    budget: &mut DecodeBudget,
+) -> alloy_dyn_abi::Result<()> {
+    let stride_words = if abi_is_dynamic(ty) {
+        1
+    } else {
+        abi_min_words(ty)?
+    };
+    let stride = words_to_bytes(stride_words)?;
+    require_region(data, base, stride.checked_mul(count).ok_or_else(abi_bound)?)?;
+    for at in 0..count {
+        let cursor = base
+            .checked_add(stride.checked_mul(at).ok_or_else(abi_bound)?)
+            .ok_or_else(abi_bound)?;
+        if abi_is_dynamic(ty) {
+            let relative = read_abi_usize(data, cursor)?;
+            if relative % 32 != 0 {
+                return Err(abi_bound());
+            }
+            let target = base.checked_add(relative).ok_or_else(abi_bound)?;
+            if target > data.len() {
+                return Err(abi_bound());
+            }
+            preflight_value(ty, data, target, budget)?;
+        } else {
+            preflight_value(ty, data, cursor, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn preflight_value(
+    ty: &DynSolType,
+    data: &[u8],
+    start: usize,
+    budget: &mut DecodeBudget,
+) -> alloy_dyn_abi::Result<()> {
+    match ty {
+        DynSolType::Bool
+        | DynSolType::Int(_)
+        | DynSolType::Uint(_)
+        | DynSolType::FixedBytes(_)
+        | DynSolType::Address
+        | DynSolType::Function => require_region(data, start, 32),
+        DynSolType::Bytes | DynSolType::String => {
+            let len = read_abi_usize(data, start)?;
+            if len > MAX_ABI_INPUT_BYTES {
+                return Err(abi_bound());
+            }
+            let body = start.checked_add(32).ok_or_else(abi_bound)?;
+            let padded = len.checked_add(31).ok_or_else(abi_bound)? / 32;
+            require_region(data, body, words_to_bytes(padded)?)
+        }
+        DynSolType::Array(inner) => {
+            let count = read_abi_usize(data, start)?;
+            budget.charge_array(inner, count)?;
+            let base = start.checked_add(32).ok_or_else(abi_bound)?;
+            preflight_repeat(inner, count, data, base, budget)
+        }
+        DynSolType::FixedArray(inner, count) => {
+            preflight_repeat(inner, *count, data, start, budget)
+        }
+        DynSolType::Tuple(items) | DynSolType::CustomStruct { tuple: items, .. } => {
+            preflight_sequence(items, data, start, budget)
+        }
+    }
+}
+
+fn abi_is_dynamic(ty: &DynSolType) -> bool {
+    match ty {
+        DynSolType::Bytes | DynSolType::String | DynSolType::Array(_) => true,
+        DynSolType::FixedArray(inner, _) => abi_is_dynamic(inner),
+        DynSolType::Tuple(items) | DynSolType::CustomStruct { tuple: items, .. } => {
+            items.iter().any(abi_is_dynamic)
+        }
+        _ => false,
+    }
+}
+
+fn abi_min_words(ty: &DynSolType) -> alloy_dyn_abi::Result<usize> {
+    abi_stats(ty, "validated ABI input", 0)
+        .map(|stats| stats.words)
+        .map_err(|_| abi_bound())
+}
+
+fn words_to_bytes(words: usize) -> alloy_dyn_abi::Result<usize> {
+    words.checked_mul(32).ok_or_else(abi_bound)
+}
+
+fn require_region(data: &[u8], start: usize, len: usize) -> alloy_dyn_abi::Result<()> {
+    let end = start.checked_add(len).ok_or_else(abi_bound)?;
+    if end > data.len() {
+        return Err(abi_bound());
+    }
+    Ok(())
+}
+
+fn read_abi_usize(data: &[u8], start: usize) -> alloy_dyn_abi::Result<usize> {
+    require_region(data, start, 32)?;
+    let word = &data[start..start + 32];
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return Err(abi_bound());
+    }
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&word[24..]);
+    usize::try_from(u64::from_be_bytes(low)).map_err(|_| abi_bound())
 }
 
 /// A bound on one declared argument. `rule` has no default, so an unbounded argument must be
@@ -265,8 +672,21 @@ impl FieldRule {
             },
             FieldRule::Struct => matches!(ty, DynSolType::CustomStruct { .. }),
             FieldRule::Batch => matches!(ty, DynSolType::Bytes),
-            FieldRule::Unbounded => true,
+            FieldRule::Unbounded => !carries_struct(ty),
         }
+    }
+}
+
+/// Whether `ty` reaches a declared struct, whose own fields carry their own rules. Only
+/// [`FieldRule::Struct`] makes [`FieldWalk`] recurse into one, so `unbounded` on such a field
+/// would leave every rule beneath it unwalked while reading as a single loose value: one word
+/// in a policy file silently exempting a whole object. That is a refusal to load.
+fn carries_struct(ty: &DynSolType) -> bool {
+    match ty {
+        DynSolType::CustomStruct { .. } => true,
+        DynSolType::Array(inner) | DynSolType::FixedArray(inner, _) => carries_struct(inner),
+        DynSolType::Tuple(items) => items.iter().any(carries_struct),
+        _ => false,
     }
 }
 
@@ -405,6 +825,13 @@ impl<'s> FieldWalk<'s> {
                 Ok(())
             }
             (FieldRule::Deadline { within_secs }, DynSolValue::Uint(deadline, _)) => {
+                if *deadline <= U256::from(self.now_secs) {
+                    return Err(FieldDenied::DeadlineExpired {
+                        path: self.path.clone(),
+                        deadline: *deadline,
+                        now_secs: self.now_secs,
+                    });
+                }
                 let horizon = U256::from(self.now_secs).saturating_add(U256::from(*within_secs));
                 if *deadline > horizon {
                     return Err(FieldDenied::DeadlineTooFar {
@@ -546,6 +973,7 @@ impl Site {
 /// constraint the argument's Solidity type can never satisfy. Checked once at load, for a policy
 /// file and an adapter manifest alike.
 pub fn check_call_rules(rules: &[CallRule]) -> Result<(), RuleErr> {
+    check_len("call rules", rules.len(), MAX_CALL_RULES)?;
     for (n, rule) in rules.iter().enumerate() {
         for other in &rules[n + 1..] {
             if other.signature.selector == rule.signature.selector {
@@ -564,6 +992,11 @@ pub fn check_call_rules(rules: &[CallRule]) -> Result<(), RuleErr> {
 fn check_one_call_rule(rule: &CallRule) -> Result<(), RuleErr> {
     let signature = rule.signature.canonical.clone();
     let arity = rule.signature.function.inputs.len();
+    check_len(
+        &format!("{signature} arguments"),
+        rule.arg.len(),
+        MAX_ARGUMENTS,
+    )?;
     let mut names: Vec<&str> = Vec::with_capacity(rule.arg.len());
     for (n, arg) in rule.arg.iter().enumerate() {
         if arg.at >= arity {
@@ -573,6 +1006,7 @@ fn check_one_call_rule(rule: &CallRule) -> Result<(), RuleErr> {
                 arity,
             });
         }
+        check_field_rule(&arg.rule, &format!("{signature} argument {}", arg.at), 0)?;
         if rule.arg[n + 1..].iter().any(|other| other.at == arg.at) {
             return Err(RuleErr::ArgDuplicated {
                 signature,
@@ -583,6 +1017,12 @@ fn check_one_call_rule(rule: &CallRule) -> Result<(), RuleErr> {
             return Err(RuleErr::ArgNameEmpty {
                 signature,
                 at: arg.at,
+            });
+        }
+        if !is_valid_string_name(&arg.name) {
+            return Err(RuleErr::ApprovalIdentifier {
+                location: format!("{signature} argument {}", arg.at),
+                value: arg.name.clone(),
             });
         }
         if names.contains(&arg.name.as_str()) {
@@ -612,6 +1052,82 @@ fn check_one_call_rule(rule: &CallRule) -> Result<(), RuleErr> {
             (false, true) => return Err(RuleErr::BatchRuleMisplaced { signature, at }),
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn check_len(location: &str, found: usize, max: usize) -> Result<(), RuleErr> {
+    if found > max {
+        return Err(RuleErr::TooManyEntries {
+            location: location.to_string(),
+            found,
+            max,
+        });
+    }
+    Ok(())
+}
+
+fn duplicate<T: PartialEq + ToString>(values: &[T]) -> Option<String> {
+    for (at, value) in values.iter().enumerate() {
+        if values[at + 1..].contains(value) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Validate the shape of one recursive field constraint before either `applies` or a request
+/// walk recurses through it.
+fn check_field_rule(rule: &FieldRule, location: &str, depth: usize) -> Result<(), RuleErr> {
+    if depth > MAX_FIELD_RULE_DEPTH {
+        return Err(RuleErr::FieldRuleTooDeep {
+            location: location.to_string(),
+            max: MAX_FIELD_RULE_DEPTH,
+        });
+    }
+    match rule {
+        FieldRule::OneOf { addresses } => {
+            if addresses.is_empty() {
+                return Err(RuleErr::EmptyRuleChoice {
+                    location: location.to_string(),
+                });
+            }
+            check_len(location, addresses.len(), MAX_RULE_CHOICES)?;
+            if let Some(value) = duplicate(addresses) {
+                return Err(RuleErr::DuplicateRuleChoice {
+                    location: location.to_string(),
+                    value,
+                });
+            }
+        }
+        FieldRule::Enum { one_of } => {
+            if one_of.is_empty() {
+                return Err(RuleErr::EmptyRuleChoice {
+                    location: location.to_string(),
+                });
+            }
+            check_len(location, one_of.len(), MAX_RULE_CHOICES)?;
+            if let Some(value) = duplicate(one_of) {
+                return Err(RuleErr::DuplicateRuleChoice {
+                    location: location.to_string(),
+                    value,
+                });
+            }
+        }
+        FieldRule::Deadline { within_secs: 0 } => {
+            return Err(RuleErr::EmptyDeadlineWindow {
+                location: location.to_string(),
+            })
+        }
+        FieldRule::Each { of, .. } => check_field_rule(of, location, depth + 1)?,
+        FieldRule::Max { .. }
+        | FieldRule::Eq { .. }
+        | FieldRule::BoolEq { .. }
+        | FieldRule::BytesEq { .. }
+        | FieldRule::Deadline { .. }
+        | FieldRule::Struct
+        | FieldRule::Batch
+        | FieldRule::Unbounded => {}
     }
     Ok(())
 }
@@ -698,7 +1214,68 @@ impl TypedDataSchema {
     /// a repeated type name, a primary type nothing declares, a type graph that will not resolve
     /// (a missing type or a cycle), or a field rule its declared Solidity type can never satisfy.
     pub fn check(&self) -> Result<(), RuleErr> {
+        if !is_valid_string_name(&self.schema) {
+            return Err(RuleErr::ApprovalIdentifier {
+                location: "typed_data.schema".to_string(),
+                value: self.schema.clone(),
+            });
+        }
+        for (location, value) in [
+            ("typed_data.domain.name", self.domain.name.as_deref()),
+            ("typed_data.domain.version", self.domain.version.as_deref()),
+        ] {
+            if let Some(value) = value {
+                let safe = !value.is_empty()
+                    && value.chars().count() <= hc_core::MAX_NAME_BYTES
+                    && value.chars().all(|c| c.is_ascii_graphic() || c == ' ');
+                if !safe {
+                    return Err(RuleErr::ApprovalText {
+                        location: location.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+            }
+        }
+        check_len(
+            &format!("{}.types", self.schema),
+            self.types.len(),
+            MAX_SCHEMA_TYPES,
+        )?;
         for (n, declared) in self.types.iter().enumerate() {
+            if !is_valid_string_name(&declared.name) {
+                return Err(RuleErr::ApprovalIdentifier {
+                    location: format!("{}.types[{n}]", self.schema),
+                    value: declared.name.clone(),
+                });
+            }
+            check_len(
+                &format!("{}.{}.fields", self.schema, declared.name),
+                declared.field.len(),
+                MAX_FIELDS_PER_TYPE,
+            )?;
+            for (field_at, field) in declared.field.iter().enumerate() {
+                if !is_valid_string_name(&field.name) {
+                    return Err(RuleErr::ApprovalIdentifier {
+                        location: format!("{}.{}.field[{field_at}]", self.schema, declared.name),
+                        value: field.name.clone(),
+                    });
+                }
+                if declared.field[field_at + 1..]
+                    .iter()
+                    .any(|other| other.name == field.name)
+                {
+                    return Err(RuleErr::DuplicateField {
+                        schema: self.schema.clone(),
+                        type_name: declared.name.clone(),
+                        name: field.name.clone(),
+                    });
+                }
+                check_field_rule(
+                    &field.rule,
+                    &format!("{}.{}.{}", self.schema, declared.name, field.name),
+                    0,
+                )?;
+            }
             if self.types[n + 1..].iter().any(|o| o.name == declared.name) {
                 return Err(RuleErr::DuplicateType {
                     schema: self.schema.clone(),
@@ -761,6 +1338,7 @@ pub(crate) fn unbounded_call(text: &str) -> CallRule {
 /// Refuse a policy that declares two schemas under one name: a request names a schema by that
 /// string, so a duplicate is a rule set the daemon would pick from arbitrarily.
 pub fn check_schemas(schemas: &[TypedDataSchema]) -> Result<(), RuleErr> {
+    check_len("typed_data schemas", schemas.len(), MAX_SCHEMAS)?;
     for (n, schema) in schemas.iter().enumerate() {
         if schemas[n + 1..].iter().any(|o| o.schema == schema.schema) {
             return Err(RuleErr::DuplicateSchema {
@@ -785,6 +1363,105 @@ mod tests {
             signature: signature(text),
             arg: args,
         }
+    }
+
+    #[test]
+    fn typed_struct_field_names_must_be_unique() {
+        let schema = TypedDataSchema {
+            schema: "mail".to_string(),
+            primary_type: "Mail".to_string(),
+            domain: DomainDecl {
+                chain_id: U256::from(1u64),
+                verifying_contract: Address::from([0x11u8; 20]),
+                name: None,
+                version: None,
+                salt: None,
+            },
+            types: vec![TypeDecl {
+                name: "Mail".to_string(),
+                field: vec![
+                    FieldDecl {
+                        name: "amount".to_string(),
+                        ty: "uint256".to_string(),
+                        rule: FieldRule::Unbounded,
+                    },
+                    FieldDecl {
+                        name: "amount".to_string(),
+                        ty: "uint256".to_string(),
+                        rule: FieldRule::Eq {
+                            eq: U256::from(1u64),
+                        },
+                    },
+                ],
+            }],
+        };
+        assert!(matches!(
+            schema.check(),
+            Err(RuleErr::DuplicateField {
+                type_name,
+                name,
+                ..
+            }) if type_name == "Mail" && name == "amount"
+        ));
+    }
+
+    /// `unbounded` is a declaration about ONE value, and [`FieldWalk`] only descends into a
+    /// struct under `struct`. Written on a struct-typed field it would therefore switch off every
+    /// rule that struct's own fields carry while reading as a single loose value — so it is a
+    /// refusal to load, naming the field and the type, whether the struct is the field's type,
+    /// an element of its array, or a member of its tuple.
+    #[test]
+    fn unbounded_on_a_struct_typed_field_refuses_to_load() {
+        let schema = |ty: &str, rule: FieldRule| TypedDataSchema {
+            schema: "mail".to_string(),
+            primary_type: "Mail".to_string(),
+            domain: DomainDecl {
+                chain_id: U256::from(1u64),
+                verifying_contract: Address::from([0x11u8; 20]),
+                name: None,
+                version: None,
+                salt: None,
+            },
+            types: vec![
+                TypeDecl {
+                    name: "Mail".to_string(),
+                    field: vec![FieldDecl {
+                        name: "person".to_string(),
+                        ty: ty.to_string(),
+                        rule,
+                    }],
+                },
+                TypeDecl {
+                    name: "Person".to_string(),
+                    field: vec![FieldDecl {
+                        name: "wallet".to_string(),
+                        ty: "address".to_string(),
+                        rule: FieldRule::OneOf { addresses: vec![A] },
+                    }],
+                },
+            ],
+        };
+
+        for ty in ["Person", "Person[]", "Person[2]"] {
+            assert!(
+                matches!(
+                    schema(ty, FieldRule::Unbounded).check(),
+                    Err(RuleErr::SchemaFieldTypeMismatch { path, declared, rule: FieldRuleKind::Unbounded, .. })
+                        if path == "Mail.person" && declared == ty
+                ),
+                "unbounded must not blanket a {ty} field"
+            );
+        }
+        assert!(schema("Person", FieldRule::Struct).check().is_ok());
+        assert!(schema("bytes32", FieldRule::Unbounded).check().is_ok());
+
+        assert!(matches!(
+            check_call_rules(&[call_rule(
+                "f((address,uint256))",
+                vec![arg(0, "pair", FieldRule::Unbounded)],
+            )]),
+            Ok(())
+        ));
     }
 
     fn arg(at: usize, name: &str, rule: FieldRule) -> ArgRule {
@@ -873,6 +1550,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn abi_policy_types_are_bounded_before_decode() {
+        assert!(signature("f(uint256[2048])").inputs.len() == 1);
+        assert!(matches!(
+            Signature::try_from("f(uint256[2049])".to_string()),
+            Err(RuleErr::TypeTooLarge { .. })
+        ));
+
+        let too_deep = format!("f(uint256{})", "[]".repeat(MAX_ABI_TYPE_DEPTH + 1));
+        assert!(matches!(
+            Signature::try_from(too_deep),
+            Err(RuleErr::TypeTooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn hostile_dynamic_array_length_is_refused_without_panicking() {
+        let signature = signature("f(uint256[2][])");
+        let mut hostile = vec![0u8; 64];
+        hostile[31] = 32;
+        hostile[32..].fill(0xff);
+        let result = std::panic::catch_unwind(|| signature.decode_input(&hostile));
+        assert!(matches!(result, Ok(Err(_))));
+
+        let mut valid = vec![0u8; 128];
+        valid[31] = 32;
+        valid[63] = 1;
+        valid[95] = 7;
+        valid[127] = 9;
+        assert!(signature.decode_input(&valid).is_ok());
+    }
+
     /// Two different signatures can be ground to share a 4-byte selector, and a payload matching
     /// both would leave the decoder to pick a shape. Both at one destination is a refusal to
     /// load, not a coin flip at request time.
@@ -881,6 +1590,7 @@ mod tests {
         let one = signature("transfer(address,uint256)");
         let other = Signature {
             function: one.function.clone(),
+            inputs: one.inputs.clone(),
             selector: one.selector,
             canonical: "gasprice_bit_ether(int128)".to_string(),
         };
@@ -1053,6 +1763,10 @@ mod tests {
         ));
 
         let deadline = FieldRule::Deadline { within_secs: 1_800 };
+        assert!(matches!(
+            walk.field("d", &deadline, &DynSolValue::Uint(U256::from(now), 256)),
+            Err(FieldDenied::DeadlineExpired { .. })
+        ));
         assert!(walk
             .field(
                 "d",

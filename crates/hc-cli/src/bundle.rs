@@ -10,6 +10,7 @@ use alloy_primitives::B256;
 use clap::{ArgGroup, Subcommand};
 use hc_bundle::sync::{self, Report, SyncMode};
 use hc_bundle::Scope;
+use hc_sign::bundle::Quorum;
 use hc_sign::grant::IntentKind;
 use hc_sign::intent::Intent;
 use std::path::PathBuf;
@@ -109,7 +110,8 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
     };
     match cmd {
         BundleCmd::New { file } => {
-            let intent = match serde_json::from_slice(&read_input(file.as_deref())?)? {
+            let intent = match hc_core::wire::strict_json_from_slice(&read_input(file.as_deref())?)?
+            {
                 Intent::SafeTx(intent) => intent,
                 Intent::TypedData(_) => {
                     return Err(CliErr::NotBundleable {
@@ -146,7 +148,7 @@ pub fn run(cmd: BundleCmd, no_sync: bool, unlock: Option<UnlockMethod>) -> Resul
             file,
             stdin: _,
         } => {
-            let response = serde_json::from_slice(&read_input(file.as_deref())?)?;
+            let response = hc_core::wire::strict_json_from_slice(&read_input(file.as_deref())?)?;
             hc_bundle::collect(mode, hash, response)?;
             Ok(())
         }
@@ -206,29 +208,34 @@ fn report(direction: &str, report: &Report) {
     }
 }
 
+/// The threshold the peer-written file claims, whenever it is not the one `safes.toml` states.
+/// Quorum is counted from the local number alone; the claim is reported and never counted.
+fn warn_stated_threshold(hash: B256, quorum: &Quorum) {
+    let Some(stated) = quorum.stated else {
+        return;
+    };
+    tracing::warn!(
+        %hash,
+        safes_toml = quorum.threshold,
+        bundle_file = stated,
+        "THRESHOLD MISMATCH: the bundle file states a threshold safes.toml does not"
+    );
+}
+
 fn status(mode: SyncMode, hash: B256) -> Result<(), CliErr> {
     let s = hc_bundle::status(mode, hash)?;
     tracing::info!(
         %hash,
-        have = s.bundle.signatures.len(),
-        threshold = s.bundle.threshold,
-        met = s.bundle.met(),
+        have = s.quorum.have,
+        threshold = s.quorum.threshold,
+        met = s.quorum.met,
         packed_bytes = s.bundle.packed().len(),
         age_hours = s.age_ms / HOUR_MS,
         "bundle"
     );
-    if s.safes_threshold != s.bundle.threshold {
-        tracing::warn!(
-            bundle = s.bundle.threshold,
-            safes_toml = s.safes_threshold,
-            "THRESHOLD CHANGED since this bundle was created"
-        );
-    }
+    warn_stated_threshold(hash, &s.quorum);
     for sig in &s.bundle.signatures {
-        tracing::info!(signer = %sig.signer, owner = !s.not_owners.contains(&sig.signer), "  signed");
-    }
-    for signer in &s.not_owners {
-        tracing::warn!(%signer, "NOT AN OWNER in safes.toml — the assembled blob reverts");
+        tracing::info!(signer = %sig.signer, "  signed");
     }
     for owner in &s.missing {
         tracing::info!(%owner, "  missing");
@@ -258,12 +265,13 @@ fn list(mode: SyncMode) -> Result<(), CliErr> {
         for one in bundles {
             tracing::info!(
                 hash = %one.hash,
-                have = one.bundle.signatures.len(),
-                threshold = one.bundle.threshold,
-                met = one.bundle.met(),
+                have = one.quorum.have,
+                threshold = one.quorum.threshold,
+                met = one.quorum.met,
                 age_hours = now.saturating_sub(one.bundle.created_at_ms) / HOUR_MS,
                 "  bundle"
             );
+            warn_stated_threshold(one.hash, &one.quorum);
         }
     }
     Ok(())
@@ -272,7 +280,7 @@ fn list(mode: SyncMode) -> Result<(), CliErr> {
 fn merge(mode: SyncMode, hash: B256, file: Option<PathBuf>) -> Result<(), CliErr> {
     let incoming = match file {
         Some(path) => hc_bundle::read_bundle(&path, hash)?,
-        None => serde_json::from_slice(&read_input(None)?)?,
+        None => hc_core::wire::strict_json_from_slice(&read_input(None)?)?,
     };
     let merged = hc_bundle::merge(mode, hash, incoming)?;
     for signer in &merged.added {
@@ -280,11 +288,12 @@ fn merge(mode: SyncMode, hash: B256, file: Option<PathBuf>) -> Result<(), CliErr
     }
     tracing::info!(
         %hash,
-        have = merged.union.signatures.len(),
-        threshold = merged.union.threshold,
-        met = merged.union.met(),
+        have = merged.quorum.have,
+        threshold = merged.quorum.threshold,
+        met = merged.quorum.met,
         "merged"
     );
+    warn_stated_threshold(hash, &merged.quorum);
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 import CryptoKit
+import Dispatch
 import Foundation
 import LocalAuthentication
 import Security
@@ -12,6 +13,53 @@ private let HC_ERR_ECDH: Int32 = -5
 private let HC_ERR_SIGN: Int32 = -6
 private let HC_ERR_BUFFER_TOO_SMALL: Int32 = -10
 
+/// Evaluate one biometric policy synchronously and return a +1 retained context for the Rust
+/// request thread to reuse across the immediately following enclave operations.
+///
+/// `reuseSeconds` sets `touchIDAuthenticationAllowableReuseDuration`: a Touch ID match made
+/// within that many seconds satisfies this evaluation without a fresh sheet, and covers the
+/// enclave operations this context then authorises. 0 is the platform default and means no
+/// reuse; any larger value opts in, including to reuse of a match this process did not ask for.
+@_cdecl("hc_la_evaluate")
+public func hc_la_evaluate(
+    _ reason: UnsafePointer<CChar>?,
+    _ reuseSeconds: Double
+) -> UnsafeMutableRawPointer? {
+    guard
+        let reason = reason,
+        let text = String(validatingCString: reason),
+        !text.isEmpty,
+        reuseSeconds >= 0
+    else {
+        return nil
+    }
+    let context = LAContext()
+    context.touchIDAuthenticationAllowableReuseDuration = reuseSeconds
+    let semaphore = DispatchSemaphore(value: 0)
+    var accepted = false
+    context.evaluatePolicy(
+        .deviceOwnerAuthenticationWithBiometrics,
+        localizedReason: text
+    ) { success, _ in
+        accepted = success
+        semaphore.signal()
+    }
+    semaphore.wait()
+    guard accepted else {
+        return nil
+    }
+    return Unmanaged.passRetained(context).toOpaque()
+}
+
+/// Balance the +1 retain returned by `hc_la_evaluate`.
+@_cdecl("hc_la_release")
+public func hc_la_release(_ context: UnsafeMutableRawPointer?) {
+    guard let context = context else {
+        return
+    }
+    Unmanaged<LAContext>.fromOpaque(context).release()
+}
+
 private func writeOut(
     _ data: Data,
     _ out: UnsafeMutablePointer<UInt8>,
@@ -24,6 +72,30 @@ private func writeOut(
     data.copyBytes(to: out, count: data.count)
     outLen.pointee = data.count
     return HC_OK
+}
+
+/// Copy a CryptoKit shared secret straight into Rust's zeroizing output buffer. Materialising an
+/// intermediate `Data` would leave a second heap copy whose allocator has no zero-on-free
+/// contract.
+private func writeSecretOut(
+    _ secret: SharedSecret,
+    _ out: UnsafeMutablePointer<UInt8>,
+    _ cap: Int,
+    _ outLen: UnsafeMutablePointer<Int>
+) -> Int32 {
+    return secret.withUnsafeBytes { raw in
+        guard raw.count <= cap else {
+            return HC_ERR_BUFFER_TOO_SMALL
+        }
+        guard raw.count == 0 || raw.baseAddress != nil else {
+            return HC_ERR_ECDH
+        }
+        if let base = raw.baseAddress, raw.count > 0 {
+            out.update(from: base.assumingMemoryBound(to: UInt8.self), count: raw.count)
+        }
+        outLen.pointee = raw.count
+        return HC_OK
+    }
 }
 
 private func loadKey(
@@ -162,8 +234,7 @@ public func hc_se_ecdh(
 
     do {
         let secret = try key.sharedSecretFromKeyAgreement(with: peerKey)
-        let raw = secret.withUnsafeBytes { Data($0) }
-        return writeOut(raw, out, cap, outLen)
+        return writeSecretOut(secret, out, cap, outLen)
     } catch {
         return HC_ERR_ECDH
     }
