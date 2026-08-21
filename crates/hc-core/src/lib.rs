@@ -95,7 +95,11 @@ pub fn read_regular_file_bounded(path: &Path, max: u64) -> std::io::Result<Vec<u
     read_bounded(open_regular_file(path)?, max)
 }
 
-/// Whether a file is regular, owned by the effective uid, and closed to group and other.
+/// Whether a file is regular, owned by the effective uid, and closed to group and other. This is
+/// the bar for a file whose CONTENTS are a secret, where a stray read bit is already the leak and
+/// there is nothing to salvage by tightening it afterwards. A file that merely has to be
+/// unwritable by other accounts — a config, a lock, a log — is checked for its owner and then
+/// tightened in place instead, so a mode nothing compromised cannot wedge an install.
 pub fn is_owner_only_regular(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

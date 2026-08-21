@@ -286,6 +286,14 @@ pub struct LabelAnnotation {
     pub name: String,
 }
 
+/// What sits at a config path that is not the regular file hot_cheese will read.
+#[derive(Debug)]
+pub enum ConfigFileKind {
+    Symlink,
+    Directory,
+    Other,
+}
+
 /// Why operator-authored annotation text may not reach an approval sheet.
 #[derive(Debug)]
 pub enum TextRefusal {
@@ -328,7 +336,8 @@ create_err_with_impls!(
     ;
     ConfigLocked { path: PathBuf },
     UnsafeConfigLock { path: PathBuf },
-    UnsafeConfigFile { path: PathBuf, mode: u32 },
+    ReplaceConfigWithARegularFile { path: PathBuf, found: ConfigFileKind },
+    ChownConfigToYourUser { path: PathBuf, owner: u32, ours: u32 },
     AnnotationTextRefused {
         address: Address,
         text: String,
@@ -420,16 +429,45 @@ impl ConfigWriteLock {
     }
 }
 
-/// Read a config at the same regular-file, owner-only, mode-0600 bar as key material: a daemon
-/// re-reads it, it pins the grant key authorizing every signature, and it names the backup remotes.
+/// Read a config only this account can rewrite: it pins the grant key every signature is verified
+/// against and names the backup remotes, and a running daemon re-reads it every cycle. The config
+/// holds no secret, so a mode open to other accounts is tightened to 0600 before the bytes are
+/// taken rather than refused, the same way [`ConfigWriteLock::take_at`] and
+/// [`crate::crypto::envelope::enforce_store_modes`] treat a loose mode they find. A path this
+/// account cannot own the contents of is what stays a refusal.
 fn owner_only_config_bytes(path: &Path) -> Result<Vec<u8>, ConfigErr> {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if !kind.is_file() {
+        return Err(ConfigErr::ReplaceConfigWithARegularFile {
+            path: path.to_path_buf(),
+            found: if kind.is_symlink() {
+                ConfigFileKind::Symlink
+            } else if kind.is_dir() {
+                ConfigFileKind::Directory
+            } else {
+                ConfigFileKind::Other
+            },
+        });
+    }
     let file = crate::open_regular_file(path)?;
     let metadata = file.metadata()?;
-    if !crate::is_owner_only_regular(&metadata) {
-        return Err(ConfigErr::UnsafeConfigFile {
+    // SAFETY: `geteuid` has no preconditions and changes no process state.
+    let ours = unsafe { libc::geteuid() };
+    if metadata.uid() != ours {
+        return Err(ConfigErr::ChownConfigToYourUser {
             path: path.to_path_buf(),
-            mode: metadata.mode(),
+            owner: metadata.uid(),
+            ours,
         });
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tracing::warn!(
+            path = %path.display(),
+            was = %format!("{mode:04o}"),
+            "config.toml was open to other accounts; tightened to 0600 before reading it"
+        );
     }
     Ok(crate::read_bounded(file, MAX_CONFIG_BYTES)?)
 }
@@ -1072,10 +1110,12 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// A running daemon re-reads `config.toml` and obeys the grant key it pins and the remotes it
-    /// names, so a config another account can rewrite, or reach through a symlink, must not load.
+    /// A daemon re-reads `config.toml` and obeys the grant key it pins, so a mode another account
+    /// can rewrite is closed before the bytes are taken instead of refused — refusing wedges every
+    /// command over a file that holds no secret — while a path whose contents this account cannot
+    /// own stays a refusal that names what to do about it.
     #[test]
-    fn a_config_another_account_can_rewrite_does_not_load() {
+    fn a_config_open_to_other_accounts_is_tightened_rather_than_wedging_every_command() {
         let dir = std::env::temp_dir().join(format!(
             "hot-cheese-config-mode-test-{}-{}",
             std::process::id(),
@@ -1091,19 +1131,42 @@ mod tests {
             owner_only_config_bytes(&path).expect("an owner-only config loads"),
             HEAD.as_bytes()
         );
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat it").mode() & 0o7777,
+            0o600
+        );
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664))
-            .expect("loosen the mode");
-        assert!(matches!(
-            owner_only_config_bytes(&path),
-            Err(ConfigErr::UnsafeConfigFile { mode, .. }) if mode & 0o077 == 0o064
-        ));
+        for loose in [0o644, 0o664, 0o606] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(loose))
+                .expect("loosen the mode");
+            assert_eq!(
+                owner_only_config_bytes(&path).expect("a loose config still loads"),
+                HEAD.as_bytes()
+            );
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat it").mode() & 0o7777,
+                0o600,
+                "{loose:o} reached the read"
+            );
+        }
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("restore the mode");
         let link = dir.join("link.toml");
         std::os::unix::fs::symlink(&path, &link).expect("make a final-component symlink");
-        assert!(owner_only_config_bytes(&link).is_err());
+        assert!(matches!(
+            owner_only_config_bytes(&link),
+            Err(ConfigErr::ReplaceConfigWithARegularFile {
+                found: ConfigFileKind::Symlink,
+                ..
+            })
+        ));
+
+        // SAFETY: `geteuid` has no preconditions and changes no process state.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(matches!(
+                owner_only_config_bytes(Path::new("/etc/hosts")),
+                Err(ConfigErr::ChownConfigToYourUser { owner: 0, .. })
+            ));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

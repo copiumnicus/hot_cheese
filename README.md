@@ -632,6 +632,26 @@ Config lives at **`$HOT_CHEESE_HOME/config.toml`**, defaulting to
 need to edit it to change the port or add backup remotes. A legacy
 `config.json` is migrated to `config.toml` automatically on first load.
 
+**This file is read only when it is a regular file owned by your account**, because a running
+daemon re-reads it every cycle and obeys what it finds: `grant_public_key` is the pin every
+signature is verified against and `backup_remotes` is where the store gets pushed. It holds no
+secret, so its *mode* is not a refusal — hot_cheese **tightens** a config left readable or
+writable by group or other to `0600` before it reads the bytes, and says so. You see the line
+once, because the next read finds it already closed:
+
+```
+WARN hc_core::config: config.toml was open to other accounts; tightened to 0600 before reading it path=/Users/you/.config/hot_cheese/config.toml was=0644
+```
+
+That is the normal outcome for a config an editor wrote back at your umask, or one written by a
+build older than this one, and nothing else changes: the command carries on. Two cases a `chmod`
+cannot honestly fix are still refusals, and each names the fix:
+
+| Refusal | Means | Fix |
+| --- | --- | --- |
+| `ChownConfigToYourUser { path, owner, ours }` | Another account owns the file, so it can rewrite the grant-key pin and the backup remotes behind you. Tightening someone else's file would not change that. | `sudo chown $(id -un) <path>` — the mode is then hot_cheese's problem, not yours. |
+| `ReplaceConfigWithARegularFile { path, found }` | The path is a `Symlink`, a `Directory`, or something stranger. A final symlink is never followed to a config. | Put the real file at that path. A dotfiles symlink cannot survive here anyway: `enroll grant`, `bundle peer add` and friends rewrite `config.toml` by atomic rename, which replaces the link with a regular file. |
+
 ```toml
 service = "com.cc.hot_cheese"
 account = "hot_cheese_master"
@@ -2343,7 +2363,15 @@ is that the daemon run in your active GUI login session so Touch ID can prompt.
 **How do I change the store directory, port, or cert?**
 Edit `~/.config/hot_cheese/config.toml` (`store`, `port`, `backup_remotes`); no
 rebuild needed. For the cert, re-run `init --import-cert/--import-key`, or
-regenerate and re-pin clients to the new fingerprint.
+regenerate and re-pin clients to the new fingerprint. Saving it at your umask is fine:
+the next command tightens it back to `0600` and carries on.
+
+**Every command fails with `Config(ChownConfigToYourUser …)` or
+`Config(ReplaceConfigWithARegularFile …)` — and `init` says `AlreadyInitialized`.**
+`init` is right to refuse: your install exists, only its `config.toml` is unreadable. Neither
+refusal is about the mode (a loose mode is tightened, not refused). Fix the path the refusal
+names — `chown` it back to yourself, or replace a symlink/directory with the real file — and the
+same command works. See [Configuration](#configuration).
 
 **Can I import an existing key?**
 Yes — `hot_cheese add <name> <ethereum|solana|bytes>` reads the secret from a

@@ -152,11 +152,12 @@ mod tests {
             "the operator's log still gets the whole thing"
         );
 
-        let unsafe_config = McpErr::Config(hc_core::config::ConfigErr::UnsafeConfigFile {
+        let unsafe_config = McpErr::Config(hc_core::config::ConfigErr::ChownConfigToYourUser {
             path: std::path::PathBuf::from("/Users/someone/.config/hot_cheese/config.toml"),
-            mode: 0o644,
+            owner: 0,
+            ours: 501,
         });
-        assert_eq!(unsafe_config.refusal(), "Config::UnsafeConfigFile");
+        assert_eq!(unsafe_config.refusal(), "Config::ChownConfigToYourUser");
 
         let anchored = McpErr::NonceOutsideWindow {
             nonce: U256::from(9_001u64),

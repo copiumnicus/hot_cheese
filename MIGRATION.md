@@ -14,6 +14,18 @@ backup.
 
 ## Cutover blockers — read first
 
+- **Your existing `config.toml` is tightened on first run, not refused.** This build reads
+  `config.toml` only as a regular file **your account owns**, because a running daemon re-reads
+  it and obeys the `grant_public_key` pin and the `backup_remotes` it finds. An older install's
+  config is routinely `0644` — an editor writes it back at your umask — and that is **not** a
+  refusal: it is chmodded to `0600` before the bytes are read, one `WARN` line says so, and the
+  command carries on. It stays a refusal only where a chmod would be a lie, and each one names
+  the fix: `ChownConfigToYourUser { path, owner, ours }` (another account owns the file:
+  `sudo chown $(id -un) <path>`) and `ReplaceConfigWithARegularFile { path, found }` (a symlink,
+  a directory, or stranger: put the real file there). If you are on a build that refused a
+  `0644` config outright — every command failing with `UnsafeConfigFile { path, mode: 33188 }`
+  while `init` correctly answered `AlreadyInitialized` — upgrading is the whole fix; your key
+  material was never the thing at fault.
 - **§1 — `serve` (and every SE op) must run in your active GUI login session.** Touch ID
   cannot fire under pure `ssh` / `sudo` / a background launchd daemon. No code signing,
   Team ID, entitlements, or Apple Developer Program is required.
