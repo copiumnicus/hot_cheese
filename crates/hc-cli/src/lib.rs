@@ -38,7 +38,7 @@ use hc_daemon::git_store::{self, GitStore};
 use hc_daemon::renderer::Headless;
 use hc_daemon::runtime::UnlockGate;
 use hc_daemon::{flock, HotApi, OpContext, Operation};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -581,15 +581,53 @@ fn cmd_se_selftest() -> Result<(), CliErr> {
 /// default: the Secure Enclave key when any SE enrollment exists, else a passphrase prompt.
 /// `--unlock passphrase` is the escape hatch when this machine's SE key is lost or
 /// invalidated — the same DEK is still wrapped under the recovery enrollment.
+///
+/// The two KEKs prove themselves at different moments, deliberately. A passphrase is proven
+/// HERE, against the keyring, because the prompt it was typed into is otherwise an "accepted"
+/// the code never checked. The Secure Enclave is proven when it is used: its proof is a Touch ID
+/// sheet the operator watches happen, and spending one per session — on top of the one the
+/// operation itself raises — trains the operator to approve sheets without reading them.
 fn make_unlocker(
     keyring: &Keyring,
     method: Option<UnlockMethod>,
 ) -> Result<Box<dyn Unlocker>, CliErr> {
     match resolve_unlock_method(keyring, method) {
         UnlockMethod::Se => Ok(Box::new(SecureEnclaveUnlocker::new(SE_LABEL))),
-        UnlockMethod::Passphrase => {
-            let pass = prompt_passphrase("Recovery passphrase: ")?;
-            Ok(Box::new(PassphraseUnlocker::from_secret(pass)))
+        UnlockMethod::Passphrase => Ok(Box::new(verified_passphrase(
+            keyring,
+            std::io::stdin().is_terminal(),
+            || prompt_passphrase("Recovery passphrase: "),
+        )?)),
+    }
+}
+
+/// Take entries from `ask` until one unwraps the DEK this keyring holds, and hand back the
+/// unlocker built from that entry. The DEK unwrapped here is dropped (zeroized) immediately:
+/// this proves the passphrase and releases nothing. `reprompt` is for a human who can type the
+/// next one; without one, the first refusal is the command's answer. The new-passphrase rules are
+/// deliberately NOT applied — an enrollment older than those rules has to keep opening.
+fn verified_passphrase(
+    keyring: &Keyring,
+    reprompt: bool,
+    mut ask: impl FnMut() -> Result<Zeroizing<String>, PassphraseErr>,
+) -> Result<PassphraseUnlocker, CliErr> {
+    let mut out = std::io::stderr();
+    loop {
+        let entered = ask()?;
+        if entered.is_empty() {
+            return Err(PassphraseErr::Empty.into());
+        }
+        let unlocker = PassphraseUnlocker::from_secret(entered);
+        match unlocker.unlock("verify the recovery passphrase", keyring, None) {
+            Ok(_) => return Ok(unlocker),
+            Err(UnlockErr::WrongPassphrase) if reprompt => {
+                writeln!(
+                    out,
+                    "that passphrase unwraps no enrollment in this keyring; enter it again"
+                )?;
+                out.flush()?;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -2611,6 +2649,75 @@ mod tests {
             "a discard that does not name which enclave key is not a discard"
         );
         assert!(Cli::try_parse_from(["hot_cheese", "discard-enclave-key", "TREASURY"]).is_err());
+    }
+
+    /// A keyring holding one recovery enrollment for `passphrase`, wrapping a DEK the caller
+    /// can compare against.
+    fn enrolled(passphrase: &str) -> (Keyring, Dek) {
+        let dek = Dek::random();
+        let mut keyring = Keyring::new();
+        keyring.add(
+            PassphraseUnlocker::new(passphrase.to_string())
+                .enroll("recovery", &dek)
+                .expect("fixture enrollment"),
+        );
+        (keyring, dek)
+    }
+
+    /// The session must be refused at the prompt the passphrase was typed into. Accepting there
+    /// and failing at the first operation tells the operator their passphrase was right.
+    #[test]
+    fn a_wrong_recovery_passphrase_is_refused_where_it_is_typed() {
+        let (keyring, dek) = enrolled("correct horse battery staple");
+        let mut asked = 0usize;
+        let refused = verified_passphrase(&keyring, false, || {
+            asked += 1;
+            Ok(Zeroizing::new("wrong horse battery staple".to_string()))
+        });
+        assert!(matches!(
+            refused,
+            Err(CliErr::Unlock(UnlockErr::WrongPassphrase))
+        ));
+        assert_eq!(asked, 1);
+
+        let opened = verified_passphrase(&keyring, false, || {
+            Ok(Zeroizing::new("correct horse battery staple".to_string()))
+        })
+        .expect("the enrolled passphrase opens the session");
+        assert_eq!(
+            opened
+                .unlock("t", &keyring, None)
+                .expect("the session unlocker unwraps the DEK")
+                .expose(),
+            dek.expose()
+        );
+    }
+
+    /// A typo costs the operator a re-prompt, not the command — but only where a human is there
+    /// to answer it; piped input gets one attempt and a refusal.
+    #[test]
+    fn a_typo_at_the_prompt_costs_a_re_prompt_not_the_command() {
+        let (keyring, _dek) = enrolled("correct horse battery staple");
+        let mut entries =
+            ["wrong horse battery staple", "correct horse battery staple"].into_iter();
+        let mut asked = 0usize;
+        let opened = verified_passphrase(&keyring, true, || {
+            asked += 1;
+            Ok(Zeroizing::new(
+                entries.next().unwrap_or_default().to_string(),
+            ))
+        })
+        .expect("the second entry opens the session");
+        assert_eq!(asked, 2);
+        assert!(opened.unlock("t", &keyring, None).is_ok());
+    }
+
+    /// The enclave arm stays lazy: building the session unlocker reaches no enclave, so it costs
+    /// no biometric on top of the one the operation itself raises. An eager check here would
+    /// prove nothing an empty keyring could satisfy, and this call succeeds against one.
+    #[test]
+    fn choosing_the_enclave_builds_a_session_unlocker_without_reaching_the_enclave() {
+        assert!(make_unlocker(&Keyring::new(), Some(UnlockMethod::Se)).is_ok());
     }
 
     #[test]

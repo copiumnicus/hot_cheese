@@ -34,7 +34,8 @@ impl PassphraseUnlocker {
         }
     }
 
-    /// Take ownership of a prompt buffer that was protected from the instant it was read.
+    /// Take ownership of a prompt buffer that was protected from the instant it was read. This
+    /// checks nothing, so a caller that treats a prompt as accepted must [`Unlocker::unlock`] it.
     pub fn from_secret(passphrase: Zeroizing<String>) -> Self {
         Self { passphrase }
     }
@@ -251,6 +252,49 @@ mod tests {
         assert!(PassphraseUnlocker::new("abcdefgh".repeat(3))
             .enroll("recovery", &dek)
             .is_ok());
+    }
+
+    /// Unlocking must never re-apply the new-passphrase rules: an enrollment written before those
+    /// rules existed is the only copy of that DEK on a fresh machine, and refusing it at the
+    /// prompt would lock its owner out for good.
+    #[test]
+    fn a_passphrase_below_the_new_minimum_still_unlocks_an_older_enrollment() {
+        let dek = Dek::random();
+        let legacy = "short pass";
+        assert!(legacy.chars().count() < MIN_NEW_PASSPHRASE_CHARS);
+        let unlocker = PassphraseUnlocker::new(legacy.to_string());
+        assert!(matches!(
+            unlocker.enroll("recovery", &dek),
+            Err(UnlockErr::PassphraseTooShort { .. })
+        ));
+
+        let mut salt = vec![0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        let kek =
+            derive_kek(legacy.as_bytes(), &salt, M_COST, T_COST, P_COST).expect("derive the KEK");
+        let id = new_id();
+        let wrapped_dek = seal(&kek, id.as_bytes(), dek.expose()).expect("wrap the DEK");
+        let mut kr = Keyring::new();
+        kr.add(Enrollment {
+            id,
+            label: "recovery".to_string(),
+            created_at: now_secs(),
+            params: EnrollParams::Passphrase {
+                kdf: "argon2id".to_string(),
+                salt,
+                m_cost: M_COST,
+                t_cost: T_COST,
+                p_cost: P_COST,
+            },
+            wrapped_dek,
+        });
+        assert_eq!(
+            unlocker
+                .unlock("t", &kr, None)
+                .expect("the older enrollment still opens")
+                .expose(),
+            dek.expose()
+        );
     }
 
     /// The costs this file writes must land inside the window `Keyring::validate` accepts, or

@@ -339,6 +339,12 @@ hot_cheese init
 Record the recovery passphrase **offline** (treat it like a seed phrase): it is
 the only cross-machine restore path for the DEK.
 
+To **check the phrase you recorded**, run `hot_cheese --unlock passphrase` and type it at the
+prompt. The prompt itself is the check: every command proves the passphrase against
+`keyring.json` before it opens anything, so a wrong one is refused right there — it never
+reaches a menu, a key, or a signature. It costs one Argon2 derivation, raises no Touch ID, and
+releases nothing.
+
 To **reuse an existing certificate** (so clients pinning the old fingerprint
 don't have to re-pin):
 
@@ -589,6 +595,15 @@ has, `SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll` when a key is the
 vault cannot prove is its own. There is no silent fallback. `serve` refuses `--unlock passphrase`, because a daemon holding a passphrase
 unlocker would answer every request from one startup prompt and lose the per-request human
 approval — recover, `enroll se` again, then serve.
+
+**The two KEKs prove themselves at different moments, deliberately.** A passphrase is proven at
+the prompt: the entry is derived and tried against `keyring.json` before the command opens a
+session, so a wrong one is `WrongPassphrase` right there — a terminal is asked again, piped
+input gets the refusal as the command's answer. The Secure Enclave is proven when it is used,
+because its proof *is* the Touch ID sheet: checking it at startup would raise one biometric to
+open the session and a second to do the work, and an operator who is taught that sheets are
+routine stops reading them. So the path with a prompt to answer verifies eagerly, and the path
+whose verification the operator watches happen stays lazy.
 
 Logging defaults to `INFO`; override with `RUST_LOG=debug` (or `trace`/`warn`/`error`).
 
