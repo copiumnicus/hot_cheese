@@ -43,9 +43,7 @@ use hc_sign::intent::{Intent, SafeTxIntent};
 use hc_sign::qr::{frames, QrKind};
 use hc_sign::SignResponse;
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, OsStr};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::OsStr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -89,7 +87,9 @@ create_err_with_impls!(
     BundleFileTooLarge { size: usize, max: u64 },
     BundleFileConflict { path: PathBuf },
     InvalidBundleFileName { path: PathBuf },
-    MisfiledBundle { path: PathBuf }
+    MisfiledBundle { path: PathBuf },
+    TooManyLocalFacts { dir: PathBuf, max: usize },
+    RetiredUnreadable { dir: PathBuf }
 );
 
 /// An exclusive, cross-process claim on the local bundle tree. MCP keeps one from its final
@@ -660,9 +660,11 @@ pub fn take_response(
     )
 }
 
-/// Write this signer's own file, once. An existing file holding the same signature over the same
-/// transaction is the same file: coordination metadata is outside the digest and outside local
-/// truth, so a difference there is not a second, conflicting claim under this signer's name.
+/// Write this signer's own file, once, and state locally that this machine has written under that
+/// signer name — which is what later keeps a peer flooding the same directory from moving it out.
+/// An existing file holding the same signature over the same transaction is the same file:
+/// coordination metadata is outside the digest and outside local truth, so a difference there is
+/// not a second, conflicting claim under this signer's name.
 fn write_one(
     dir: &Path,
     signer: Address,
@@ -675,14 +677,14 @@ fn write_one(
     }
     let bytes = serialized_bundle(one, owners)?;
     match atomic_write_new(&path, &bytes) {
-        Ok(()) => Ok(()),
+        Ok(()) => local::sign_as(signer),
         Err(hc_core::crypto::envelope::EnvErr::StdIo(error))
             if error.kind() == std::io::ErrorKind::AlreadyExists =>
         {
             let held = hc_core::read_regular_file_bounded(&path, MAX_FILE_BYTES)?;
             let held: SafeTxBundle = hc_core::wire::strict_json_from_slice(&held)?;
             if held.signatures == one.signatures && held.digest() == one.digest() {
-                Ok(())
+                local::sign_as(signer)
             } else {
                 Err(BundleErr::BundleFileConflict { path })
             }
@@ -741,11 +743,13 @@ pub fn intent_to_sign(sync: SyncMode, hash: B256, key: &str) -> Result<SafeTxInt
 /// Take a response into the bundle on disk, then hand back the union that is actually there
 /// afterwards. Pushes it, so the co-signer's next read already has it.
 ///
-/// The response is held on disk BEFORE anything that can fail runs. A biometric was already spent
-/// on it, so a lock this process could not take, or a directory that would not load, must leave
-/// the approval recoverable instead of dropping it: the next collect for this bundle takes
-/// whatever is still held. The file this device writes states the threshold THIS machine knows,
-/// never the coordination a peer put in whichever seed arrived first.
+/// The response is held on disk BEFORE anything that can fail runs, and holding it also claims
+/// the bundle as this machine's own. A biometric was already spent on it, so a lock this process
+/// could not take, a directory that would not load, or a write that ran out of disk must leave the
+/// approval recoverable instead of dropping it: an approval is released only when the write it
+/// authorised actually landed, and the next collect for this bundle takes whatever is still held.
+/// The file this device writes states the threshold THIS machine knows, never the coordination a
+/// peer put in whichever seed arrived first.
 pub fn collect(
     sync: SyncMode,
     hash: B256,
@@ -765,12 +769,13 @@ pub fn collect(
             .and_then(|one| write_one(&dir, signer, &one, &safe.owners))
         {
             Ok(()) => {
-                local::release(&path)?;
+                if let Err(error) = local::release(&path) {
+                    tracing::warn!(%hash, %signer, %error, "cannot release an approval this collect landed");
+                }
                 taken.push(signer);
             }
             Err(error) => {
-                tracing::warn!(%hash, %signer, %error, "a held approval cannot join this bundle");
-                local::release(&path)?;
+                tracing::warn!(%hash, %signer, %error, "a held approval did not join this bundle and stays held");
                 if refused.is_none() {
                     refused = Some(error);
                 }
@@ -935,108 +940,43 @@ pub fn export(sync: SyncMode, hash: B256) -> Result<Execution, BundleErr> {
     })
 }
 
-/// Remove only the flat, canonical files a valid bundle owns, through the directory descriptor
-/// that was opened before deletion. Recursive deletion is inappropriate here: an unexpected
-/// nested directory is not bundle state and must never be erased merely because it sits under a
-/// digest-looking pathname.
-fn remove_bundle_directory(dir: &Path) -> Result<(), BundleErr> {
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)?;
-    let identity = directory.metadata()?;
-    // SAFETY: `geteuid` has no preconditions and changes no process state.
-    let ours = unsafe { libc::geteuid() };
-    if !identity.file_type().is_dir() || identity.uid() != ours {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "bundle directory is not owner-controlled",
-        )
-        .into());
-    }
-
-    let mut names = Vec::new();
-    for (at, entry) in std::fs::read_dir(dir)?.enumerate() {
-        if at >= MAX_ENUMERATED_ENTRIES {
-            return Err(BundleErr::TooManyDirectoryEntries {
-                dir: dir.to_path_buf(),
-                max: MAX_ENUMERATED_ENTRIES,
-            });
-        }
-        let entry = entry?;
-        let name = entry.file_name();
-        if !entry.file_type()?.is_file() || !canonical_bundle_file_name(&name) {
-            return Err(BundleErr::InvalidBundleFileName { path: entry.path() });
-        }
-        if names.len() >= MAX_FILES_PER_BUNDLE {
-            return Err(BundleErr::TooManyBundleFiles {
-                dir: dir.to_path_buf(),
-                found: names.len() + 1,
-                max: MAX_FILES_PER_BUNDLE,
-            });
-        }
-        names.push(name);
-    }
-
-    // Bind the path-based enumeration to the descriptor before mutating the opened directory.
-    let current = std::fs::symlink_metadata(dir)?;
-    if !current.file_type().is_dir()
-        || current.dev() != identity.dev()
-        || current.ino() != identity.ino()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bundle directory changed during retirement",
-        )
-        .into());
-    }
-
-    for name in names {
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bundle name contains NUL")
-        })?;
-        // SAFETY: `directory` and the NUL-terminated filename remain live for this call, and a
-        // canonical bundle filename has no slash. flags=0 refuses directories.
-        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    directory.sync_all()?;
-    drop(directory);
-
-    let current = std::fs::symlink_metadata(dir)?;
-    if !current.file_type().is_dir()
-        || current.dev() != identity.dev()
-        || current.ino() != identity.ino()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bundle directory changed during retirement",
-        )
-        .into());
-    }
-    std::fs::remove_dir(dir)?;
-    Ok(())
-}
-
 /// Retire a bundle, locally and only locally. Manual, and honestly so: with no RPC client this
 /// machine cannot learn the Safe's on-chain nonce. It deliberately does not sync — a push cannot
 /// delete, because no transfer in this module carries `--delete` — so the retirement is recorded
 /// where no peer writes, and the next pull that brings the directory back finds it removed again.
+///
+/// A directory that will not LOAD is retired anyway. A peer can leave one behind — a bundle for a
+/// Safe this `safes.toml` no longer describes is the ordinary case — and a retirement that first
+/// demanded a readable union is exactly how such a directory came to hold its (safe, chain, nonce)
+/// slot with no way for the operator to get rid of it. The union is then the one thing this
+/// cannot report, so it says so with [`BundleErr::RetiredUnreadable`] AFTER the bundle is gone.
 pub fn rm(hash: B256) -> Result<SafeTxBundle, BundleErr> {
     let _mutation = Mutation::take()?;
     let dir = bundle_dir(hash);
-    let held = load_dir(&dir, hash)?;
+    if !owned_directory_exists(&dir)? {
+        return Err(BundleErr::NoSuchBundle { dir });
+    }
+    let held = load_dir(&dir, hash);
     local::retire(hash)?;
-    local::discard(hash)?;
-    remove_bundle_directory(&dir)?;
-    tracing::info!(
-        %hash,
-        had = held.signatures.len(),
-        nonce = %held.intent.nonce,
-        "retired bundle"
-    );
-    Ok(held)
+    if let Err(error) = local::discard(hash) {
+        tracing::warn!(%hash, %error, "cannot clear the approvals held for a bundle being retired");
+    }
+    ingest::remove_flat_directory(&dir)?;
+    match held {
+        Ok(held) => {
+            tracing::info!(
+                %hash,
+                had = held.signatures.len(),
+                nonce = %held.intent.nonce,
+                "retired bundle"
+            );
+            Ok(held)
+        }
+        Err(error) => {
+            tracing::warn!(%hash, %error, "retired a bundle this machine could not read");
+            Err(BundleErr::RetiredUnreadable { dir })
+        }
+    }
 }
 
 /// The transaction framed for another device's camera. The frame carries the FIELDS, so the far
@@ -1256,6 +1196,8 @@ pub(crate) mod tests {
 
     #[test]
     fn signer_files_are_create_only_and_idempotent() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_immutable_signer_home", 2, [0x11]);
         let dir = temp("hot_cheese_bundle_immutable_signer");
         let seed = bundle(intent(3));
         let response = signed(0x11, &seed);
@@ -1279,8 +1221,15 @@ pub(crate) mod tests {
             Err(BundleErr::BundleFileConflict { .. })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), foreign_bytes);
+        assert!(
+            root.join("bundle-signers")
+                .join(format!("{signer:#x}"))
+                .is_file(),
+            "the machine states the signer names it has written under"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1311,13 +1260,14 @@ pub(crate) mod tests {
         std::fs::write(nested.join("KEEP"), b"unrelated").unwrap();
 
         assert!(matches!(
-            remove_bundle_directory(&dir),
-            Err(BundleErr::InvalidBundleFileName { .. })
+            ingest::remove_flat_directory(&dir),
+            Err(ingest::IngestErr::NestedEntry { .. })
         ));
         assert_eq!(std::fs::read(nested.join("KEEP")).unwrap(), b"unrelated");
+        assert!(dir.is_dir(), "the directory holding it is kept, and named");
         assert!(
-            dir.join(SEED_FILE).exists(),
-            "refusal happens before deletion"
+            !dir.join(SEED_FILE).exists(),
+            "the bundle's own state still goes, or its slot is held for ever"
         );
 
         std::fs::remove_dir_all(dir).unwrap();
@@ -1392,6 +1342,111 @@ pub(crate) mod tests {
             2,
             "the approval that was already spent is not lost"
         );
+        assert!(local::held(hash).expect("the spool").is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One file in the spool that cannot be READ must cost itself and nothing else. It used to
+    /// cost every later collect for that bundle — after the biometric — which strands approvals
+    /// for good, and the file is not even one this machine wrote.
+    #[test]
+    fn an_unreadable_held_file_cannot_poison_a_later_collect() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_spool_poison", 2, [0x11, 0x22]);
+        let seed = bundle(intent(3));
+        let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize the seed"),
+        )
+        .unwrap();
+
+        let spool = root.join("bundle-spool").join(hash.to_string());
+        std::fs::create_dir_all(&spool).expect("make the spool dir");
+        let poison = spool.join(format!("{:#x}{BUNDLE_SUFFIX}", Address::ZERO));
+        std::fs::write(&poison, b"{}").expect("plant unreadable bytes");
+        std::fs::set_permissions(&poison, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        for at in [0x11u8, 0x22u8] {
+            let after = collect(SyncMode::Off, hash, signed(at, &seed))
+                .expect("a collect behind a spent biometric still lands");
+            assert_eq!(after.signatures.len(), usize::from(at == 0x22) + 1);
+        }
+        assert!(
+            poison.exists(),
+            "what cannot be read is kept, not destroyed"
+        );
+
+        std::fs::set_permissions(&poison, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A directory that will not LOAD must still be removable, or a peer's bundle for a Safe this
+    /// machine stopped describing holds its (safe, chain, nonce) slot with nothing the operator
+    /// can do about it. The retirement is what has to happen; the union is the one thing this
+    /// cannot report, and it says so rather than refusing.
+    #[test]
+    fn a_bundle_that_will_not_load_is_still_retired() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_rm_unloadable", 2, [0x11, 0x22]);
+        let seed = bundle(intent(3));
+        let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize the seed"),
+        )
+        .unwrap();
+        std::fs::write(dir.join(".unsigned.json.9Kx1"), b"half a transfer").unwrap();
+        std::fs::write(root.join("bundles").join("safes.toml"), "safe = []\n").unwrap();
+
+        assert!(matches!(
+            load_dir(&dir, hash),
+            Err(BundleErr::UnknownSafe { .. })
+        ));
+        assert!(matches!(rm(hash), Err(BundleErr::RetiredUnreadable { .. })));
+        assert!(!dir.exists(), "including the transfer artefact it held");
+        assert!(root
+            .join("bundle-tombstones")
+            .join(hash.to_string())
+            .is_file());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A biometric is spent before the write, so the write failing — a full disk, a directory
+    /// that turned read-only — must leave the approval exactly where it is. Releasing it on ANY
+    /// error is how an approval was lost in the one case the spool exists for.
+    #[test]
+    fn an_approval_survives_a_write_that_failed() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_bundle_write_failure", 2, [0x11, 0x22]);
+        let seed = bundle(intent(3));
+        let hash = seed.digest();
+        let dir = bundle_dir(hash);
+        std::fs::create_dir_all(&dir).expect("make the bundle dir");
+        std::fs::write(
+            dir.join(SEED_FILE),
+            serde_json::to_vec(&seed).expect("serialize the seed"),
+        )
+        .unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(collect(SyncMode::Off, hash, signed(0x11, &seed)).is_err());
+        assert_eq!(
+            local::held(hash).expect("the spool").len(),
+            1,
+            "an approval the write could not take is still held"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let after =
+            collect(SyncMode::Off, hash, signed(0x22, &seed)).expect("the next collect takes both");
+        assert_eq!(after.signatures.len(), 2);
         assert!(local::held(hash).expect("the spool").is_empty());
 
         std::fs::remove_dir_all(root).unwrap();

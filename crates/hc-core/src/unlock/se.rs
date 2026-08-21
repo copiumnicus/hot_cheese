@@ -16,8 +16,9 @@
 //! Standard ECDH is symmetric: `ECDH(eph_priv, se_pub) == ECDH(se_priv, eph_pub)`.
 //!
 //! * **enroll** runs entirely on the host with the `p256` crate
-//!   (`ECDH(eph_priv, se_pub)`). It only needs the SE *public* key, so it triggers **no
-//!   Touch ID** — you can enroll a new DEK wrapping at any time.
+//!   (`ECDH(eph_priv, se_pub)`). It only needs the SE *public* key — the proven one
+//!   [`crate::mac::secure_enclave::ensure_se_key`] hands [`enroll_secure_enclave`] — so it
+//!   triggers **no Touch ID** and can re-wrap a DEK at any time.
 //! * **unlock** runs the mirror image inside the Secure Enclave
 //!   (`ECDH(se_priv, eph_pub)`), which requires a live biometric. That biometric is the
 //!   per-request gate: no Touch ID → no ECDH → no KEK → no DEK.
@@ -56,26 +57,36 @@ impl SecureEnclaveUnlocker {
     }
 }
 
-/// Classify a Secure Enclave failure: only an absent key is the passphrase fallback, because a
-/// key that is present but unproven or unreadable may be a planted one, and the re-enrollment
-/// that hint leads to is exactly what would wrap this vault's DEK under it.
+/// Classify a Secure Enclave failure. Every one of them keeps the recovery route, because the
+/// same DEK is wrapped under the recovery enrollment and `--unlock passphrase` re-enrolls
+/// nothing; a key that is present but unproven or unreadable additionally refuses to point at a
+/// re-enrollment, which is the step that would wrap this vault's DEK under a planted key.
 fn se_failure(e: secure_enclave::SeErr) -> UnlockErr {
     use secure_enclave::SeErr;
     match e {
         SeErr::KeyNotFound => UnlockErr::SeKeyUnavailableTryUnlockPassphrase,
         source @ (SeErr::BadBlob
-        | SeErr::UnrecordedEnclaveKey { .. }
+        | SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey { .. }
         | SeErr::BlobNotOwnerOnly { .. }
         | SeErr::BlobNotAKeyFile { .. }) => {
             tracing::error!(
                 ?source,
                 "a Secure Enclave key is present at this machine's key path but this vault \
                  cannot prove it is the one it recorded; refusing to unlock and refusing to \
-                 recommend re-enrollment, which would wrap the DEK under it"
+                 recommend re-enrollment, which would wrap the DEK under it. Your keys are still \
+                 there: re-run with `--unlock passphrase`"
             );
-            UnlockErr::SeKeyPresentButUnprovenDoNotReenroll { source }
+            UnlockErr::SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { source }
         }
-        other => UnlockErr::Se(other),
+        source => {
+            tracing::error!(
+                ?source,
+                "this machine's Secure Enclave would not use the key it has, which an added or \
+                 removed fingerprint alone is enough to cause; the DEK is unaffected, so re-run \
+                 with `--unlock passphrase`"
+            );
+            UnlockErr::SeKeyUnusableTryUnlockPassphrase { source }
+        }
     }
 }
 
@@ -134,45 +145,47 @@ impl Unlocker for SecureEnclaveUnlocker {
         }
         Err(UnlockErr::NoMatchingEnrollment)
     }
+}
 
-    /// Wrap an existing DEK under a fresh ephemeral-key ECDH against this machine's SE
-    /// public key. Host-only ECDH, so **no Touch ID** is required to enroll.
-    fn enroll(&self, label: &str, dek: &Dek) -> Result<Enrollment, UnlockErr> {
-        use p256::ecdh::EphemeralSecret;
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        use rand::rngs::OsRng;
-        use zeroize::Zeroize;
+/// Wrap an existing DEK under a fresh ephemeral-key ECDH against `proven`, the enclave key
+/// [`secure_enclave::ensure_se_key`] checked. The proof is the only way in, so the record names
+/// the key that was checked and no re-read of the blob path can substitute another. Host-only
+/// ECDH, so **no Touch ID** is required to enroll.
+pub fn enroll_secure_enclave(
+    label: &str,
+    dek: &Dek,
+    proven: &secure_enclave::ProvenEnclaveKey,
+) -> Result<Enrollment, UnlockErr> {
+    use p256::ecdh::EphemeralSecret;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use rand::rngs::OsRng;
+    use zeroize::Zeroize;
 
-        let se_pub = secure_enclave::se_public_key(&self.label)?;
-        // The only failure here is a malformed stored `se_pub`; surface it as the
-        // matching typed SE error rather than an opaque curve error.
-        let se_pub_key = p256::PublicKey::from_sec1_bytes(&se_pub)
-            .map_err(|_| UnlockErr::Se(secure_enclave::SeErr::BadPubKeyLen(se_pub.len())))?;
+    let se_pub = proven.public_key().to_vec();
+    let se_pub_key = p256::PublicKey::from_sec1_bytes(&se_pub)
+        .map_err(|_| UnlockErr::Se(secure_enclave::SeErr::BadPubKeyLen(se_pub.len())))?;
 
-        // Ephemeral keypair; the secret is consumed by `diffie_hellman` and dropped
-        // (its `SharedSecret` output is zeroize-on-drop).
-        let eph_secret = EphemeralSecret::random(&mut OsRng);
-        let eph_point = eph_secret.public_key().to_encoded_point(false);
-        let eph_pub: Vec<u8> = eph_point.as_bytes().to_vec();
+    let eph_secret = EphemeralSecret::random(&mut OsRng);
+    let eph_point = eph_secret.public_key().to_encoded_point(false);
+    let eph_pub: Vec<u8> = eph_point.as_bytes().to_vec();
 
-        let shared = eph_secret.diffie_hellman(&se_pub_key);
-        let mut ikm = [0u8; 32];
-        ikm.copy_from_slice(shared.raw_secret_bytes().as_slice());
+    let shared = eph_secret.diffie_hellman(&se_pub_key);
+    let mut ikm = [0u8; 32];
+    ikm.copy_from_slice(shared.raw_secret_bytes().as_slice());
 
-        let id = keyring::new_id();
-        let kek = derive_kek(&ikm, &id)?;
-        ikm.zeroize();
+    let id = keyring::new_id();
+    let kek = derive_kek(&ikm, &id)?;
+    ikm.zeroize();
 
-        let wrapped_dek = envelope::seal(&kek, id.as_bytes(), dek.expose())?;
+    let wrapped_dek = envelope::seal(&kek, id.as_bytes(), dek.expose())?;
 
-        Ok(Enrollment {
-            id,
-            label: label.into(),
-            created_at: keyring::now_secs(),
-            params: EnrollParams::SecureEnclave { se_pub, eph_pub },
-            wrapped_dek,
-        })
-    }
+    Ok(Enrollment {
+        id,
+        label: label.into(),
+        created_at: keyring::now_secs(),
+        params: EnrollParams::SecureEnclave { se_pub, eph_pub },
+        wrapped_dek,
+    })
 }
 
 #[cfg(test)]
@@ -232,23 +245,87 @@ mod tests {
         assert_eq!(eph_pub.as_bytes()[0], 0x04);
     }
 
-    /// HKDF must depend on the salt (enrollment id): the same shared secret under two
-    /// different ids yields different KEKs, so a wrapped DEK can't be replayed under a
-    /// swapped record.
-    /// Only a genuinely absent enclave key may earn the passphrase hint, because the
-    /// re-enrollment that hint leads to is what would wrap this vault's DEK under a key that is
-    /// present but unproven.
+    /// Every enclave failure the unlock path can raise names the recovery route, because the DEK
+    /// is intact behind the recovery enrollment in all of them and an operator told only "ECDH
+    /// failed" can reasonably conclude their keys are gone. The variant name IS the message here
+    /// (`Display` is `Debug`), so the route has to survive in the name.
     #[test]
-    fn only_an_absent_enclave_key_routes_to_the_passphrase_fallback() {
+    fn every_enclave_unlock_failure_carries_the_passphrase_route() {
+        use secure_enclave::SeErr;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from("/nonexistent/se_kek_hotcheese.blob");
+        let every_failure = [
+            SeErr::Unavailable,
+            SeErr::ScreenLocked,
+            SeErr::KeyNotFound,
+            SeErr::BadPubKeyLen(3),
+            SeErr::BadPeerPoint,
+            SeErr::SoftwareKey,
+            SeErr::TouchIdDenied,
+            SeErr::Ecdh,
+            SeErr::GrantSign,
+            SeErr::GrantSignatureInvalid,
+            SeErr::BadBlob,
+            SeErr::BufferTooSmall,
+            SeErr::Shim(-99),
+            SeErr::StdIo(std::io::Error::other("read")),
+            SeErr::Create { code: -25308 },
+            SeErr::AccessControl { code: -50 },
+            SeErr::BadSignatureLen { len: 7 },
+            SeErr::GrantReuseWindowExceeded {
+                elapsed_ms: 40_000,
+                window_ms: 10_000,
+            },
+            SeErr::InvalidLabel {
+                label: "a_b".into(),
+            },
+            SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey {
+                path: path.clone(),
+                found: "0123456789abcdef".into(),
+                recorded: Vec::new(),
+            },
+            SeErr::EnclaveKeyPathOccupied { path: path.clone() },
+            SeErr::BlobNotOwnerOnly { path: path.clone() },
+            SeErr::BlobNotAKeyFile { path: path.clone() },
+            SeErr::NoEnclaveKeyToDiscard { path: path.clone() },
+            SeErr::RecordedEnclaveKeyNotDiscardable {
+                path: path.clone(),
+                se_key: "0123456789abcdef".into(),
+            },
+            SeErr::EnclaveKeyChangedUnderDiscard {
+                path,
+                shown: "0123456789abcdef".into(),
+                found: "fedcba9876543210".into(),
+            },
+            SeErr::DiscardNotConfirmed {
+                required: secure_enclave::DISCARD_UNRECORDED_KEY_PHRASE,
+            },
+        ];
+        for failure in every_failure {
+            let shown = se_failure(failure).to_string();
+            assert!(
+                shown.contains("TryUnlockPassphrase"),
+                "an enclave failure that names no way back to the keys: {shown}"
+            );
+        }
+    }
+
+    /// A key that is present but unproven may be a planted one, so its refusal must keep saying
+    /// so: re-enrolling is the step that would wrap this vault's DEK under it, and that is the
+    /// one route no failure may point at.
+    #[test]
+    fn a_present_but_unproven_enclave_key_still_refuses_to_recommend_re_enrollment() {
         use secure_enclave::SeErr;
         use std::path::PathBuf;
 
         let path = PathBuf::from("/nonexistent/se_kek_hotcheese.blob");
         let present_but_unproven = [
             SeErr::BadBlob,
-            SeErr::UnrecordedEnclaveKey {
+            SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey {
                 path: path.clone(),
-                public_key: "04ab".into(),
+                found: "0123456789abcdef".into(),
+                recorded: vec!["fedcba9876543210".into()],
             },
             SeErr::BlobNotOwnerOnly { path: path.clone() },
             SeErr::BlobNotAKeyFile { path },
@@ -258,10 +335,11 @@ mod tests {
             assert!(
                 matches!(
                     &mapped,
-                    UnlockErr::SeKeyPresentButUnprovenDoNotReenroll { .. }
+                    UnlockErr::SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { .. }
                 ),
                 "{mapped:?}"
             );
+            assert!(mapped.to_string().contains("DoNotReenroll"), "{mapped:?}");
         }
 
         assert!(matches!(
@@ -270,10 +348,15 @@ mod tests {
         ));
         assert!(matches!(
             se_failure(SeErr::TouchIdDenied),
-            UnlockErr::Se(SeErr::TouchIdDenied)
+            UnlockErr::SeKeyUnusableTryUnlockPassphrase {
+                source: SeErr::TouchIdDenied
+            }
         ));
     }
 
+    /// HKDF must depend on the salt (enrollment id): the same shared secret under two
+    /// different ids yields different KEKs, so a wrapped DEK can't be replayed under a
+    /// swapped record.
     #[test]
     fn kek_is_salted_by_enrollment_id() {
         let shared = [9u8; 32];

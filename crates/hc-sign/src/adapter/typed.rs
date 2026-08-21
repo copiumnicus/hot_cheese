@@ -9,7 +9,7 @@
 //! Everything the digest depends on — the resolver, the domain, the struct name at every depth —
 //! is a function of the policy file. The message is coerced ONCE, and that single value is both
 //! what is hashed and what is rendered, so the digest signed is the digest read.
-use super::{annotate, call, Alarm, Raised, Summary};
+use super::{annotate, call, summarize, Alarm, Raised, Summary};
 use crate::intent::TypedDataIntent;
 use crate::policy::Policy;
 use crate::schema::{
@@ -267,8 +267,9 @@ impl TypedMessage<'_> {
         self.digest
     }
 
-    /// The human's only view of the message: the alarms as their own block, worst-ranked first,
-    /// and every declared field with the operator's own name beside the value that was coerced —
+    /// The human's only view of the message: the alarms as their own block, ordered by
+    /// [`summarize`](super::summarize), and every declared field with the operator's own name beside the
+    /// value that was coerced —
     /// the same value [`TypedMessage::digest`] was taken over. The domain is printed in full,
     /// `salt` included: everything inside the digest a human is asked to approve is visible.
     pub fn summary(&self, key: &str, config: &Config) -> Summary {
@@ -288,12 +289,6 @@ impl TypedMessage<'_> {
                 },
                 at: String::new(),
             });
-        }
-        raised.sort_by_key(|r| r.alarm.rank());
-
-        let mut alarms = Vec::with_capacity(raised.len());
-        for one in &raised {
-            alarms.push(one.alarm.line(&one.at, chain_id, config));
         }
 
         let mut body = self.schema.primary_type.clone();
@@ -321,7 +316,7 @@ impl TypedMessage<'_> {
                 None => String::new(),
             },
         ));
-        Summary { alarms, body }
+        summarize(raised, body, chain_id, config)
     }
 
     /// Every declared field of `name`, in declaration order, indented under its struct. The

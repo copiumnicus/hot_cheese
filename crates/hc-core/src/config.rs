@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +20,9 @@ pub struct Config {
     pub account: String,
     /// Directory holding the encrypted keystores + `keyring.json`.
     pub store: String,
+    /// Root of the add-only store snapshots, one subtree per vault; absent uses [`store_archive_dir`].
+    #[serde(default)]
+    pub store_archive: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
     /// Uncompressed SEC1 hex (65 bytes) of the Secure Enclave grant key `serve` must find.
@@ -30,6 +34,9 @@ pub struct Config {
     /// Seconds the runtime waits between backup fetches; 0 disables the periodic fetch.
     #[serde(default)]
     pub backup_fetch_secs: Option<u64>,
+    /// Seconds one approval prompt waits for an answer before it denies itself.
+    #[serde(default)]
+    pub approval_timeout_secs: Option<u64>,
     /// What an agent proposing over MCP may name, accumulate and spend.
     #[serde(default)]
     pub mcp: Option<Mcp>,
@@ -108,6 +115,18 @@ const DEFAULT_BUNDLE_POLL_SECS: u64 = 30;
 /// The floor under that. `bundle_watch_secs = 0` would otherwise spin rsync subprocesses as fast
 /// as ssh can connect; 5 is one peer's own connect timeout.
 const MIN_BUNDLE_POLL_SECS: u64 = 5;
+
+/// Seconds one approval prompt waits for an answer when `config.toml` does not say otherwise.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
+
+/// The floor an operator may set that to. A prompt the operator cannot read, reach and answer
+/// denies every request on a busy machine, and an unanswered prompt is what makes every later one
+/// challenged, so a deadline below this turns the whole approval surface into noise.
+const MIN_APPROVAL_TIMEOUT_SECS: u64 = 5;
+
+/// The ceiling. One prompt holds the single approval thread for its whole deadline, and every
+/// caller behind it waits twice that for a place in the line before it is told to come back.
+const MAX_APPROVAL_TIMEOUT_SECS: u64 = 600;
 
 /// What an agent proposing over MCP is allowed to accumulate, to name, and to spend. The queue
 /// bounds are read by the CLI and the daemon too; the rest bound the agent alone — which keys and
@@ -332,8 +351,14 @@ create_err_with_impls!(
     StorePathHasUnsafeComponent { path: PathBuf },
     StorePathIsDangerous { path: PathBuf },
     StorePathNotDirectory { path: PathBuf },
+    StoreArchiveNotAbsolute { path: PathBuf },
+    StoreArchiveHasUnsafeComponent { path: PathBuf },
+    StoreArchiveNotDirectory { path: PathBuf },
+    StoreArchiveSharesTheStore { archive: PathBuf, store: PathBuf },
+    StoreArchiveSharesTheHome { archive: PathBuf, home: PathBuf },
     TooManyEntries { field: String, found: usize, max: usize },
     InvalidMcpLimit { field: &'static str, found: u64, min: u64, max: u64 },
+    InvalidApprovalTimeout { found: u64, min: u64, max: u64 },
     InvalidMcpKey { key: String },
     DuplicateAnchor { safe: Address, chain_id: U256 },
     InvalidAdapterId { id: String },
@@ -472,6 +497,45 @@ fn validate_store_path(configured: &str) -> Result<(), ConfigErr> {
     Ok(())
 }
 
+/// Judge an operator-chosen `store_archive`. The archive exists to survive the destruction of the
+/// store and of the home dir, so an archive that lives inside either — or that contains either —
+/// shares exactly the fate it was added to escape, and is refused here rather than discovered after
+/// the `rm -rf`. An archive inside the store would also be a directory the store grammar refuses,
+/// which would wedge every commit.
+fn validate_store_archive_path(configured: &str, store: &str) -> Result<(), ConfigErr> {
+    let path = resolve_path(configured);
+    if !path.is_absolute() {
+        return Err(ConfigErr::StoreArchiveNotAbsolute { path });
+    }
+    if configured
+        .split('/')
+        .any(|component| component == "." || component == "..")
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(ConfigErr::StoreArchiveHasUnsafeComponent { path });
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink())
+        || (path.exists() && !path.is_dir())
+    {
+        return Err(ConfigErr::StoreArchiveNotDirectory { path });
+    }
+    let archive = canonical_with_missing(&path)?;
+    if archive.parent().is_none() {
+        return Err(ConfigErr::StoreArchiveHasUnsafeComponent { path: archive });
+    }
+    let store = canonical_with_missing(&resolve_path(store))?;
+    if archive.starts_with(&store) || store.starts_with(&archive) {
+        return Err(ConfigErr::StoreArchiveSharesTheStore { archive, store });
+    }
+    let home = canonical_with_missing(&home_dir())?;
+    if archive.starts_with(&home) || home.starts_with(&archive) {
+        return Err(ConfigErr::StoreArchiveSharesTheHome { archive, home });
+    }
+    Ok(())
+}
+
 fn check_count(field: &str, found: usize, max: usize) -> Result<(), ConfigErr> {
     if found > max {
         return Err(ConfigErr::TooManyEntries {
@@ -563,6 +627,44 @@ pub fn config_path() -> PathBuf {
     home_dir().join("config.toml")
 }
 
+/// Root of the store's add-only snapshots when `config.toml` names no `store_archive`.
+///
+/// Deliberately outside [`home_dir`] and outside the store: an `rm -rf` of either — a mistake, a
+/// stale uninstall script, an agent told to clean up — must not be able to take the copies with it,
+/// which is the whole reason this archive exists. A snapshot is written on every mutation that adds
+/// or changes a keystore or `keyring.json`, is named after the digest of its own bytes so a new one
+/// can never land on an older one, and is never removed by anything in this program: pruning is the
+/// operator's own `rm`, on files they can read and name first.
+///
+/// Being outside every `HOT_CHEESE_HOME` means every install on the machine shares this one root,
+/// and nothing prunes it, so a throwaway home's snapshots would otherwise pile up here forever and
+/// be indistinguishable from real ones at exactly the moment they matter. A snapshot therefore
+/// lands under `<root>/<vault_id>/`, the same namespace a backup push targets, and an install lists
+/// and restores only its own subtree.
+///
+/// Three consequences the operator has to know, because they are properties of add-only storage
+/// and not of this implementation:
+///
+/// - Old ciphertext lives here forever. If the DEK is ever compromised, every snapshot ever
+///   written is decryptable, and deleting a keystore afterwards buys nothing back. Rotation means
+///   generating a NEW key and moving the funds to it, never deleting the old one.
+/// - Every snapshot is another copy of the same ciphertext, and the recovery passphrase is the only
+///   thing between a stolen copy and the keys. More copies is more surface for an offline attack on
+///   that passphrase, so the passphrase has to be worth that.
+/// - The archive holds exactly what the store holds: ciphertext, plus cleartext key names and
+///   policies. That is safe to leave on a disk only you can read. It is not safe to publish, and
+///   the cleartext half names every key you hold and what each one is allowed to sign.
+pub fn store_archive_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("hot_cheese")
+            .join("store-archive");
+    }
+    PathBuf::from(".hot_cheese_store_archive")
+}
+
 /// `<home>/adapters`: adapter manifests and their sockets. Deliberately outside the store, so
 /// adapter trust is per-machine and never travels with a backup or an SSH bootstrap.
 pub fn adapters_dir() -> PathBuf {
@@ -580,6 +682,13 @@ pub fn adapter_socket(id: &str) -> PathBuf {
 /// must never ride the path that carries key material.
 pub fn bundles_dir() -> PathBuf {
     home_dir().join("bundles")
+}
+
+/// `<home>/read-grants`: one sealed grant per key an agent may pull without Touch ID.
+/// Deliberately outside the store, whose git tree replicates to every backup remote: a live
+/// credential must never reach a backup, and the store grammar would refuse the directory anyway.
+pub fn read_grants_dir() -> PathBuf {
+    home_dir().join("read-grants")
 }
 
 /// `<home>/bundle-quarantine`: where a file a peer pushed goes when it fails verification.
@@ -609,6 +718,12 @@ impl Config {
     pub fn store_path(&self) -> PathBuf {
         resolve_path(&self.store)
     }
+    pub fn store_archive_path(&self) -> PathBuf {
+        match &self.store_archive {
+            Some(configured) => resolve_path(configured),
+            None => store_archive_dir(),
+        }
+    }
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(5555)
     }
@@ -619,6 +734,14 @@ impl Config {
     }
     pub fn backup_fetch_secs(&self) -> u64 {
         self.backup_fetch_secs.unwrap_or(DEFAULT_BACKUP_FETCH_SECS)
+    }
+    /// How long one approval prompt waits for an answer before it denies itself. Bounded by
+    /// [`Config::validate`], so a nonsensical value stops the command instead of the daemon.
+    pub fn approval_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.approval_timeout_secs
+                .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_SECS),
+        )
     }
     /// The `[mcp]` table, or every bound at its default when the config carries no such table.
     pub fn mcp(&self) -> &Mcp {
@@ -637,6 +760,9 @@ impl Config {
     /// Validate an in-memory configuration before it is persisted or trusted.
     pub fn validate(&self) -> Result<(), ConfigErr> {
         validate_store_path(&self.store)?;
+        if let Some(archive) = &self.store_archive {
+            validate_store_archive_path(archive, &self.store)?;
+        }
         for (field, value) in [("service", &self.service), ("account", &self.account)] {
             if value.len() > MAX_LEGACY_KEYCHAIN_FIELD_BYTES || value.contains('\0') {
                 return Err(ConfigErr::InvalidLegacyKeychainField {
@@ -651,6 +777,15 @@ impl Config {
                 || p256::PublicKey::from_sec1_bytes(&point).is_err()
             {
                 return Err(ConfigErr::InvalidGrantPublicKey);
+            }
+        }
+        if let Some(found) = self.approval_timeout_secs {
+            if !(MIN_APPROVAL_TIMEOUT_SECS..=MAX_APPROVAL_TIMEOUT_SECS).contains(&found) {
+                return Err(ConfigErr::InvalidApprovalTimeout {
+                    found,
+                    min: MIN_APPROVAL_TIMEOUT_SECS,
+                    max: MAX_APPROVAL_TIMEOUT_SECS,
+                });
             }
         }
         let mcp = self.mcp();
@@ -860,6 +995,7 @@ impl Config {
             service: String::new(),
             account: String::new(),
             store: store.to_string(),
+            store_archive: Some(format!("{store}.archive")),
             port: None,
             grant_public_key: Some(
                 "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\
@@ -868,6 +1004,7 @@ impl Config {
             ),
             bundle_watch_secs: None,
             backup_fetch_secs: None,
+            approval_timeout_secs: None,
             mcp: None,
             backup_remotes: Vec::new(),
             adapters: Vec::new(),
@@ -1028,6 +1165,47 @@ mod tests {
             token("erc1155", 6),
             Err(ConfigErr::DecimalsOnNonFungible { .. })
         ));
+    }
+
+    /// An archive inside the store, or inside the home, shares exactly the `rm -rf` it exists to
+    /// survive — and an archive containing either is the same mistake written the other way round.
+    #[test]
+    fn a_store_archive_that_shares_what_it_protects_is_refused_at_config_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "hot-cheese-config-archive-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).expect("make the store");
+        let archived = |at: PathBuf| -> Result<Config, ConfigErr> {
+            let cfg: Config = toml::from_str(&format!(
+                "service = \"\"\naccount = \"\"\nstore = {:?}\nstore_archive = {:?}\n",
+                store.display().to_string(),
+                at.display().to_string()
+            ))?;
+            cfg.validate()?;
+            Ok(cfg)
+        };
+        assert!(matches!(
+            archived(store.join("snapshots")),
+            Err(ConfigErr::StoreArchiveSharesTheStore { .. })
+        ));
+        assert!(matches!(
+            archived(dir.clone()),
+            Err(ConfigErr::StoreArchiveSharesTheStore { .. })
+        ));
+        assert!(matches!(
+            archived(home_dir().join("snapshots")),
+            Err(ConfigErr::StoreArchiveSharesTheHome { .. })
+        ));
+        assert!(matches!(
+            archived(PathBuf::from("relative/snapshots")),
+            Err(ConfigErr::StoreArchiveNotAbsolute { .. })
+        ));
+        archived(dir.join("snapshots"))
+            .expect("an archive beside the store and outside the home is what this is for");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

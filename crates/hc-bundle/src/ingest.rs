@@ -9,12 +9,15 @@
 //! and anything that would poison the union is moved to `<home>/bundle-quarantine` before the
 //! union is taken.
 //!
-//! A file judged invalid is one no local writer can produce, so quarantine cannot eat your own
-//! signature. The ONE exception is [`MAX_FILES_PER_BUNDLE`]: past it the overflow is moved out
-//! by name order, and a peer that floods a directory with names sorting below ours can push a
-//! local signature no pass has judged yet into the quarantine tree. It is moved, never deleted,
-//! precisely so the operator can put it back — and the alternative, leaving one directory's file
-//! count unbounded under a poller that runs 2,880 times a day, is worse.
+//! Nothing here DELETES a file this machine could have written. A refusal moves the file to the
+//! quarantine tree, and only a file whose name is not one of this machine's own signer names is
+//! ever dropped instead when that tree is full — so a signature the operator paid a biometric for
+//! survives every ceiling in this module, including [`MAX_FILES_PER_BUNDLE`], where a peer that
+//! floods a directory chooses which of ITS files leaves and never which of ours.
+//!
+//! Whose a directory is, is likewise read off the disk: [`Truth`] carries this machine's own
+//! claims, so [`MAX_BUNDLE_DIRS`] and [`MAX_DIRS_PER_PEER`] bound peer-delivered directories and
+//! nothing else, whichever entry point created the local one.
 //!
 //! Every ceiling here bounds WORK, never the pass itself. The quarantine tree is a ring that
 //! [`Ingest::sweep`] reclaims from disk, so a peer that sends rubbish until the counter saturates
@@ -61,15 +64,18 @@ pub const MAX_BUNDLE_DIRS: usize = 64;
 /// caller's flood backoff can see.
 pub const MAX_DIRS_PER_PEER: usize = MAX_BUNDLE_DIRS / 4;
 
-/// How long a bundle that never acquired a signature keeps its (safe, chain, nonce) slot. A Safe
-/// executes each nonce once, so a proposal nobody signed in a fortnight is holding a slot against
-/// every later transaction for that nonce. Measured against the LOCAL clock: `created_at_ms` is
-/// whatever a peer typed.
+/// How long a bundle holding no signature keeps its (safe, chain, nonce) slot. A Safe executes
+/// each nonce once, so a proposal nobody signed in a fortnight is holding a slot against every
+/// later transaction for that nonce. It also bounds a directory whose signature files name a Safe
+/// this machine cannot judge at all. Measured against the LOCAL clock: `created_at_ms` is
+/// whatever a peer typed. A directory holding a signature for a Safe this machine DOES describe
+/// never expires, and neither does one this machine claimed.
 pub const PROPOSAL_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 
-/// How long a directory holding nothing but files for a Safe this `safes.toml` does not describe
+/// How long a directory holding nothing but a seed for a Safe this `safes.toml` does not describe
 /// keeps its slot. Nothing in it can become valid until the operator adds that Safe, and the peer
-/// still has it: the pull after they do brings it straight back.
+/// still has it: the pull after they do brings it straight back. It applies only to a machine
+/// that describes some OTHER Safe, so a `safes.toml` that is simply absent expires nothing.
 pub const UNKNOWN_SAFE_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// Files the quarantine tree holds before a rejected file is deleted instead of moved. 1024 ×
@@ -99,7 +105,12 @@ create_err_with_impls!(
     StdIo(std::io::Error),
     Grant(hc_sign::grant::GrantErr)
     ;
-    TooManyEntries { path: PathBuf, max: usize }
+    TooManyEntries { path: PathBuf, max: usize },
+    NotOwnerControlled { path: PathBuf },
+    NestedEntry { path: PathBuf },
+    DirectoryChanged { path: PathBuf },
+    NameHasNul { path: PathBuf },
+    NoQuarantineName { path: PathBuf }
 );
 
 /// Which rule a quarantined file broke.
@@ -123,15 +134,15 @@ pub enum Reject {
     Metadata,
 }
 
-/// Why a file is leaving the bundle tree, and therefore what a full quarantine does about it: a
-/// refusal that can touch a local file evicts older evidence to make room, one that cannot is
-/// simply dropped.
+/// Whether the file leaving the bundle tree is one this machine could have written, and therefore
+/// what a full quarantine does about it: a local file evicts older evidence to make room, a
+/// foreign one is simply dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
-    /// [`judge`] refused it by a rule no local writer can break.
-    Judged,
-    /// It pushed its directory past [`MAX_FILES_PER_BUNDLE`], which a local file can be caught by.
-    Crowding,
+    /// Written under a signer name this machine has never written a bundle file under.
+    Foreign,
+    /// This machine's own signer name, or a file the per-directory cap caught rather than a rule.
+    Local,
 }
 
 /// What the validator did with a file it refused. Every refusal LEAVES the bundle directory:
@@ -146,14 +157,57 @@ pub enum Disposal {
     Deleted,
 }
 
-/// The LOCAL truth every directory in one pass is judged by.
-struct Truth<'a> {
-    /// Bundles this device wrote into, which no cap and no expiry ever removes.
-    ours: &'a HashSet<B256>,
+/// The LOCAL truth every directory in one pass is judged by, read as a unit so that no pass ever
+/// runs on half of it.
+pub struct Truth {
     /// The Safes this machine describes, which is who may sign and nothing a file says.
-    safes: &'a crate::Safes,
+    safes: crate::Safes,
+    /// Bundles this machine created, imported into or spent a biometric on; no cap, quota or
+    /// expiry here ever removes one.
+    ours: HashSet<B256>,
+    /// Signer names this machine has itself written a bundle file under.
+    signers: HashSet<Address>,
+    /// Bundles this machine retired.
+    retired: HashSet<B256>,
     /// The pass's own clock, read once, so every expiry in it measures from one instant.
     now_ms: u64,
+}
+
+impl Truth {
+    /// Read every local fact one pass judges by. A failure is a refusal and never a default: a
+    /// pass that ran without this would quarantine, refuse and expire against truth it does not
+    /// have, and an empty `safes.toml` substituted for a broken one makes every fully-signed
+    /// bundle on the disk look unknown, unsigned and expired.
+    ///
+    /// A `safes.toml` that is ABSENT is not a failure — it is a machine that describes no Safe —
+    /// and [`Ingest::validate`] expires nothing on the unknown-Safe ground when there is no Safe
+    /// to be unknown against.
+    pub fn load() -> Result<Self, crate::BundleErr> {
+        let safes = match crate::Safes::load() {
+            Ok(safes) => safes,
+            Err(crate::BundleErr::NoSafesFile { path }) => {
+                tracing::debug!(path = %path.display(), "this machine describes no Safe");
+                crate::Safes::default()
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Truth {
+            safes,
+            ours: crate::local::ours()?,
+            signers: crate::local::signers()?,
+            retired: crate::local::retired()?,
+            now_ms: hc_sign::grant::now_ms()?,
+        })
+    }
+
+    /// How this machine would refuse a file filed under `name`: a signer name it has written a
+    /// bundle file under is its own work, whatever a later `safes.toml` says about that owner.
+    fn refusal(&self, name: &str) -> Refusal {
+        match owner_of(name) {
+            Ok(Some(signer)) if self.signers.contains(&signer) => Refusal::Local,
+            _ => Refusal::Foreign,
+        }
+    }
 }
 
 /// What judging one bundle directory left behind.
@@ -189,8 +243,8 @@ pub struct Verdict {
     /// peer's [`MAX_DIRS_PER_PEER`].
     pub refused_dirs: Vec<B256>,
     /// Bundle directories removed because this machine retired them, or because a proposal
-    /// holding no signature outlived [`PROPOSAL_TTL_MS`] — [`UNKNOWN_SAFE_TTL_MS`] when nothing
-    /// in it names a Safe this machine describes.
+    /// outlived [`PROPOSAL_TTL_MS`] — [`UNKNOWN_SAFE_TTL_MS`] when it holds only a seed for a
+    /// Safe this machine does not describe.
     pub retired: Vec<B256>,
     /// Bundle directories this pass could not judge and left for the next one; one broken
     /// directory costs itself and nothing else.
@@ -221,15 +275,22 @@ struct FileId {
     len: u64,
 }
 
-fn retention_priority<'a>(candidate: &'a str, held: &HashMap<String, FileId>) -> (u8, &'a str) {
-    (
-        match candidate {
-            SEED_FILE => 0,
-            judged if held.contains_key(judged) => 1,
-            _ => 2,
-        },
-        candidate,
-    )
+/// What a directory over its file cap keeps, worst last. This machine's own signer names rank
+/// above anything a pass has merely judged, so a peer that floods a directory with names sorting
+/// below ours cannot push a local signature no pass has seen yet out of it.
+fn retention_priority<'a>(
+    candidate: &'a str,
+    held: &HashMap<String, FileId>,
+    truth: &Truth,
+) -> (u8, &'a str) {
+    let rank = match candidate {
+        SEED_FILE => 0,
+        mine if truth.refusal(mine) == Refusal::Local => 1,
+        judged if held.contains_key(judged) => 2,
+        canonical if owner_of(canonical).is_ok() => 3,
+        _ => 4,
+    };
+    (rank, candidate)
 }
 
 /// What a previous pass already judged, so the next pass ecrecovers only what changed.
@@ -305,12 +366,16 @@ fn dirs(scope: Scope) -> Result<Vec<(B256, PathBuf)>, IngestErr> {
     Ok(out)
 }
 
-/// Remove a directory this machine will not keep, and every FLAT file in it — the canonical ones
-/// and the rsync temp artefacts a force-killed transfer leaves behind, which are exactly what
-/// otherwise makes this cleanup fail forever. The directory descriptor binds deletion to the inode
-/// we inspected; an unexpected nested directory, symlink, or local replacement still makes the
-/// cleanup fail, without recursively erasing anything.
-fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
+/// Remove a bundle directory and every FLAT file in it — the canonical ones and the rsync temp
+/// artefacts a force-killed transfer leaves behind, which are exactly what otherwise makes this
+/// cleanup fail forever. The directory descriptor binds deletion to the inode we inspected.
+///
+/// Nothing nested is ever erased, or even opened: a directory, symlink or device under a bundle
+/// pathname is not bundle state, and this refuses to remove the directory that holds it and names
+/// it. The flat files still go, so the bundle stops being a bundle — a retirement that could
+/// remove NOTHING because someone left a folder there is how a slot came to be held for ever with
+/// no way for the operator to give it up.
+pub(crate) fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -319,14 +384,13 @@ fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
     // SAFETY: `geteuid` has no preconditions and changes no process state.
     let ours = unsafe { libc::geteuid() };
     if !identity.file_type().is_dir() || identity.uid() != ours {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "arrived bundle directory is not owner-controlled",
-        )
-        .into());
+        return Err(IngestErr::NotOwnerControlled {
+            path: dir.to_path_buf(),
+        });
     }
 
     let mut names = Vec::new();
+    let mut nested = None;
     for (at, entry) in std::fs::read_dir(dir)?.enumerate() {
         if at >= MAX_ENUMERATED_ENTRIES {
             return Err(IngestErr::TooManyEntries {
@@ -337,14 +401,8 @@ fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
         let entry = entry?;
         let name = entry.file_name();
         if !entry.file_type()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "refusing to recursively remove unexpected bundle entry {}",
-                    entry.path().display()
-                ),
-            )
-            .into());
+            nested = Some(entry.path());
+            continue;
         }
         names.push(name);
     }
@@ -354,17 +412,17 @@ fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
         || current.dev() != identity.dev()
         || current.ino() != identity.ino()
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "arrived bundle directory changed during cleanup",
-        )
-        .into());
+        return Err(IngestErr::DirectoryChanged {
+            path: dir.to_path_buf(),
+        });
     }
 
     for name in names {
-        let name = CString::new(name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bundle name contains NUL")
-        })?;
+        let Ok(name) = CString::new(name.as_bytes()) else {
+            return Err(IngestErr::NameHasNul {
+                path: dir.join(name),
+            });
+        };
         // SAFETY: the descriptor and NUL-terminated basename remain live, the validated name
         // has no slash, and flags=0 refuses to unlink a directory.
         if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
@@ -373,17 +431,18 @@ fn remove_flat_directory(dir: &Path) -> Result<(), IngestErr> {
     }
     directory.sync_all()?;
     drop(directory);
+    if let Some(path) = nested {
+        return Err(IngestErr::NestedEntry { path });
+    }
 
     let current = std::fs::symlink_metadata(dir)?;
     if !current.file_type().is_dir()
         || current.dev() != identity.dev()
         || current.ino() != identity.ino()
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "arrived bundle directory changed during cleanup",
-        )
-        .into());
+        return Err(IngestErr::DirectoryChanged {
+            path: dir.to_path_buf(),
+        });
     }
     std::fs::remove_dir(dir)?;
     Ok(())
@@ -505,6 +564,9 @@ impl Ingest {
         let root = bundle_quarantine_dir();
         self.swept_at_ms = now_ms;
         self.quarantined = 0;
+        if let Err(error) = crate::local::reclaim(now_ms) {
+            tracing::warn!(%error, "cannot reclaim the local facts this machine is done with");
+        }
         if !crate::owned_directory_exists(&root)? {
             return Ok(());
         }
@@ -594,29 +656,30 @@ impl Ingest {
         Ok(())
     }
 
-    /// Whether a directory is one a peer just created. A bundle this device wrote into is never
-    /// one, which is what keeps [`MAX_BUNDLE_DIRS`] from deleting the operator's own new bundle,
-    /// and before the priming pass nothing has arrived at all.
-    fn arrived(&self, hash: B256, ours: &HashSet<B256>) -> bool {
-        self.primed && !self.seen.contains_key(&hash) && !ours.contains(&hash)
+    /// Whether a directory is one a peer just created. A bundle this machine claimed is never
+    /// one, which is what keeps [`MAX_BUNDLE_DIRS`] and [`MAX_DIRS_PER_PEER`] from deleting the
+    /// operator's own new bundle, and before the priming pass nothing has arrived at all.
+    fn arrived(&self, hash: B256, truth: &Truth) -> bool {
+        self.primed && !self.seen.contains_key(&hash) && !truth.ours.contains(&hash)
     }
 
     /// Take a refused file out of the tree: to the quarantine dir, or deleted when that tree is
-    /// full of evidence no sweep can reclaim yet and no local writer could have produced the file.
-    /// A [`Refusal::Crowding`] file sweeps for room instead, because leaving it where it is holds
-    /// its whole directory over [`MAX_FILES_PER_BUNDLE`] and nothing can then load it.
+    /// full of evidence no sweep can reclaim yet AND no writer here could have produced the file.
+    /// A [`Refusal::Local`] file sweeps for room instead, because it is either this machine's own
+    /// signature or a file whose absence is what puts its directory back under
+    /// [`MAX_FILES_PER_BUNDLE`], and neither may be destroyed to make a ceiling hold.
     fn dispose(
         &mut self,
         from: &Path,
         name: &str,
         hash: B256,
         refusal: Refusal,
+        now: u64,
     ) -> Result<Disposal, IngestErr> {
         let dir = bundle_quarantine_dir().join(hash.to_string());
-        let now = hc_sign::grant::now_ms()?;
         let full = self.quarantined >= MAX_QUARANTINE_FILES;
         if full || now.saturating_sub(self.swept_at_ms) >= QUARANTINE_SWEEP_MS {
-            self.sweep(now, full && refusal == Refusal::Crowding)?;
+            self.sweep(now, full && refusal == Refusal::Local)?;
         }
         if self.quarantined >= MAX_QUARANTINE_FILES {
             std::fs::remove_file(from)?;
@@ -647,25 +710,19 @@ impl Ingest {
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a create-only quarantine pathname",
-        )
-        .into())
+        Err(IngestErr::NoQuarantineName { path: dir })
     }
 }
 
 impl Ingest {
-    /// Judge everything `scope` covers against the LOCAL `safes.toml`, quarantining what would
-    /// poison a union and reading nothing whose local identity has not moved since the last pass.
-    /// `ours` is the set of bundles this device wrote into, which [`MAX_BUNDLE_DIRS`] never
-    /// refuses. Sorted at every level so two runs over the same tree do the same thing in the
-    /// same order.
+    /// Judge everything `scope` covers against [`Truth`], quarantining what would poison a union
+    /// and reading nothing whose local identity has not moved since the last pass. Sorted at
+    /// every level so two runs over the same tree do the same thing in the same order.
     ///
     /// A directory this pass cannot judge is skipped, not fatal: one killed transfer must not
     /// deny service for every other bundle, and refusing every peer forever is what an aborted
-    /// pass costs. Without a readable `safes.toml` there is no truth to judge by, so nothing is
-    /// judged and nothing is moved.
+    /// pass costs. There is no pass without truth: the caller loads it, and a load that failed
+    /// never reaches here.
     ///
     /// [`MAX_INGEST_FILES`] bounds the files one pass JUDGES, never the names it reaches: a
     /// budget spent on skips would be spent re-reaching the same sorted prefix every pass, and
@@ -678,7 +735,7 @@ impl Ingest {
     pub fn validate(
         &mut self,
         scope: Scope,
-        ours: &HashSet<B256>,
+        truth: &Truth,
         from: Delivered<'_>,
     ) -> Result<Verdict, IngestErr> {
         let entries = dirs(scope)?;
@@ -693,27 +750,12 @@ impl Ingest {
             dirs: entries.len(),
             ..Verdict::default()
         };
-        let retired = match crate::local::retired() {
-            Ok(retired) => retired,
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the local retirements; keeping every directory");
-                HashSet::new()
-            }
-        };
-        let safes = match crate::Safes::load() {
-            Ok(safes) => safes,
-            Err(error) => {
-                tracing::warn!(%error, "cannot read safes.toml; this pass judges nothing");
-                crate::Safes::default()
-            }
-        };
         let mut kept = 0usize;
         for (hash, _) in &entries {
-            if !self.arrived(*hash, ours) {
+            if !self.arrived(*hash, truth) {
                 kept += 1;
             }
         }
-        let now = hc_sign::grant::now_ms()?;
         let mut spent = 0usize;
         if let Delivered::By(host) = from {
             for peer in self.from.values() {
@@ -722,15 +764,10 @@ impl Ingest {
                 }
             }
         }
-        let truth = Truth {
-            ours,
-            safes: &safes,
-            now_ms: now,
-        };
         let mut pass: HashMap<B256, HashMap<String, FileId>> = HashMap::new();
         for (hash, dir) in entries {
-            let arrived = self.arrived(hash, ours);
-            if retired.contains(&hash) && !ours.contains(&hash) {
+            let arrived = self.arrived(hash, truth);
+            if truth.retired.contains(&hash) && !truth.ours.contains(&hash) {
                 match remove_flat_directory(&dir) {
                     Ok(()) => {
                         verdict.retired.push(hash);
@@ -738,6 +775,9 @@ impl Ingest {
                         verdict.changed |= self.seen.remove(&hash).is_some();
                         if !arrived {
                             kept -= 1;
+                        }
+                        if let Err(error) = crate::local::renew(hash) {
+                            tracing::warn!(%hash, %error, "cannot restamp a retirement this pass enforced");
                         }
                         tracing::info!(%hash, "removed a bundle this machine retired");
                     }
@@ -768,7 +808,7 @@ impl Ingest {
                 }
                 kept += 1;
             }
-            match self.judge_dir(hash, &dir, arrived, &truth, &mut verdict) {
+            match self.judge_dir(hash, &dir, arrived, truth, &mut verdict) {
                 Ok(Judged::Held(fresh)) => {
                     pass.insert(hash, fresh);
                 }
@@ -803,15 +843,21 @@ impl Ingest {
     }
 
     /// Judge one directory, taking every file it holds on its own terms. A name that came out of
-    /// `read_dir` and will not open is a transfer racing this pass, so it is left for the next one
-    /// rather than judged on bytes this pass does not have. A proposal is only expired by a pass
-    /// that had the budget to see every file it holds.
+    /// `read_dir` and will not open, stat or read is a transfer racing this pass, so it is left
+    /// for the next one rather than judged on bytes this pass does not have, and it still counts
+    /// as a signature the expiry below must not destroy. A proposal is only expired by a pass that
+    /// had the budget to see every file it holds.
+    ///
+    /// An arrival whose every file was refused is reclaimed empty: the files leave for quarantine,
+    /// and one invalid canonical file per fresh digest would otherwise let a peer hold every
+    /// directory slot with shells. A concurrent local write makes that `remove_dir` fail with
+    /// `DirectoryNotEmpty`, and the next pass accounts for the directory instead.
     fn judge_dir(
         &mut self,
         hash: B256,
         dir: &Path,
         arrived: bool,
-        truth: &Truth<'_>,
+        truth: &Truth,
         verdict: &mut Verdict,
     ) -> Result<Judged, IngestErr> {
         let held = self.seen.remove(&hash).unwrap_or_default();
@@ -844,19 +890,20 @@ impl Ingest {
                     .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| {
-                        retention_priority(a, &held).cmp(&retention_priority(b, &held))
+                        retention_priority(a, &held, truth)
+                            .cmp(&retention_priority(b, &held, truth))
                     })
                     .map(|(at, _)| at)
                     .unwrap_or(0);
-                let refused = if retention_priority(&name, &held)
-                    < retention_priority(&names[worst], &held)
+                let refused = if retention_priority(&name, &held, truth)
+                    < retention_priority(&names[worst], &held, truth)
                 {
                     std::mem::replace(&mut names[worst], name)
                 } else {
                     name
                 };
                 let from = dir.join(&refused);
-                let disposal = self.dispose(&from, &refused, hash, Refusal::Crowding)?;
+                let disposal = self.dispose(&from, &refused, hash, Refusal::Local, truth.now_ms)?;
                 tracing::debug!(file = %from.display(), ?disposal, "a bundle directory is over its file cap");
                 verdict.refused_files += 1;
             }
@@ -870,14 +917,23 @@ impl Ingest {
         let mut unknown = false;
         for name in names {
             let from = dir.join(&name);
+            let bears_signature = matches!(owner_of(&name), Ok(Some(_)));
             let file = match hc_core::open_regular_file(&from) {
                 Ok(file) => file,
                 Err(error) => {
                     tracing::warn!(file = %from.display(), %error, "skipping a bundle file this pass cannot open");
+                    signed |= bears_signature;
                     continue;
                 }
             };
-            let meta = file.metadata()?;
+            let meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(file = %from.display(), %error, "skipping a bundle file this pass cannot stat");
+                    signed |= bears_signature;
+                    continue;
+                }
+            };
             let id = FileId {
                 ino: meta.ino(),
                 ctime: meta.ctime(),
@@ -885,12 +941,13 @@ impl Ingest {
                 len: meta.size(),
             };
             if held.get(&name) == Some(&id) {
-                signed |= name != SEED_FILE;
+                signed |= bears_signature;
                 fresh.insert(name, id);
                 continue;
             }
             if verdict.judged >= MAX_INGEST_FILES {
                 verdict.capped = true;
+                signed |= bears_signature;
                 continue;
             }
             verdict.judged += 1;
@@ -898,28 +955,33 @@ impl Ingest {
                 true => Ruling::Refuse(Reject::Size),
                 false => {
                     let mut bytes = Vec::with_capacity(id.len as usize);
-                    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+                    if let Err(error) = file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes) {
+                        tracing::warn!(file = %from.display(), %error, "skipping a bundle file this pass cannot read");
+                        signed |= bears_signature;
+                        continue;
+                    }
                     if bytes.len() as u64 > MAX_FILE_BYTES {
                         Ruling::Refuse(Reject::Size)
                     } else {
-                        judge(&bytes, &name, hash, truth.safes)
+                        judge(&bytes, &name, hash, &truth.safes)
                     }
                 }
             };
             let reject = match ruling {
                 Ruling::Take => {
-                    signed |= name != SEED_FILE;
+                    signed |= bears_signature;
                     fresh.insert(name, id);
                     continue;
                 }
                 Ruling::Unknown => {
                     unknown = true;
+                    signed |= bears_signature;
                     tracing::debug!(file = %from.display(), "this machine does not describe the Safe this bundle names");
                     continue;
                 }
                 Ruling::Refuse(reject) => reject,
             };
-            let disposal = self.dispose(&from, &name, hash, Refusal::Judged)?;
+            let disposal = self.dispose(&from, &name, hash, truth.refusal(&name), truth.now_ms)?;
             tracing::debug!(
                 file = %from.display(),
                 ?disposal,
@@ -935,12 +997,6 @@ impl Ingest {
         if held != fresh {
             verdict.changed = true;
         }
-        // A hostile peer can otherwise consume every directory slot with one invalid
-        // canonical file per fresh digest: the files leave for quarantine, but their empty
-        // digest directories would remain and make every later peer bundle look over-cap.
-        // Remove only a directory that arrived in this pass and is now truly empty. A
-        // concurrent/local file makes `remove_dir` fail with `DirectoryNotEmpty`, in which
-        // case the directory is retained and the next pass can account for it.
         if arrived && fresh.is_empty() {
             match std::fs::remove_dir(dir) {
                 Ok(()) => return Ok(Judged::Reclaimed),
@@ -951,19 +1007,20 @@ impl Ingest {
                 Err(error) => return Err(error.into()),
             }
         }
-        let ttl = match unknown && fresh.is_empty() {
-            true => UNKNOWN_SAFE_TTL_MS,
-            false => PROPOSAL_TTL_MS,
+        let ttl = match (signed, unknown) {
+            (true, false) => None,
+            (false, true) if !truth.safes.safe.is_empty() => Some(UNKNOWN_SAFE_TTL_MS),
+            _ => Some(PROPOSAL_TTL_MS),
         };
-        if !signed
-            && !verdict.capped
-            && !truth.ours.contains(&hash)
-            && local_age_ms(dir, truth.now_ms)? > ttl
+        let Some(ttl) = ttl else {
+            return Ok(Judged::Held(fresh));
+        };
+        if !verdict.capped && !truth.ours.contains(&hash) && local_age_ms(dir, truth.now_ms)? > ttl
         {
             remove_flat_directory(dir)?;
             verdict.retired.push(hash);
             verdict.changed = true;
-            tracing::warn!(%hash, unknown, "removed a proposal that never acquired a signature");
+            tracing::warn!(%hash, unknown, signed, "removed a proposal whose slot expired");
             return Ok(Judged::Reclaimed);
         }
         Ok(Judged::Held(fresh))
@@ -985,6 +1042,15 @@ mod tests {
     /// The local truth of one pass, as [`judge`] takes it.
     fn safes(threshold: u8, seeds: impl IntoIterator<Item = u8>) -> crate::Safes {
         toml::from_str(&crate::tests::safes_toml(threshold, seeds)).expect("the fixture parses")
+    }
+
+    /// Every local fact of the home this test set up, as every entry point reads it.
+    fn truth() -> Truth {
+        Truth::load().expect("this test's own local truth")
+    }
+
+    fn now() -> u64 {
+        hc_sign::grant::now_ms().expect("the local clock")
     }
 
     /// Every file under `root`, by path relative to it, so two trees compare byte for byte.
@@ -1136,7 +1202,7 @@ mod tests {
 
         let mut ingest = Ingest::new().expect("start validator");
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("judge the bundle tree");
 
         assert!(verdict
@@ -1174,7 +1240,7 @@ mod tests {
 
         let mut ingest = Ingest::new().expect("count the existing quarantine");
         let disposal = ingest
-            .dispose(&source, "junk.json", hash, Refusal::Judged)
+            .dispose(&source, "junk.json", hash, Refusal::Foreign, now())
             .expect("quarantine the colliding refusal");
         let Disposal::Quarantined { to } = disposal else {
             panic!("a non-full quarantine must retain the refusal");
@@ -1215,7 +1281,7 @@ mod tests {
         std::fs::write(&stuffed, b"peer bytes").expect("write judged-invalid bytes");
         assert_eq!(
             ingest
-                .dispose(&stuffed, "stuffed.json", hash, Refusal::Judged)
+                .dispose(&stuffed, "stuffed.json", hash, Refusal::Foreign, now())
                 .expect("dispose judged-invalid file"),
             Disposal::Deleted
         );
@@ -1224,7 +1290,7 @@ mod tests {
         let crowded = source_dir.join("crowded.json");
         std::fs::write(&crowded, b"possibly local bytes").expect("write crowded bytes");
         let disposal = ingest
-            .dispose(&crowded, "crowded.json", hash, Refusal::Crowding)
+            .dispose(&crowded, "crowded.json", hash, Refusal::Local, now())
             .expect("make room for a refusal that can touch a local file");
         let Disposal::Quarantined { to } = disposal else {
             panic!("a full quarantine must evict rather than leave a crowded file behind");
@@ -1274,7 +1340,7 @@ mod tests {
         let refused = source_dir.join("refused.json");
         std::fs::write(&refused, b"peer bytes").expect("write a refused file");
         let disposal = ingest
-            .dispose(&refused, "refused.json", live, Refusal::Judged)
+            .dispose(&refused, "refused.json", live, Refusal::Foreign, now())
             .expect("dispose against a saturated counter");
         assert!(
             matches!(disposal, Disposal::Quarantined { .. }),
@@ -1339,7 +1405,7 @@ mod tests {
 
         let mut ingest = Ingest::new().expect("start validator");
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("validate the directory");
         assert!(
             verdict.rejected.is_empty(),
@@ -1354,7 +1420,7 @@ mod tests {
         );
 
         let settled = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("the directory is settled");
         assert_eq!(settled.judged, 0);
 
@@ -1460,7 +1526,7 @@ mod tests {
         let mut refused = Vec::new();
         let pass = |ingest: &mut Ingest, refused: &mut Vec<(String, Reject)>| {
             let verdict = ingest
-                .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+                .validate(Scope::All, &truth(), Delivered::Locally)
                 .expect("a pass over the test tree");
             refused.extend(refusals(&a, &verdict));
             verdict
@@ -1537,7 +1603,7 @@ mod tests {
         let mut full = Vec::new();
         loop {
             let verdict = fresh
-                .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+                .validate(Scope::All, &truth(), Delivered::Locally)
                 .expect("a full pass");
             full.extend(refusals(&b, &verdict));
             if !verdict.capped {
@@ -1560,8 +1626,13 @@ mod tests {
     }
 
     /// The priming asymmetry, which is the non-trivial half of the directory cap: getting it
-    /// backwards deletes the operator's own bundles. A directory this device wrote into is never
-    /// a peer's, whatever the cap says.
+    /// backwards deletes the operator's own bundles.
+    ///
+    /// The second half is what makes a directory OURS. It is not a notification: `bundle new` and
+    /// `bundle sign` in a terminal poke no poller, and a daemon that learned about local work only
+    /// from the console deleted the operator's own freshly-signed bundle on its next tick. Both
+    /// verbs are driven here through the same entry points the CLI uses, and the tree is already
+    /// past [`MAX_BUNDLE_DIRS`], so every cap this pass has is against them.
     #[test]
     fn only_a_directory_that_arrived_past_the_cap_is_refused() {
         let _env = HOME.lock();
@@ -1573,7 +1644,7 @@ mod tests {
 
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("the priming pass");
         assert!(
             verdict.refused_dirs.is_empty(),
@@ -1583,24 +1654,29 @@ mod tests {
 
         let arrived = seed_dir(&held, 900);
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("the pass that sees it arrive");
         assert_eq!(verdict.refused_dirs, vec![arrived]);
         assert!(!bundle_dir(arrived).exists());
 
-        let mine = seed_dir(&held, 901);
+        let mine = crate::new(crate::sync::SyncMode::Off, intent(901)).expect("bundle new");
+        let seed = crate::read_bundle(&bundle_dir(mine), mine).expect("read what it wrote");
+        let response = signed(0x11, &seed);
+        let signer = response.signer;
+        crate::collect(crate::sync::SyncMode::Off, mine, response).expect("bundle sign");
+
         let verdict = ingest
-            .validate(
-                Scope::All,
-                &HashSet::from_iter([mine]),
-                Delivered::By("peer"),
-            )
+            .validate(Scope::All, &truth(), Delivered::By("peer"))
             .expect("the pass that sees our own");
         assert!(
             verdict.refused_dirs.is_empty(),
-            "a bundle this device wrote into is never evicted by the cap"
+            "a bundle this machine made is never evicted by a cap or a peer's quota"
         );
-        assert!(bundle_dir(mine).is_dir());
+        assert!(bundle_dir(mine)
+            .join(format!("{signer:#x}{BUNDLE_SUFFIX}"))
+            .is_file());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1633,7 +1709,7 @@ mod tests {
         let held = [&root];
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("prime the empty tree");
 
         for nonce in 0..MAX_BUNDLE_DIRS as u64 {
@@ -1646,7 +1722,7 @@ mod tests {
         }
 
         let refused = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::By("peer"))
+            .validate(Scope::All, &truth(), Delivered::By("peer"))
             .expect("quarantine every invalid arrival");
         assert_eq!(refused.rejected.len(), MAX_DIRS_PER_PEER);
         assert_eq!(
@@ -1665,7 +1741,7 @@ mod tests {
 
         let honest = seed_dir(&held, 9_000);
         let accepted = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::By("peer"))
+            .validate(Scope::All, &truth(), Delivered::By("peer"))
             .expect("judge the later honest arrival");
         assert!(accepted.refused_dirs.is_empty());
         assert_eq!(accepted.dirs, 1);
@@ -1683,20 +1759,20 @@ mod tests {
 
         assert!(
             ingest
-                .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+                .validate(Scope::All, &truth(), Delivered::Locally)
                 .expect("prime the seed")
                 .changed
         );
         assert!(
             !ingest
-                .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+                .validate(Scope::All, &truth(), Delivered::Locally)
                 .expect("settled tree")
                 .changed
         );
 
         std::fs::remove_file(dir.join(SEED_FILE)).expect("remove the accepted seed");
         let removed_file = ingest
-            .validate(Scope::One(hash), &HashSet::new(), Delivered::Locally)
+            .validate(Scope::One(hash), &truth(), Delivered::Locally)
             .expect("notice the file removal");
         assert!(removed_file.changed);
         assert_eq!(removed_file.judged, 0);
@@ -1704,7 +1780,7 @@ mod tests {
         std::fs::remove_dir(&dir).expect("remove the empty bundle directory");
         assert!(
             ingest
-                .validate(Scope::One(hash), &HashSet::new(), Delivered::Locally)
+                .validate(Scope::One(hash), &truth(), Delivered::Locally)
                 .expect("notice the scoped directory removal")
                 .changed
         );
@@ -1799,7 +1875,7 @@ mod tests {
 
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("the pass that puts our own file in seen");
 
         for seed_byte in all_owners() {
@@ -1833,7 +1909,7 @@ mod tests {
         .expect("write the file that breaks the cap");
 
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("the pass that enforces the cap");
         assert_eq!(verdict.crowded, vec![hash]);
         assert_eq!(verdict.refused_files, 1);
@@ -1863,7 +1939,7 @@ mod tests {
         assert!(bundle_dir(hash).is_dir(), "the peer still has it");
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("judge the resurrected directory");
         assert_eq!(verdict.retired, vec![hash]);
         assert!(!bundle_dir(hash).exists());
@@ -1887,7 +1963,7 @@ mod tests {
         }
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("prime a full tree");
 
         let junk = bundle(intent(700)).digest();
@@ -1918,7 +1994,7 @@ mod tests {
         .expect("write it into a directory this machine already held");
 
         let verdict = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("one broken arrival cannot abort the pass");
         assert_eq!(verdict.refused_dirs, vec![junk]);
         assert!(
@@ -1937,13 +2013,36 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A bundle naming a Safe this `safes.toml` does not describe can never become valid, so it
-    /// must not hold a (safe, chain, nonce) slot for the fortnight an unsigned proposal gets — a
-    /// peer would otherwise consume this machine's tree with bundles no pass can ever accept.
-    /// Nothing is destroyed while the operator might still add that Safe, and their peer's next
-    /// pull brings it back once they do.
+    /// This home's own local truth, judging against `safes` at `now_ms`, so the expiry rules can
+    /// be stated against a clock rather than waited for.
+    fn truth_at(safes: crate::Safes, now_ms: u64) -> Truth {
+        let held = truth();
+        Truth {
+            safes,
+            ours: held.ours,
+            signers: held.signers,
+            retired: held.retired,
+            now_ms,
+        }
+    }
+
+    /// A `safes.toml` that describes some Safe, and not the fixture's.
+    fn another_safe() -> crate::Safes {
+        toml::from_str(&crate::tests::safes_toml(2, [0x11, 0x22]).replace(
+            &format!("{:#x}", Address::from([0x11u8; 20])),
+            &format!("{:#x}", Address::from([0x44u8; 20])),
+        ))
+        .expect("a safes.toml describing some other Safe")
+    }
+
+    /// A bundle naming a Safe this `safes.toml` does not describe can never become valid, so a
+    /// PROPOSAL for one must not hold a (safe, chain, nonce) slot for the fortnight a proposal for
+    /// a known Safe gets. What it must not do is destroy signatures on that ground: a directory
+    /// holding a signature keeps the ordinary fortnight even when nothing can judge it, and a
+    /// machine that describes no Safe at all makes no statement about any of them and expires
+    /// nothing early — which is what a `safes.toml` that will not load must never be able to fake.
     #[test]
-    fn a_bundle_for_an_unknown_safe_holds_its_slot_only_briefly() {
+    fn an_unknown_safe_expires_a_proposal_and_never_a_signature() {
         let _env = HOME.lock();
         let root = home("hot_cheese_ingest_unknown_safe", 2, [0x11, 0x22]);
         let held = [&root];
@@ -1951,61 +2050,116 @@ mod tests {
         let dir = bundle_dir(hash);
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         let mut verdict = Verdict::default();
-        let now = hc_sign::grant::now_ms().expect("the local clock");
-        let none = crate::Safes::default();
-        let ours = HashSet::new();
+        let now = now();
+        let known = truth_at(safes(2, [0x11, 0x22]), now + UNKNOWN_SAFE_TTL_MS + 1);
+        let unknown = truth_at(another_safe(), now + UNKNOWN_SAFE_TTL_MS + 1);
+        let describes_nothing = truth_at(crate::Safes::default(), now + UNKNOWN_SAFE_TTL_MS + 1);
 
         let young = ingest
             .judge_dir(
                 hash,
                 &dir,
                 false,
-                &Truth {
-                    ours: &ours,
-                    safes: &none,
-                    now_ms: now + UNKNOWN_SAFE_TTL_MS - 1,
-                },
+                &truth_at(another_safe(), now + UNKNOWN_SAFE_TTL_MS - 1),
                 &mut verdict,
             )
             .expect("judge it while the operator might still add the Safe");
         assert!(matches!(young, Judged::Held(_)));
         assert!(dir.join(SEED_FILE).is_file());
 
+        let nothing_to_be_unknown_against = ingest
+            .judge_dir(hash, &dir, false, &describes_nothing, &mut verdict)
+            .expect("judge it on a machine that describes no Safe");
+        assert!(
+            matches!(nothing_to_be_unknown_against, Judged::Held(_)),
+            "a machine with no Safes states nothing about a Safe it does not name"
+        );
+
+        let signed = seed_dir(&held, 4_244);
+        let signature = self::signed(0x11, &bundle(intent(4_244)));
+        let mut one = SafeTxBundle {
+            signatures: Vec::new(),
+            ..bundle(intent(4_244))
+        };
+        one.add(
+            CollectedSignature {
+                signer: signature.signer,
+                signature: signature.signature,
+            },
+            &crate::tests::owners_of([0x11, 0x22]),
+        )
+        .expect("a valid signature over that digest");
+        std::fs::write(
+            bundle_dir(signed).join(format!("{:#x}{BUNDLE_SUFFIX}", signature.signer)),
+            serde_json::to_vec(&one).expect("serialize"),
+        )
+        .expect("write the signature");
+        let kept_signature = ingest
+            .judge_dir(signed, &bundle_dir(signed), false, &unknown, &mut verdict)
+            .expect("judge a signature for a Safe this machine cannot judge");
+        assert!(
+            matches!(kept_signature, Judged::Held(_)),
+            "an unknown Safe is a reason to ignore a bundle, not to destroy its signatures"
+        );
+        assert_eq!(
+            std::fs::read_dir(bundle_dir(signed))
+                .expect("read the directory")
+                .count(),
+            2
+        );
+
         let expired = ingest
-            .judge_dir(
-                hash,
-                &dir,
-                false,
-                &Truth {
-                    ours: &ours,
-                    safes: &none,
-                    now_ms: now + UNKNOWN_SAFE_TTL_MS + 1,
-                },
-                &mut verdict,
-            )
-            .expect("judge it once its short life is up");
+            .judge_dir(hash, &dir, false, &unknown, &mut verdict)
+            .expect("judge the proposal once its short life is up");
         assert!(matches!(expired, Judged::Reclaimed));
         assert!(!dir.exists());
 
-        let known = seed_dir(&held, 4_243);
-        let local = safes(2, [0x11, 0x22]);
+        let ours = seed_dir(&held, 4_243);
         let kept = ingest
-            .judge_dir(
-                known,
-                &bundle_dir(known),
-                false,
-                &Truth {
-                    ours: &ours,
-                    safes: &local,
-                    now_ms: now + UNKNOWN_SAFE_TTL_MS + 1,
-                },
-                &mut verdict,
-            )
+            .judge_dir(ours, &bundle_dir(ours), false, &known, &mut verdict)
             .expect("judge a proposal for a Safe this machine does describe");
         assert!(
             matches!(kept, Judged::Held(_)),
             "an unsigned proposal for a known Safe still gets its fortnight"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Local truth is all of it or none of it. A `safes.toml` an operator broke — an owner
+    /// removed without lowering the threshold — used to be substituted with an EMPTY one, under
+    /// which every file rules unknown, every directory reads as unsigned, and a fully-signed
+    /// bundle is an hour from deletion. There is no such pass now: the load refuses by name, the
+    /// callers that would have run it stop, the tree is untouched, and fixing the file resumes
+    /// everything with the signatures still there.
+    #[test]
+    fn a_safes_toml_that_will_not_load_refuses_instead_of_emptying_local_truth() {
+        let _env = HOME.lock();
+        let root = home("hot_cheese_ingest_broken_truth", 2, [0x11, 0x22]);
+        let held = [&root];
+        let hash = seed_dir(&held, 8_100);
+        let mut ingest = Ingest::new().expect("an empty quarantine tree");
+        ingest
+            .validate(Scope::All, &truth(), Delivered::Locally)
+            .expect("prime a healthy tree");
+
+        crate::tests::write_safes(&root, 2, [0x11]);
+        assert!(matches!(
+            Truth::load(),
+            Err(crate::BundleErr::InvalidSafeThreshold { threshold: 2, .. })
+        ));
+        assert!(
+            crate::poll::Poller::start().is_err(),
+            "the daemon's poller refuses to run a pass with no truth to judge by"
+        );
+        assert!(bundle_dir(hash).join(SEED_FILE).is_file());
+
+        crate::tests::write_safes(&root, 2, [0x11, 0x22]);
+        let resumed = ingest
+            .validate(Scope::All, &truth(), Delivered::Locally)
+            .expect("the pass the operator's fix restored");
+        assert_eq!(resumed.dirs, 1);
+        assert!(resumed.retired.is_empty() && resumed.rejected.is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2023,7 +2177,7 @@ mod tests {
         let held = [&root];
         let mut ingest = Ingest::new().expect("an empty quarantine tree");
         ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::Locally)
+            .validate(Scope::All, &truth(), Delivered::Locally)
             .expect("prime the empty tree");
 
         let mut refused = 0usize;
@@ -2035,7 +2189,7 @@ mod tests {
                 nonce += 1;
             }
             let verdict = ingest
-                .validate(Scope::All, &HashSet::new(), Delivered::By("hostile"))
+                .validate(Scope::All, &truth(), Delivered::By("hostile"))
                 .expect("judge one pass of one peer's flood");
             refused += verdict.refused_dirs.len();
             dirs = verdict.dirs;
@@ -2052,7 +2206,7 @@ mod tests {
 
         let elsewhere = seed_dir(&held, 50_000);
         let other = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::By("honest"))
+            .validate(Scope::All, &truth(), Delivered::By("honest"))
             .expect("another peer's pass");
         assert!(
             other.refused_dirs.is_empty(),
@@ -2072,7 +2226,7 @@ mod tests {
 
         let freed = seed_dir(&held, 60_000);
         let after = ingest
-            .validate(Scope::All, &HashSet::new(), Delivered::By("hostile"))
+            .validate(Scope::All, &truth(), Delivered::By("hostile"))
             .expect("the pass that frees a slot and fills it again");
         assert!(
             !after.refused_dirs.contains(&freed),

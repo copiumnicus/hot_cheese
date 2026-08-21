@@ -132,8 +132,12 @@ impl Unlocker for PassphraseUnlocker {
             Err(UnlockErr::NoMatchingEnrollment)
         }
     }
+}
 
-    fn enroll(&self, label: &str, dek: &Dek) -> Result<Enrollment, UnlockErr> {
+impl PassphraseUnlocker {
+    /// Wrap an existing DEK under this passphrase, producing an enrollment record to add to the
+    /// keyring.
+    pub fn enroll(&self, label: &str, dek: &Dek) -> Result<Enrollment, UnlockErr> {
         self.validate_new()?;
         let mut salt = vec![0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
@@ -260,6 +264,7 @@ mod tests {
                 .enroll("recovery", &dek)
                 .expect("enroll"),
         );
-        kr.validate().expect("a freshly written enrollment validates");
+        kr.validate()
+            .expect("a freshly written enrollment validates");
     }
 }

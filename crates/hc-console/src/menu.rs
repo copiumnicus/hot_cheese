@@ -7,14 +7,18 @@ use super::{bundles, readtest, status, Console};
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType};
 use err_mac::create_err_with_impls;
+use hc_core::config::{read_grants_dir, Config};
 use hc_core::crypto::envelope::{
     encrypt_file_new, read_keystore, Dek, EnvErr, KeyUse, MAX_SECRET_BYTES,
 };
 use hc_core::is_valid_key_name;
+use hc_core::read_grant::{self, DEFAULT_GRANT_HOURS};
 use hc_core::keyring::{EnrollParams, Keyring};
-use hc_core::mac::secure_enclave::{ensure_se_key, SE_KEY_LABEL};
+use hc_core::mac::secure_enclave::{ensure_se_key, se_fingerprint, ProvenEnclaveKey, SE_KEY_LABEL};
 use hc_core::mac::MacBackend;
-use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker};
+use hc_core::unlock::{
+    enroll_secure_enclave, PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker,
+};
 use hc_daemon::exposure::{TunnelId, TunnelSpec};
 use hc_daemon::git_store;
 use hc_daemon::live::Live;
@@ -25,6 +29,7 @@ use inquire::{Confirm, CustomType, InquireError, Password, PasswordDisplayMode, 
 use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -46,6 +51,7 @@ create_err_with_impls!(
     pub MenuErr,
     NotServing,
     NoKeystores,
+    NoGrants,
     NoTunnels,
     NoDiscoveredPeers,
     NoEnrolledPeers,
@@ -67,6 +73,7 @@ create_err_with_impls!(
     Git(hc_daemon::git_store::GitErr),
     Config(hc_core::config::ConfigErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
+    ReadGrant(hc_core::read_grant::ReadGrantErr),
     Se(hc_core::mac::secure_enclave::SeErr),
     Base58(bs58::decode::Error),
     Serde(serde_json::Error),
@@ -268,6 +275,16 @@ menu_enum!(KeyAction {
     Add => "Import an existing secret",
         "Takes a secret at a masked prompt, seals it under the DEK, and commits the store, which \
          the session then pushes to every backup remote. The use you pick is permanent.",
+    Allow => "Allow an agent to read a key for N hours",
+        "Reseals one shareable key under a fresh bearer token and prints it once, with a block \
+         to hand an agent. Costs one Touch ID now and none on any request that carries the \
+         token, until it expires. sign_only keys are refused before anything unlocks.",
+    Grants => "List read grants",
+        "Every grant still in force, with its expiry and the time it has left; expired ones are \
+         removed as they are read. Decrypts nothing and prompts for nothing.",
+    RevokeGrant => "Revoke a read grant",
+        "Destroys one grant now, so the token an agent is holding releases nothing on its next \
+         request. Decrypts nothing and prompts for nothing.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -301,6 +318,10 @@ menu_enum!(BackupAction {
     Pull => "Forced pull from the first remote (DESTRUCTIVE)",
         "Explicitly trusts the first remote and replaces this machine's history, changing or \
          deleting the local files it names before asking.",
+    Archive => "List the local add-only snapshots",
+        "Shows every snapshot of the store in the archive directory, oldest first. One is written \
+         on each mutation that adds or changes a key, and nothing here ever removes one; restoring \
+         from one is `hot_cheese archive restore <digest>`.",
     Back => "Back",
         "Leave this screen for the one above it.",
 });
@@ -553,7 +574,88 @@ fn keys_screen(console: &Console) -> Result<Step, MenuErr> {
         KeyAction::Generate => generate(console),
         KeyAction::Address => address(console),
         KeyAction::Add => add(console),
+        KeyAction::Allow => allow(console),
+        KeyAction::Grants => Ok(Step {
+            choice: MenuChoice::Keys,
+            notice: grants_notice(&console.rt.config.store_path(), now_secs()?)?,
+        }),
+        KeyAction::RevokeGrant => revoke_grant(console),
     }
+}
+
+/// Mint one read grant. The window is checked and the export permit taken from the keystore's
+/// cleartext header BEFORE the unlock, so neither a window outside the allowed range nor a
+/// sign_only key costs a biometric; after that the DEK is unwrapped once and the plaintext is
+/// resealed under the token's own KEK. The block is written straight to the terminal and held
+/// there, because the notice line the next frame draws is not somewhere a token can be shown
+/// once and copied reliably.
+fn allow(console: &Console) -> Result<Step, MenuErr> {
+    let name = ask!(pick(
+        &console.rt.live,
+        "Key to allow an agent to read",
+        keystore_names(console)?,
+        Filter::On
+    ));
+    let hours = ask!(nav(CustomType::<u32>::new("Hours the token stays valid")
+        .with_default(DEFAULT_GRANT_HOURS)
+        .prompt()));
+    let now = now_secs()?;
+    read_grant::expiry_at(now, hours)?;
+    let permit = read_keystore(&console.rt.config.store_path().join(&name))?.export_permit()?;
+    let keyring = keyring_of(console)?;
+    let dek = ask!(dek_for(
+        console,
+        &keyring,
+        &format!("Allow \"{name}\" to be read for {hours}h without further approval")
+    ));
+    let granted = read_grant::create(&read_grants_dir(), &name, permit, &dek, now, hours)?;
+    let mut out = std::io::stderr();
+    writeln!(
+        out,
+        "\n{}\n",
+        read_grant::handoff(&granted, console.rt.config.port()).as_str()
+    )?;
+    out.flush()?;
+    ask!(nav(
+        Text::new("Press enter once you have copied the block above").prompt()
+    ));
+    Ok(Step {
+        choice: MenuChoice::Keys,
+        notice: match granted.replaced {
+            true => format!("granted {} (the previous token is dead)", granted.live),
+            false => format!("granted {}", granted.live),
+        },
+    })
+}
+
+fn revoke_grant(console: &Console) -> Result<Step, MenuErr> {
+    let now = now_secs()?;
+    let live = read_grant::list(&read_grants_dir(), &console.rt.config.store_path(), now)?;
+    if live.is_empty() {
+        return Err(MenuErr::NoGrants);
+    }
+    let mut names = Vec::new();
+    for grant in live {
+        names.push(grant.key);
+    }
+    let name = ask!(pick(&console.rt.live, "Grant to revoke", names, Filter::On));
+    read_grant::revoke(&read_grants_dir(), &name)?;
+    Ok(Step {
+        choice: MenuChoice::Keys,
+        notice: format!("revoked the read grant for {name}; its token releases nothing now"),
+    })
+}
+
+fn grants_notice(store: &Path, now: u64) -> Result<String, MenuErr> {
+    let live = read_grant::list(&read_grants_dir(), store, now)?;
+    if live.is_empty() {
+        return Ok("no read grants".to_string());
+    }
+    let mut lines = Vec::new();
+    for grant in live {
+        lines.push(grant.to_string());
+    }
+    Ok(lines.join("\n"))
 }
 
 fn generate(console: &Console) -> Result<Step, MenuErr> {
@@ -904,8 +1006,13 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
                 });
             }
             if let Some(rewind) = doomed.rewind {
-                let question =
-                    rewind_prompt(rewind, doomed.local_only, &doomed.changed, &doomed.removed);
+                let question = rewind_prompt(
+                    rewind,
+                    doomed.local_only,
+                    &doomed.added,
+                    &doomed.changed,
+                    &doomed.removed,
+                );
                 let accepted = ask!(nav(Confirm::new(&question).with_default(false).prompt()));
                 if !accepted {
                     return Ok(Step {
@@ -915,9 +1022,23 @@ fn backup_screen(console: &Console) -> Result<Step, MenuErr> {
                 }
                 doomed.accept_rewind();
             }
+            if !doomed.lost_enrollments.is_empty() {
+                let question = lost_enrollments_prompt(&doomed.lost_enrollments);
+                let accepted = ask!(nav(Confirm::new(&question).with_default(false).prompt()));
+                if !accepted {
+                    return Ok(Step {
+                        choice: MenuChoice::Backup,
+                        notice: "declined; this machine keeps its unlock paths and the store is \
+                                 unchanged"
+                            .to_string(),
+                    });
+                }
+                doomed.accept_lost_enrollments();
+            }
             console.rt.git.pull_apply(&doomed)?;
             format!("pulled vault {vault} from {}", remote.host)
         }
+        BackupAction::Archive => archive_notice(&console.rt.config),
     };
     Ok(Step {
         choice: MenuChoice::Backup,
@@ -980,7 +1101,35 @@ fn pull_report(doomed: &git_store::Doomed, now: u64) -> String {
     if let Some(line) = touched("!!", "REMOVES", &doomed.removed) {
         lines.push(line);
     }
+    if let Some(line) = touched(
+        "!!",
+        "REPLACES OR DELETES, carried by no commit here",
+        &doomed.unrecorded,
+    ) {
+        lines.push(line);
+    }
+    if !doomed.lost_enrollments.is_empty() {
+        lines.push(format!(
+            "  !! STRANDS this machine: the incoming keyring keeps none of its {} enrollment(s): \
+             {}",
+            doomed.lost_enrollments.len(),
+            names(&doomed.lost_enrollments)
+        ));
+    }
     lines.join("\n")
+}
+
+/// The question a pull that keeps none of this machine's enrollments costs. Agreeing to roll a
+/// store back is not agreeing to lose the way into its DEK, so it is asked on its own.
+fn lost_enrollments_prompt(ids: &[String]) -> String {
+    format!(
+        "NO WAY BACK IN: the incoming keyring keeps none of this machine's {} enrollment(s) — {}. \
+         Applying this leaves this machine unable to unwrap its own DEK: no Touch ID and no \
+         recovery passphrase enrolled here opens the store afterwards, and only a passphrase \
+         enrolled in the INCOMING keyring does. Accept losing every unlock path?",
+        ids.len(),
+        names(ids)
+    )
 }
 
 /// The second question a rollback costs, naming the specific loss. A backup host chooses the
@@ -988,6 +1137,7 @@ fn pull_report(doomed: &git_store::Doomed, now: u64) -> String {
 fn rewind_prompt(
     rewind: git_store::Rewind,
     local_only: u64,
+    added: &[String],
     changed: &[String],
     removed: &[String],
 ) -> String {
@@ -1011,6 +1161,17 @@ fn rewind_prompt(
             changed.len(),
             names(changed)
         ),
+        git_store::Rewind::Widens => format!(
+            "GRANTED AUTHORITY: nothing is deleted and no local commit is discarded — the incoming \
+             tip ADDS {} security-relevant file(s) this machine never had — {} — and a \
+             policies/<key>.toml where there was none turns deny-by-default into allow",
+            added.len(),
+            names(added)
+        ),
+        git_store::Rewind::Unrecorded => "NOT IN ANY COMMIT HERE: this store holds key material \
+             no commit on this machine carries, so the reset replaces what the incoming tip has, \
+             the clean deletes the rest, and nothing local can put either back"
+            .to_string(),
     };
     format!(
         "{danger}. Ancestry proves neither who wrote this history nor that it is current, so a \
@@ -1062,6 +1223,7 @@ fn backup_notice(state: &git_store::GitState) -> String {
             "{} {} {}",
             remote.host, remote.folder, remote.relation
         ));
+        lines.push(format!("  {}", guard_line(remote.receive_guards)));
         if let Some(failure) = &remote.last_failure {
             lines.push(format!(
                 "  last failure {:?}: {} {}",
@@ -1072,6 +1234,71 @@ fn backup_notice(state: &git_store::GitState) -> String {
     lines.join("\n")
 }
 
+/// Whether one backup host refuses the push that would destroy it, which is the only guard on
+/// losing ciphertext that nothing on this machine can switch off. Its absence gets the whole
+/// sentence, because a backup silently accepting deletions looks exactly like one that does not.
+fn guard_line(guards: Option<git_store::ReceiveGuards>) -> String {
+    match guards {
+        Some(guards) if guards.enforced() => {
+            "refuses ref deletions and history rewrites".to_string()
+        }
+        Some(guards) => format!(
+            "DOES NOT REFUSE DELETIONS (denyDeletes {}, denyNonFastForwards {}): one push from \
+             this machine can destroy this copy",
+            guards.deny_deletes, guards.deny_non_fast_forwards
+        ),
+        None => "receive settings not read yet; fetch to learn whether it refuses a deletion"
+            .to_string(),
+    }
+}
+
+/// The add-only snapshots on this machine, oldest first, with the newest last where an operator
+/// looking for "the one before the accident" will read it.
+fn archive_notice(config: &Config) -> String {
+    let found = match git_store::archive_list(config) {
+        Ok(found) => found,
+        Err(error) => return format!("could not read the store archive: {error}"),
+    };
+    let mut lines = vec![format!(
+        "{} snapshot(s) of this vault in {}",
+        found.found.len(),
+        found.root.display()
+    )];
+    if found.other_vaults > 0 {
+        lines.push(format!(
+            "{} other install(s) archive here; their snapshots are not listed and not restorable \
+             into this store",
+            found.other_vaults
+        ));
+    }
+    if found.flat > 0 {
+        lines.push(format!(
+            "{} snapshot(s) lie directly in the root, from before it held one subtree per vault",
+            found.flat
+        ));
+    }
+    if found.skipped > 0 {
+        lines.push(format!(
+            "{} entry(s) here are counted rather than listed, so this listing is short; a restore \
+             by digest looks its snapshot up by name and is not affected",
+            found.skipped
+        ));
+    }
+    for archive in &found.found {
+        lines.push(format!(
+            "{}  {} bytes  first archived at {}",
+            archive.digest, archive.bytes, archive.at
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The KEK a new enrollment wraps the DEK under, carrying the enclave key this machine proved.
+enum EnrollWith {
+    Se(ProvenEnclaveKey),
+    Passphrase(PassphraseUnlocker),
+}
+
 fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
     let action = ask!(pick(
         &console.rt.live,
@@ -1079,25 +1306,22 @@ fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
         EnrollAction::ALL.to_vec(),
         Filter::Off
     ));
-    let (kind, default_label, unlocker): (&str, &str, Box<dyn Unlocker>) = match action {
+    let (kind, default_label, with): (&str, &str, EnrollWith) = match action {
         EnrollAction::Back => {
             return Ok(Step {
                 choice: MenuChoice::Back,
                 notice: String::new(),
             })
         }
-        EnrollAction::Se => {
-            ensure_se_key(SE_KEY_LABEL)?;
-            (
-                "secure enclave",
-                "secure-enclave",
-                Box::new(SecureEnclaveUnlocker::new(SE_KEY_LABEL)),
-            )
-        }
+        EnrollAction::Se => (
+            "secure enclave",
+            "secure-enclave",
+            EnrollWith::Se(ensure_se_key(SE_KEY_LABEL)?),
+        ),
         EnrollAction::Passphrase => (
             "recovery passphrase",
             "recovery",
-            Box::new(PassphraseUnlocker::from_secret(ask!(new_passphrase()))),
+            EnrollWith::Passphrase(PassphraseUnlocker::from_secret(ask!(new_passphrase()))),
         ),
     };
     let label = ask!(nav(Text::new("Enrollment label")
@@ -1110,7 +1334,10 @@ fn enroll_screen(console: &Console) -> Result<Step, MenuErr> {
         &keyring,
         "Enroll a new hot_cheese unlock method"
     ));
-    let enrollment = unlocker.enroll(label.trim(), &dek)?;
+    let enrollment = match with {
+        EnrollWith::Se(proven) => enroll_secure_enclave(label.trim(), &dek, &proven)?,
+        EnrollWith::Passphrase(unlocker) => unlocker.enroll(label.trim(), &dek)?,
+    };
     let id = enrollment.id.clone();
     let mut change = String::new();
     if let EnrollParams::SecureEnclave { se_pub, .. } = &enrollment.params {
@@ -1273,13 +1500,6 @@ pub(crate) fn keystore_names(console: &Console) -> Result<Vec<String>, MenuErr> 
     Ok(names)
 }
 
-/// The 16 lowercase hex characters of SHA-256 over a SEC1 enclave public key, the form the
-/// bootstrap ritual and the `/read` prompt already name an enclave key by.
-pub fn se_fingerprint(public_key: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(public_key)[..8])
-}
-
 fn list_notice(console: &Console) -> Result<String, MenuErr> {
     let keyring = keyring_of(console)?;
     let store = console.rt.config.store_path();
@@ -1356,12 +1576,14 @@ mod tests {
     /// question claim both — "discards 0 local commit(s)" over the one danger that was real.
     #[test]
     fn each_rollback_ground_names_the_loss_it_is() {
+        let added = vec!["policies/TREASURY.toml".to_string()];
         let changed = vec!["TREASURY".to_string(), "keyring.json".to_string()];
         let removed = vec!["OPS".to_string()];
-        let backwards = rewind_prompt(git_store::Rewind::Backwards, 3, &changed, &[]);
-        let fork = rewind_prompt(git_store::Rewind::Fork, 3, &changed, &[]);
-        let deletes = rewind_prompt(git_store::Rewind::Deletes, 0, &changed, &removed);
-        let contents = rewind_prompt(git_store::Rewind::Contents, 0, &changed, &[]);
+        let backwards = rewind_prompt(git_store::Rewind::Backwards, 3, &[], &changed, &[]);
+        let fork = rewind_prompt(git_store::Rewind::Fork, 3, &[], &changed, &[]);
+        let deletes = rewind_prompt(git_store::Rewind::Deletes, 0, &[], &changed, &removed);
+        let contents = rewind_prompt(git_store::Rewind::Contents, 0, &[], &changed, &[]);
+        let widens = rewind_prompt(git_store::Rewind::Widens, 0, &added, &[], &[]);
 
         assert!(backwards.contains("discards 3 local commit(s)"));
         assert!(fork.contains("does not contain 3 commit(s)"));
@@ -1369,13 +1591,32 @@ mod tests {
         assert!(contents.contains("REPLACES 2 security-relevant file(s) with older content"));
         assert!(contents.contains("TREASURY, keyring.json"));
         assert!(contents.contains("revive a retired keystore"));
+        assert!(widens.contains("ADDS 1 security-relevant file(s) this machine never had"));
+        assert!(widens.contains("policies/TREASURY.toml"));
+        assert!(widens.contains("turns deny-by-default into allow"));
         assert!(
             !contents.contains("discards 0 local commit(s)"),
             "the shared variant reported the harmless fact as the danger: {contents}"
         );
-        for other in [&backwards, &fork, &deletes] {
+        for other in [&backwards, &fork, &deletes, &widens] {
             assert_ne!(other, &contents);
         }
+    }
+
+    /// The one loss that costs this machine the way into its own DEK was surfaced nowhere: the
+    /// pull report never mentioned it and no question was asked about it, so a rollback answer
+    /// carried it silently. It has to name the enrollments it strands and say what that means.
+    #[test]
+    fn the_pull_names_the_enrollments_it_strands() {
+        let ids = vec!["e_9f2a".to_string(), "e_1c07".to_string()];
+        let question = lost_enrollments_prompt(&ids);
+        assert!(question.contains("e_9f2a") && question.contains("e_1c07"));
+        assert!(question.contains("unable to unwrap its own DEK"));
+        assert_ne!(
+            question,
+            rewind_prompt(git_store::Rewind::Backwards, 1, &[], &[], &[]),
+            "one answer must not stand for both losses"
+        );
     }
 
     /// The strength rule has to refuse at the prompt, where a re-prompt is free — not after

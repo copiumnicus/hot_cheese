@@ -656,12 +656,16 @@ the sheet names the key (`Unlock "<NAME>" for read key`) — do not script or sp
 
 **The daemon refuses nothing on its own.** There is no rate limit and no per-pass prompt cap:
 the loopback listener authenticates nobody, so any budget the daemon spent by itself would
-refuse your own service as readily as an attacker. Prompts are strictly serial, one at a time
-in arrival order, each on screen at least 400 ms before a keystroke counts as its answer, and
-one left unanswered for 60 s auto-denies. `q` at a prompt denies that request, denies the queued
-backlog, and buys 30 s of quiet **from that caller only**. Update any client that treats
-non-200 as retry-forever: a refusal is **403**, a full approval queue (4 deep) is **503** with
-`Retry-After: 1`, and only a genuine failure is **500**.
+refuse your own service as readily as an attacker. What it does instead is order: every place
+on the way to the operator is handed out in arrival order, so a caller that submits without
+stopping cannot get ahead of one already waiting. Prompts are strictly serial, one at a time,
+each on screen at least 400 ms before a keystroke counts as its answer, and one left unanswered
+somewhere between 60 s and 80 s auto-denies — the exact moment is drawn per prompt so the caller
+told its request was refused learns nothing about when your screen next changes. A prompt that
+replaced an unanswered one announces itself and takes only `y<number>`. `q` at a prompt denies
+that request and the queued backlog, and buys no quiet from anything after it. Update any client
+that treats non-200 as retry-forever: a refusal is **403**, a wait for a place in the approval
+line that ran out is **503** with `Retry-After: 1`, and only a genuine failure is **500**.
 
 ## 8. Back up what the store backup does NOT cover
 
@@ -962,11 +966,19 @@ stops. Send it with whatever tooling you already use.
 The enclave key is device-bound and dies with the machine, with the blob file, or with a
 **Touch ID re-enrollment** (the key's ACL is `.biometryCurrentSet`, so adding or removing a
 fingerprint invalidates it). The store is **not** lost: the same DEK is also wrapped under
-your recovery passphrase. Commands fail with an error naming the remedy — e.g.
+your recovery passphrase. Every enclave failure names that remedy — a missing blob, a blob the
+enclave refuses, and a blob this vault cannot prove is its own each carry it:
 
 ```
 command failed error=ApiBackend(Unlock(SeKeyUnavailableTryUnlockPassphrase))
+command failed error=ApiBackend(Unlock(SeKeyUnusableTryUnlockPassphrase { source: BadBlob }))
+command failed error=ApiBackend(Unlock(SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { .. }))
 ```
+
+The last one is the only one that also refuses to point at a re-enrollment: a key is sitting at
+this machine's key path that no enrollment records, and re-enrolling would wrap this vault's DEK
+under it. Compare the fingerprint it prints with the `se_key` of every enrollment `list` shows;
+if it is none of them, `hot_cheese discard-enclave-key se` removes it behind a typed phrase.
 
 The escape hatch is the global `--unlock <se|passphrase>` flag, accepted by every command
 that unlocks the DEK (`address`, `add`, `generate`, `bundle sign`, `seal`, `enroll`, `migrate`),
@@ -1014,7 +1026,9 @@ design. `hot_cheese list` warns when no passphrase is enrolled.
 | Touch ID denied | The biometric prompt for the legacy master was rejected. | Re-run and approve. |
 | `GetPassword(NonzeroStatus(-25300))` | No legacy master under the configured `service`/`account`. | Fix §3 and re-run. |
 | `GetPassword(NonzeroStatus(-128))` | The login-Keychain ACL dialog was cancelled. | Re-run and choose **Allow**. |
-| `Unlock(SeKeyUnavailableTryUnlockPassphrase)` | This machine's Secure Enclave key is missing or unloadable. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
+| `Unlock(SeKeyUnavailableTryUnlockPassphrase)` | This machine's Secure Enclave key blob is missing. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
+| `Unlock(SeKeyUnusableTryUnlockPassphrase { .. })` | The blob is there and the enclave will not use it — a Touch ID re-enrollment alone does this. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
+| `Unlock(SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { .. })` | A key no enrollment records is at this machine's key path. | Re-run with `--unlock passphrase`. Do **not** re-enrol until you have compared the printed fingerprint with `list`; `discard-enclave-key se` removes it if it is not yours. |
 
 In every case the old store is left **byte-for-byte unchanged** and no partial new store
 is produced.

@@ -59,7 +59,7 @@ use hc_core::crypto::envelope::{
 use hc_core::is_valid_key_name;
 use hc_core::keyring::{Keyring, VaultId, KEYRING_FILE};
 use hc_core::mac::secure_enclave;
-use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
+use hc_core::unlock::{enroll_secure_enclave, PassphraseUnlocker, SecureEnclaveUnlocker, Unlocker};
 use hc_sign::policy::{Policy, MAX_POLICY_BYTES};
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;
@@ -1179,6 +1179,7 @@ impl BootstrapSsh {
             .stderr(Stdio::piped());
         let mut watchdog = hc_core::ParentDeathGuard::start().map_err(|_| BootstrapErr::Ssh)?;
         watchdog.configure(&mut command);
+        hc_core::close_inherited_fds_on_exec(&mut command);
         let mut child = command.spawn().map_err(|_| BootstrapErr::Ssh)?;
         let Some(stdin) = child.stdin.take() else {
             kill_child_group(&mut child, &mut watchdog);
@@ -1270,9 +1271,9 @@ pub fn bootstrap_from(target: &str, recovery_passphrase: bool) -> Result<(), Boo
         None
     };
 
-    // B's Secure Enclave key (created idempotently); its public point is the HELLO id.
-    secure_enclave::ensure_se_key(LABEL)?;
-    let b_se_pub = secure_enclave::se_public_key(LABEL)?;
+    // B's Secure Enclave key (created idempotently); its proven public point is the HELLO id.
+    let proven = secure_enclave::ensure_se_key(LABEL)?;
+    let b_se_pub = proven.public_key().to_vec();
     tracing::warn!(
         recipient_key_sha256 = %hex::encode(&Sha256::digest(&b_se_pub)[..8]),
         "bootstrap recipient key; compare this fingerprint with the authority's Touch ID prompt"
@@ -1287,7 +1288,11 @@ pub fn bootstrap_from(target: &str, recovery_passphrase: bool) -> Result<(), Boo
     // Re-wrap under B's own SE and persist BEFORE acknowledging, so we only ACK once
     // the DEK is durably stored on B. The DEK is zeroized when `received` drops.
     match persist(&store, &received, passphrase, |dek| {
-        Ok(SecureEnclaveUnlocker::new(LABEL).enroll("bootstrap (this machine SE)", dek)?)
+        Ok(enroll_secure_enclave(
+            "bootstrap (this machine SE)",
+            dek,
+            &proven,
+        )?)
     }) {
         Ok(()) => {
             write_frame(&mut w, Tag::Ack, &Ack { ok: true })?;

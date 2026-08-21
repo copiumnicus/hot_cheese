@@ -61,10 +61,11 @@ pub enum Bind {
     Unlink,
 }
 
-/// The stale-socket decision, taken under the directory [`claim`] so that the probe it reads
-/// cannot go out of date before the unlink and the bind that act on it. A path that answers
-/// belongs to a live daemon, so this one refuses to start rather than stealing its adapters;
-/// only a refused connect proves the file outlived its process. Nothing else unlinks anything.
+/// The stale-socket decision, taken under the directory's [`crate::flock::Claim`] so that the
+/// probe it reads cannot go out of date before the unlink and the bind that act on it. A path
+/// that answers belongs to a live daemon, so this one refuses to start rather than stealing its
+/// adapters; only a refused connect proves the file outlived its process. Nothing else unlinks
+/// anything.
 pub fn decide(path: &Path, probe: Probe) -> Result<Bind, SocketErr> {
     match probe {
         Probe::Absent => Ok(Bind::Fresh),
@@ -294,8 +295,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Run one of the `#[ignore]`d tests below in a process of its own, and fail with its whole
+    /// output. Spawning a subprocess duplicates every descriptor this process holds until the
+    /// child reaches its `exec`, so a sibling test's `git` keeps a claim file locked and a closed
+    /// listener answering connects for as long as that takes — which is exactly what the two
+    /// tests below assert has stopped happening. A process that spawns nothing has no such window.
+    fn run_alone(test: &str) {
+        let exe = std::env::current_exe().expect("the running test binary has a path");
+        let run = std::process::Command::new(exe)
+            .args(["--exact", "--ignored", "--nocapture", test])
+            .output()
+            .expect("the test binary runs again");
+        assert!(
+            run.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     #[test]
     fn a_non_socket_path_is_never_unlinked_as_stale() {
+        run_alone("socket::tests::a_non_socket_path_is_never_unlinked_as_stale_alone");
+    }
+
+    #[test]
+    #[ignore = "run by a_non_socket_path_is_never_unlinked_as_stale, alone"]
+    fn a_non_socket_path_is_never_unlinked_as_stale_alone() {
         let dir = std::env::temp_dir().join(format!(
             "hot_cheese_socket_type_test_{}",
             std::process::id()
@@ -321,8 +347,16 @@ mod tests {
     /// Claiming a path is one step, so a second bind of a LIVE socket refuses instead of
     /// stealing it, and the first daemon is still the one reachable at that path afterwards.
     /// The file a dead daemon leaves behind stays rebindable, which is the only unlink there is.
+    #[test]
+    fn a_second_bind_refuses_a_live_socket_and_leaves_it_reachable() {
+        run_alone(
+            "socket::tests::a_second_bind_refuses_a_live_socket_and_leaves_it_reachable_alone",
+        );
+    }
+
     #[tokio::test]
-    async fn a_second_bind_refuses_a_live_socket_and_leaves_it_reachable() {
+    #[ignore = "run by a_second_bind_refuses_a_live_socket_and_leaves_it_reachable, alone"]
+    async fn a_second_bind_refuses_a_live_socket_and_leaves_it_reachable_alone() {
         let dir = std::env::temp_dir().join(format!(
             "hot_cheese_socket_claim_test_{}",
             std::process::id()
@@ -331,10 +365,11 @@ mod tests {
         let path = dir.join("adapter.sock");
         let (first, _) = bind_socket(&path).expect("the first bind claims the path");
 
-        assert!(matches!(
-            bind_socket(&path),
-            Err(SocketErr::DaemonAlreadyListening { .. })
-        ));
+        match bind_socket(&path) {
+            Err(SocketErr::DaemonAlreadyListening { .. }) => {}
+            Err(other) => panic!("a live socket must refuse a second bind: {other:?}"),
+            Ok(_) => panic!("a live socket was stolen by a second bind"),
+        }
 
         let client = tokio::net::UnixStream::connect(&path)
             .await

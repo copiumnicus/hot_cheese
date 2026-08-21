@@ -19,13 +19,16 @@ use err_mac::create_err_with_impls;
 use hc_core::is_valid_string_name;
 use serde::Deserialize;
 
+/// The one Safe call that changes nothing but how many signatures the Safe demands.
+pub const CHANGE_THRESHOLD: &str = "changeThreshold(uint256)";
+
 /// The four Safe owner/threshold management calls — the fail-closed rotation set. Compared
 /// against a declared signature's canonical text, so it cannot drift from a selector table.
 pub const OWNER_MGMT: [&str; 4] = [
     "swapOwner(address,address,address)",
     "addOwnerWithThreshold(address,uint256)",
     "removeOwner(address,address,uint256)",
-    "changeThreshold(uint256)",
+    CHANGE_THRESHOLD,
 ];
 
 /// The four Safe module/guard/fallback calls: each hands one address permanent control of the

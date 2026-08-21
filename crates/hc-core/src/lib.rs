@@ -4,6 +4,7 @@ pub mod config;
 pub mod crypto;
 pub mod keyring;
 pub mod mac;
+pub mod read_grant;
 pub mod share;
 pub mod solana;
 pub mod unlock;
@@ -180,6 +181,90 @@ pub fn limit_child_file_size(command: &mut std::process::Command, max: u64) -> s
     Ok(())
 }
 
+/// Descriptors one post-fork listing holds before the exhaustive scan takes over.
+#[cfg(target_vendor = "apple")]
+const LISTED_FDS: usize = 1024;
+
+/// Mark one descriptor close-on-exec, tolerating a number nothing is open on.
+#[cfg(unix)]
+fn set_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `F_SETFD` rewrites one descriptor's flags and nothing else.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Make the child give up every descriptor above stdio at `exec`. Darwin has no `SOCK_CLOEXEC`,
+/// no `accept4` and no `pipe2`, so a listener, an accepted connection and each of std's own pipes
+/// are inheritable for the syscalls between their creation and the `fcntl` that marks them; a
+/// child forked in that window keeps the descriptor for its whole life. Re-marking inside the
+/// child makes the parent's table state at fork time irrelevant. The flag is set rather than the
+/// descriptor closed because std reports a failed `exec` back through a descriptor of its own,
+/// which must stay usable right up to the `exec` that closes it.
+///
+/// The child reads its own descriptor table rather than walking every number up to the file
+/// ceiling, which a shell-inherited `RLIMIT_NOFILE` makes tens of milliseconds long. That walk
+/// stays as the fallback, and all of it sits between `fork` and `exec`, where the child still
+/// holds a copy of every lock and socket this process owns.
+pub fn close_inherited_fds_on_exec(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: `getdtablesize` takes no arguments, changes no process state, and returns the
+        // exclusive upper bound on any descriptor number this process can hold.
+        let ceiling = unsafe { libc::getdtablesize() };
+        let mark_inherited = move || -> std::io::Result<()> {
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut listing = [libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                }; LISTED_FDS];
+                let capacity = libc::c_int::try_from(std::mem::size_of_val(&listing)).unwrap_or(0);
+                // SAFETY: the listing is writable for exactly `capacity` bytes, and a process's
+                // own descriptor table is always readable to it.
+                let filled = unsafe {
+                    libc::proc_pidinfo(
+                        libc::getpid(),
+                        libc::PROC_PIDLISTFDS,
+                        0,
+                        listing.as_mut_ptr().cast(),
+                        capacity,
+                    )
+                };
+                let listed =
+                    usize::try_from(filled).unwrap_or(0) / std::mem::size_of::<libc::proc_fdinfo>();
+                if filled > 0 && filled < capacity {
+                    for entry in &listing[..listed] {
+                        if entry.proc_fd > libc::STDERR_FILENO {
+                            set_close_on_exec(entry.proc_fd)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            for fd in (libc::STDERR_FILENO + 1)..ceiling {
+                set_close_on_exec(fd)?;
+            }
+            Ok(())
+        };
+        // SAFETY: the closure runs after fork and before exec. It captures one integer, keeps its
+        // listing in its own frame, and calls only `getpid`, `proc_pidinfo` and `fcntl` — each an
+        // argument shuffle onto a `svc` trap, so it takes no lock and allocates nothing. An
+        // `std::io::Error` carrying a raw OS error is likewise inline.
+        unsafe {
+            command.pre_exec(mark_inherited);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 /// Run a child while draining both output pipes concurrently and retaining only bounded
 /// buffers. Closing an over-limit pipe also prevents a verbose child from continuing to feed
 /// memory through `Command::output()`'s otherwise-unbounded collector.
@@ -268,6 +353,7 @@ IFS= read -r _terminate || :
             .stderr(Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
+        close_inherited_fds_on_exec(&mut command);
         let mut watcher = command.spawn()?;
         let process_group = match libc::pid_t::try_from(watcher.id()) {
             Ok(process_group) if process_group > 0 => process_group,
@@ -355,6 +441,7 @@ fn output_bounded_inner(
 
     let mut watchdog = ParentDeathGuard::start()?;
     watchdog.configure(command);
+    close_inherited_fds_on_exec(command);
     let process_group = watchdog.process_group_id();
     let mut child = command
         .stdout(Stdio::piped())

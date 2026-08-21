@@ -36,3 +36,4 @@ zeroize.workspace = true
 
 [dev-dependencies]
 hc-core = { workspace = true, features = ["test-util"] }
+hc-daemon = { workspace = true, features = ["test-util"] }

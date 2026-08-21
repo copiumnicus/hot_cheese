@@ -33,3 +33,6 @@ p256.workspace = true
 hex.workspace = true
 tracing.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

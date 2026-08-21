@@ -20,14 +20,13 @@
 //! Every reachable peer is therefore an untrusted writer, and every pull is followed by
 //! [`crate::ingest::Ingest::validate`] before anything reads what arrived.
 use crate::ingest::{
-    Delivered, Ingest, Verdict, MAX_BUNDLE_DIRS, MAX_FILES_PER_BUNDLE, MAX_FILE_BYTES,
+    Delivered, Ingest, Truth, Verdict, MAX_BUNDLE_DIRS, MAX_FILES_PER_BUNDLE, MAX_FILE_BYTES,
     MAX_INGEST_FILES,
 };
 use crate::tailnet::{self, Node, TailnetErr};
 use crate::{Scope, BUNDLE_SUFFIX, SEED_FILE};
 use alloy_primitives::{Address, B256};
 use err_mac::create_err_with_impls;
-use hashbrown::HashSet;
 use hc_core::config::{bundles_dir, validate_ssh_target, BundlePeer, Config};
 use rand::RngCore;
 use std::collections::{BTreeMap, BTreeSet};
@@ -688,11 +687,17 @@ fn each_peer(scope: Scope) -> Report {
 fn locked_validate(
     ingest: &mut Ingest,
     scope: Scope,
-    ours: &HashSet<B256>,
     from: Delivered<'_>,
 ) -> Result<Verdict, SyncErr> {
     let _lock = crate::lock::Lock::take()?;
-    Ok(ingest.validate(scope, ours, from)?)
+    let truth = match Truth::load() {
+        Ok(truth) => truth,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read this machine's own bundle facts; judging nothing");
+            return Err(SyncErr::ValidationUnavailable);
+        }
+    };
+    Ok(ingest.validate(scope, &truth, from)?)
 }
 
 /// Pull `scope` from every enrolled peer, then judge everything that landed. Best-effort in
@@ -717,7 +722,7 @@ pub fn pull(scope: Scope) -> Report {
         Ok(ingest) => ingest,
         Err(error) => return unavailable(peers, error),
     };
-    match locked_validate(&mut ingest, Scope::All, &HashSet::new(), Delivered::Locally) {
+    match locked_validate(&mut ingest, Scope::All, Delivered::Locally) {
         Ok(verdict) => report.verdict = verdict,
         Err(error) => return unavailable(peers, error),
     }
@@ -733,12 +738,7 @@ pub fn pull(scope: Scope) -> Report {
                 Err(error)
             }
         };
-        match locked_validate(
-            &mut ingest,
-            scope,
-            &HashSet::new(),
-            Delivered::By(&peer.host),
-        ) {
+        match locked_validate(&mut ingest, scope, Delivered::By(&peer.host)) {
             Ok(verdict) => absorb_verdict(&mut report.verdict, verdict),
             Err(error) => {
                 tracing::warn!(host = %peer.host, %error, "could not validate what the pull wrote")

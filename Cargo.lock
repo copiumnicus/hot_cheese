@@ -1546,6 +1546,7 @@ dependencies = [
  "rand 0.8.6",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "sha2",
  "subtle",

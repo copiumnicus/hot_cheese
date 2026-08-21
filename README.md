@@ -8,7 +8,9 @@ bound to Touch ID** and/or a **recovery passphrase**. There is **no extractable
 master password** anymore.
 
 Every key read is gated by a **cryptographic** Touch ID step (not a UI prompt you
-could bypass), traffic is protected by **TLS certificate pinning**, and each
+could bypass) — or, for one `shareable` key at a time and only while the operator has
+explicitly issued one, by a time-boxed [read grant](#read-grants) that caches no DEK.
+Traffic is protected by **TLS certificate pinning**, and each
 secret is delivered over a per-request **Diffie-Hellman key exchange** — an
 ephemeral P-256 exchange whose transcript is bound into both the KDF and the AEAD —
 so only the calling client can decrypt it. Because the DEK never touches disk in the
@@ -43,6 +45,7 @@ and policies beside it are not — see [Backups](#backups)), and a new machine c
 6. [CLI Reference](#cli-reference)
 7. [Configuration](#configuration)
 8. [Server Endpoints](#server-endpoints)
+   - [Read grants](#read-grants)
 9. [Signing Adapters](#signing-adapters)
 10. [Safe Bundles: several devices, one transaction](#safe-bundles-several-devices-one-transaction)
 10. [MCP: an agent proposes, you sign](#mcp-an-agent-proposes-you-sign)
@@ -169,7 +172,7 @@ Every key declares at creation whether it may ever leave the daemon:
 
 | Use | `/read` (export) | `/sign`, `address` | Reversible? |
 | --- | --- | --- | --- |
-| `shareable` | released to the client | yes | yes — `seal --use sign-only` tightens it |
+| `shareable` | released to the client, and to a live [read grant](#read-grants) | yes | yes — `seal --use sign-only` tightens it, and ends any live grant with it |
 | `sign_only` (**default**) | **refused, always** | yes | **no, by construction** |
 
 ```bash
@@ -189,6 +192,12 @@ the DEK. A refused export therefore costs **zero** Touch ID prompts.
 it under a looser AAD — exactly the export `sign_only` forbids — so no command does it.
 `hot_cheese seal` refuses with `SealCannotLoosen`; the only route back is a new key
 (`generate --use shareable`) and a rotation.
+
+Tightening a key is also the per-key kill switch for a token somebody already holds. A
+[read grant](#read-grants) seals a **copy** of the key, so the daemon re-reads the keystore's
+cleartext header on every token-authenticated `/read` and releases nothing unless that keystore
+still exists and still declares `shareable`. `seal --use sign-only` and deleting the keystore
+therefore stop a live grant on its next request, and `seal` names each grant that stopped.
 
 `seal` binds an existing keystore, which is how a store written before uses existed (it
 lists as `unsealed`, and an unsealed key cannot be exported) gets its declaration:
@@ -499,10 +508,15 @@ legitimate request refused. What bounds a flood is the operator:
 
 A denied request answers **403**, deliberately not `500` — a client that retries every
 server error would otherwise turn your refusal into a retry loop and starve itself. At
-most **4** privileged operations may be queued behind the one on screen; a fifth is
-refused at once with **503** and `Retry-After: 1` rather than held. A connection that
-opens and produces no request within **2 seconds** is dropped, so a peer cannot hold
-listener slots without asking for anything.
+most **4** privileged operations may be queued behind the one on screen, and at most
+**16** callers per listener may be waiting for a place in that queue; places are handed
+out in **arrival order**, so a caller that submits without stopping can never get ahead
+of one already waiting, and a caller is answered **503** with `Retry-After: 1` only after
+waiting longer than two whole prompts without a place coming free. Both places are held
+by the caller's own connection, so a caller that stops waiting for its answer stops
+holding them, and the request it left behind is dropped without ever being shown to you.
+A connection that opens and produces no request within **2 seconds** is dropped, so a
+peer cannot hold listener slots without asking for anything.
 
 ---
 
@@ -519,7 +533,10 @@ listener slots without asking for anything.
 | `address <evm\|solana> <name>` | Print the public address / pubkey of a stored key. |
 | `list` | List stored keystores (with each one's use) and keyring enrollments, each Secure Enclave enrollment carrying its `se_key=<16 hex>` fingerprint. Prompts nothing. |
 | `adapters` | Show every trusted adapter: manifest path, pinned vs computed hash, socket path, and the policy-intersection verdict `serve` will act on. Prompts nothing, unlocks nothing. |
-| `seal [<name>\|--all] [--use <shareable\|sign-only>]` | Bind a key's use into its envelope. Tightens only; `--all` binds just the still-unsealed keys. One unlock for the whole batch. |
+| `seal [<name>\|--all] [--use <shareable\|sign-only>]` | Bind a key's use into its envelope. Tightens only; `--all` binds just the still-unsealed keys. One unlock for the whole batch. Names every read grant that stops releasing as a result. |
+| `read-grant allow <name> [--hours <n>]` | Reseal one **shareable** key under a fresh 256-bit token so an agent can pull it over `/read` with **no Touch ID** until it expires (default 48h, max 8760). Costs exactly one Touch ID now. Prints the token **once** with a block to hand the agent; nothing stores it, so it can never be shown again. A window outside `1..=8760` is refused while the argument is parsed, and a `sign_only` key from its cleartext header **before** anything unlocks, so neither costs a biometric. Re-running rotates the token and kills the previous one. |
+| `read-grant list` | Every grant still in force, with its expiry, the time it has left, and whether the key it names would still be released — a grant whose key was sealed `sign_only` or deleted lists as **DEAD**. Expired ones are deleted as they are read, unless the clock has moved further past the expiry than the grant's whole window, which is treated as a clock to refuse on rather than destroy grants on. No claim, no unlock, no prompt — it runs while the console holds the store. |
+| `read-grant revoke <name>` | Delete one grant now, so the token an agent holds releases nothing on its next request. No claim, no unlock, no prompt. |
 | `bundle new [--file <json>]` | Start a bundle from a JSON intent; the threshold comes from `bundles/safes.toml`. Refuses a Safe that file does not describe. Prompts nothing. **Pushes.** |
 | `bundle sign <hash> --key <name>` | Sign the bundle with a local key and file the signature under this device's signer address. The **only** bundle verb that prompts, and the only human signing verb there is: policy-checked, grant-gated, one Touch ID. Needs `enroll grant`. **Pulls, then pushes.** |
 | `bundle status <hash>` | Merged view: signatures collected vs threshold, which owners are still missing, rivals, packed length, age. Prompts nothing. **Pulls.** |
@@ -541,6 +558,7 @@ listener slots without asking for anything.
 | `backup pull --force [--vault <id>] [--confirm-rewind <phrase>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. A pull that is **not** a purely additive fast-forward — one that forks, rewinds onto an ancestor, deletes store files, or replaces store files with older content — additionally requires the phrase `roll this store back`. |
 | `backup list` | List the vaults sharing the first remote's folder, flagging this install's. Prompts nothing. |
 | `accept-deletions [--confirm-deletion <phrase>]` | Record store files or enrollments that are **already gone**, which every other command refuses to commit. Names each one, then requires the phrase `record the loss of these hot_cheese files` typed back — `--confirm-deletion` carries it where there is no terminal. CLI-only, and the only way out of a store wedged by a missing file. |
+| `discard-enclave-key <se\|grant> [--confirm-discard <phrase>]` | Remove an enclave key blob squatting this machine's key path, which otherwise blocks the Secure Enclave path for good. Prints the path, the squatter's fingerprint and every fingerprint this install records, then requires the phrase `discard this unrecorded hot_cheese enclave key` typed back — `--confirm-discard` carries it where there is no terminal. **Refuses outright** to touch a key this install DOES record. |
 | `migrate --old-store <dir> --new-store <dir> [--shareable <name>]…` | Migrate legacy Keychain-master keystores into the envelope format. Everything not named `--shareable` lands `sign_only` (see [MIGRATION.md](./MIGRATION.md)). |
 | `bootstrap-from <user@host> [--recovery-passphrase]` | Bootstrap this machine's DEK + store from an authority machine over SSH. Enrolls this machine's Secure Enclave only, unless `--recovery-passphrase` also enrolls a recovery passphrase read from a masked prompt (or from stdin with no terminal). |
 
@@ -549,8 +567,10 @@ which enrolled KEK unwraps the DEK. Omit it and nothing changes — the Secure E
 whenever an SE enrollment exists, otherwise you are prompted for a passphrase. Pass
 `--unlock passphrase` to reach the recovery enrollment while an SE enrollment exists; that is
 the escape hatch when this machine's enclave key is lost or was invalidated by a Touch ID
-re-enrollment (the failure names it: `SeKeyUnavailableTryUnlockPassphrase`). There is no
-silent fallback. `serve` refuses `--unlock passphrase`, because a daemon holding a passphrase
+re-enrollment, and **every** enclave failure names it — `SeKeyUnavailableTryUnlockPassphrase`
+when the blob is gone, `SeKeyUnusableTryUnlockPassphrase` when the enclave refuses the blob it
+has, `SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll` when a key is there that this
+vault cannot prove is its own. There is no silent fallback. `serve` refuses `--unlock passphrase`, because a daemon holding a passphrase
 unlocker would answer every request from one startup prompt and lose the per-request human
 approval — recover, `enroll se` again, then serve.
 
@@ -573,6 +593,7 @@ store = "~/.config/hot_cheese/store"
 port = 5555
 grant_public_key = "04…"
 bundle_watch_secs = 30
+approval_timeout_secs = 60
 
 [mcp]
 max_pending = 16
@@ -624,6 +645,7 @@ name = "Vendor payouts"
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
 | `bundle_watch_secs` | Seconds between ticks of the background bundle poller a session runs (optional; defaults to `30`, floored at `5`). The name is kept so an existing `config.toml` is not silently ignored. |
 | `backup_fetch_secs` | Seconds a session waits between backup fetches (optional; defaults to `300`). `0` disables the timer, leaving pushes-after-mutation and the manual verbs; re-enabling it takes a restart. |
+| `approval_timeout_secs` | Seconds one approval prompt waits for an answer before it denies itself (optional; defaults to `60`, accepted range `5`–`600`, refused at config load outside it as `InvalidApprovalTimeout`). A prompt additionally waits a random extra up to a third of this, drawn afresh for each one, so the caller told the instant its request was refused learns nothing about when the screen next changes. A caller waiting for a place in the approval line is told to come back after twice this. |
 | `mcp.max_pending` | Unsigned bundles the MCP proposal server may leave waiting before it refuses to file another (optional; defaults to `16`). The queue is read by a human, so it is bounded by what a human will read. See [MCP](#mcp-an-agent-proposes-you-sign). |
 | `mcp.keys` | Allow-list of keystore names the agent may propose against (optional). **Absent or empty is every key in the store**, which is what an install that never states this gets. |
 | `mcp.safes` | Allow-list of Safe addresses the agent may propose against (optional). **Absent or empty is every Safe `bundles/safes.toml` describes.** |
@@ -646,8 +668,12 @@ rebuild.
 All endpoints are served over pinned HTTPS on loopback. Every endpoint but `/health`
 is a privileged operation: it is printed on the daemon's terminal and answered `y`
 by the operator, and then prompts for **Touch ID** (when a Secure Enclave enrollment
-is in use). Names must match `[A-Za-z0-9_]+`. A request the operator **refuses** answers
-`403 FORBIDDEN`; one that arrives with the approval queue already full answers
+is in use). The one exception is a `/read` carrying a read-grant token the operator
+issued for that key — see [Read grants](#read-grants). A prompt that replaced one you never answered says so and is answerable
+only by `y<number>` carrying that request's own number, so a keystroke you were
+composing for the request that vanished can never approve the one that took its place.
+Names must match `[A-Za-z0-9_]+`. A request the operator **refuses** answers
+`403 FORBIDDEN`; one whose wait for a place in the approval line ran out answers
 `503 SERVICE_UNAVAILABLE` with `Retry-After: 1`; every other failure is
 `500 INTERNAL_SERVER_ERROR`.
 
@@ -683,6 +709,53 @@ The table above is the **loopback** surface. An adapter's own unix socket routes
 `/sign/<name>` and nothing else — `/read` and every generate/address route are not in its
 table at all, so an adapter cannot reach them by construction, not by a check that could
 regress. See [Signing Adapters](#signing-adapters).
+
+### Read grants
+
+An agent on another machine that restarts a service needs one key, repeatedly, and cannot
+put a finger on your Mac. `hot_cheese read-grant allow <name> --hours 48` costs **one**
+Touch ID and mints a random 256-bit token, rendered base58 and printed once:
+
+- The token **is** the key material. An HKDF-SHA256 KEK derived from it seals that one key's
+  plaintext into `<home>/read-grants/<name>` (file `0600`, directory `0700`). The token is
+  written nowhere, so the file alone is inert and nothing can show the token a second time.
+- The AAD binds a domain separator, the key name and the window, so a grant file moved to
+  another name, or given a later expiry on disk, stops opening rather than covering more.
+- Only an **export permit** mints one, which exists only for a key sealed `shareable`. A
+  `sign_only` key is refused from its cleartext header before any unlock, so a wrong key
+  costs no biometric.
+- A grant holds a **copy**, so the daemon re-reads that keystore's cleartext header on every
+  release — no DEK, no enclave, no prompt — and refuses unless the key is still there and
+  still shareable. `seal --use sign-only` and deleting the keystore end a live grant; the
+  refusal is the same `403` a junk token gets, so it is not a way to probe what the store
+  holds. `read-grant list` marks such a grant **DEAD**.
+- Grants live under the **home dir, never the store**: the store is a git repository that
+  replicates to every backup remote, and a live credential must not reach a backup. Its path
+  grammar (`keyring.json`, `<KEY>`, `policies/<KEY>.toml`) would refuse the directory anyway.
+
+The agent presents it as `x-hot-cheese-read-grant: <token>` on `POST /read/<name>` — and on
+no other route: a token offered on `/sign`, on `/health`, on an unknown path, or on an
+adapter socket is `403` rather than ignored. `HOT_CHEESE_READ_GRANT` makes the reference
+client in `crates/hc-daemon/examples/pin_cert.rs` send it for you.
+
+At serve time the DEK is **never unwrapped and the enclave is never called**: the token's own
+KEK opens the sealed key on the connection task, which never reaches the thread that owns
+Touch ID. The answer still goes back through the same per-request ECDH layer, so the key is
+sealed to that caller and nobody else. A wrong, expired or absent grant, and one whose key is
+no longer shareable, all end in the same refusal — one `403`, one empty body, nothing to
+distinguish and nothing to time — and it costs **no approval**, so junk tokens can never be
+sprayed into prompts on your screen. Every token-authenticated release is logged at `warn` with
+the key, the time and the caller's ephemeral-key fingerprint; the token itself is never logged
+at any level. That line is deferred while an approval prompt is on your screen, like every
+other line an unauthenticated peer can cause — a token holder must not be able to scroll the
+request you are answering away — and the count, the window it covers and the rate it implies
+are reported the moment the prompt is answered, so the record survives the deferral. An expired
+grant is refused, and its file deleted unless the clock has moved further past the expiry than
+the grant's whole window: a clock that jumped is a reason to refuse, not to destroy grants.
+
+This is deliberately narrower than `serve --unlock passphrase`, which stays refused: no DEK is
+cached, so the blast radius of a grant is exactly the one `shareable` key it names, for exactly
+as long as it lasts, rather than every key for the daemon's lifetime.
 
 ### `/sign` and the per-payload grant
 
@@ -1620,6 +1693,16 @@ and reports only `len=`, `digest=`, and `evm_address=`. The digest is salted per
 truncated, so it is not a usable offline commitment to the secret. It never prints key
 bytes and zeroizes the recovered secret.
 
+Set `HOT_CHEESE_READ_GRANT` to a token from `hot_cheese read-grant allow <name>` and the same
+client sends it as `x-hot-cheese-read-grant`, so the read costs the owner nothing at all until
+the grant expires. That is the only path on which a `/read` does not prompt — see
+[Read grants](#read-grants):
+
+```bash
+export HOT_CHEESE_READ_GRANT=<the token printed once by read-grant allow>
+cargo run --release --example pin_cert -- https://localhost:5555 TRADING_BOT
+```
+
 Note that `curl --cacert` is **not** an equivalent test on macOS: the system curl uses the
 SecureTransport backend, which treats `--cacert` as an *additional* anchor on top of the
 system trust store. Use it for liveness (`/health`), and this client for pinning.
@@ -2048,7 +2131,9 @@ Specific residual risks:
   own: it is taken as this machine's key only when its public point is **already
   recorded** — `se_pub` in a `keyring.json` enrollment for the KEK, `grant_public_key` in
   `config.toml` for the grant key — and an unrecorded blob is refused outright
-  (`UnrecordedEnclaveKey`). That closes the path where a same-uid process planted a
+  (`UnrecordedEnclaveKeyRunDiscardEnclaveKey`, which names the squatter's fingerprint next
+  to every fingerprint this install records, and points at `discard-enclave-key`). That
+  closes the path where a same-uid process planted a
   **non-biometric** enclave key and the next enrollment adopted it as the KEK, after
   which the DEK unwrapped with no biometric at all. What remains: `keyring.json` is plain
   JSON with no integrity tag, so a same-uid attacker who plants **both** a non-biometric
@@ -2085,6 +2170,20 @@ Specific residual risks:
   present human approving Touch ID, can solicit a **shareable** key. Touch ID gives
   human-presence, not caller identity. Marking a key `sign_only` is what removes it from
   that exposure entirely, and is the reason `sign_only` is the default.
+- **A [read grant](#read-grants) is a bearer token, and it replaces the human for its
+  window.** Anyone holding one can pull that one `shareable` key over `/read` until it
+  expires, with no biometric and nothing on your screen — that is what you asked for when
+  you issued it. Its blast radius is bounded on purpose: one named key, one route, one
+  expiry, no cached DEK, and no reach into `/sign` or any other key. What replaces the human
+  is the audit trail, so read the `warn` lines naming the key, the time and the caller's
+  ephemeral-key fingerprint — and the deferred-line report that stands in for them while you
+  are at an approval prompt. Treat the token like the key itself: it is 256 bits of CSPRNG
+  and there is no rate limit, so guessing it is not the threat — pasting it somewhere it
+  outlives its purpose is. `read-grant revoke` ends one immediately, re-running
+  `read-grant allow` rotates the token, which silently kills whatever was holding the old
+  one, and `seal --use sign-only` (or deleting the keystore) ends it as the per-key kill
+  switch, because every release re-reads that key's live header. This is deliberately narrower than `serve --unlock passphrase`, which stays refused:
+  that would drop the biometric for **every** key for the daemon's whole lifetime.
 - **No anti-rollback.** Keystore files bind AEAD AAD = domain ‖ key name ‖ use (a
   wrong-DEK, renamed, or re-flagged file won't decrypt), but **version/epoch
   anti-rollback is not implemented**. An attacker who can write **old ciphertexts (under
@@ -2155,13 +2254,20 @@ restore. Keep the passphrase offline and enroll more than one unlock method.
 
 **What if I re-enroll Touch ID, or get a new Mac?**
 Secure Enclave keys are device-bound and are invalidated when Touch ID is
-re-enrolled — that SE enrollment stops working, and commands fail with
-`SeKeyUnavailableTryUnlockPassphrase`. Recover with the **recovery passphrase**:
+re-enrolled — that SE enrollment stops working. The blob is still on disk, so the
+failure is `SeKeyUnusableTryUnlockPassphrase` (or `SeKeyUnavailableTryUnlockPassphrase`
+if the blob is gone too). Your keys are untouched. Recover with the **recovery
+passphrase**:
 
 ```bash
 rm ~/.config/hot_cheese/se_kek_hotcheese_se_kek_v1.blob   # only if the blob is stale
 hot_cheese --unlock passphrase enroll se                  # re-bind a fresh enclave key
 ```
+
+That `rm` is for **your own** stale key, the one whose fingerprint `list` shows. If the key at
+that path is one this install never recorded — the failure says so, and prints its fingerprint
+next to the recorded ones — do not `rm` it blind: `hot_cheese discard-enclave-key se` removes
+exactly that case behind a typed phrase, and refuses a key this install records.
 
 Any command takes `--unlock passphrase` in the meantime. To move to a new Mac, use
 [`bootstrap-from`](#ssh-bootstrap) (which carries the vault id, so both machines keep

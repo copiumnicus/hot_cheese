@@ -620,12 +620,13 @@ fn judge(intent: &SafeTxIntent, config: &Config) -> (Verdict, SummaryView) {
 /// and ceilings this surface does not publish — so it goes to the local log and never into the
 /// answer the caller reads. The body is the agent's own transaction decoded back at it.
 fn body_for_agent(intent: &SafeTxIntent, summary: &hc_sign::adapter::Summary) -> String {
-    if !summary.alarms.is_empty() {
+    let alarms = summary.alarms();
+    if !alarms.is_empty() {
         tracing::warn!(
             key = %hc_core::safe_diagnostic_text(&intent.key),
             safe = %intent.safe,
             nonce = %intent.nonce,
-            alarms = %hc_core::safe_diagnostic_text(&summary.alarms.join(" \u{2016} ")),
+            alarms = %hc_core::safe_diagnostic_text(&alarms.join(" \u{2016} ")),
             "an agent's transfer raised alarms; they are the operator's to read, not the agent's"
         );
     }

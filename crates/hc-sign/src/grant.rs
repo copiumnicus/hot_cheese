@@ -21,7 +21,6 @@ use hc_core::mac::local_auth::LaContext;
 use hc_core::mac::secure_enclave::{grant_sign, SE_GRANT_KEY_LABEL};
 use p256::ecdsa::signature::Verifier;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 create_err_with_impls!(
     #[derive(Debug)]
@@ -47,8 +46,8 @@ const SEP: u8 = 0x00;
 /// Signatures one grant authorizes. It is 1, and the move into `sign` is what enforces it.
 const MAX_SIGNATURES: u8 = 1;
 
-/// How long a minted grant stays verifiable. It is minted and consumed inside one call, so
-/// this bounds the window between [`mint`] and [`verify`], not a human's deliberation.
+/// How long a minted grant stays verifiable. It is stamped after the approval and consumed in
+/// the next statement, so this bounds the window between [`mint`] and [`verify`], never a human.
 pub const GRANT_TTL_MS: u64 = 5_000;
 
 /// Which intent shape produced the digest a grant covers. An adapter manifest names the same
@@ -69,7 +68,7 @@ impl IntentKind {
     }
 }
 
-/// The exact terms of ONE signature. The grant's identity IS `SHA-256(canonical_bytes)`.
+/// The exact terms of ONE signature, and the only thing the enclave ever signs as a grant.
 pub struct GrantTerms {
     /// Keystore the signature is for.
     pub key_name: String,
@@ -110,12 +109,6 @@ impl GrantTerms {
         out.push(MAX_SIGNATURES);
         out
     }
-
-    /// The grant's identity: SHA-256 of the canonical encoding, so one value states every term
-    /// the enclave signed and a caller can re-assert all of them at once.
-    pub fn digest(&self) -> B256 {
-        B256::from_slice(&Sha256::digest(self.canonical_bytes()))
-    }
 }
 
 /// Minted terms and the enclave's raw `r || s` over their canonical bytes.
@@ -141,35 +134,29 @@ impl SignGrant {
     pub fn intent_digest(&self) -> B256 {
         self.terms.intent_digest
     }
-    /// [`GrantTerms::digest`] of the terms the enclave signature covered: keystore, intent
-    /// digest, policy digest, manifest digest, kind, nonce and expiry together.
-    pub fn terms_digest(&self) -> B256 {
-        self.terms.digest()
-    }
 }
 
-/// Sign `terms` with the Secure Enclave grant key. `auth` is the context the approval
-/// already evaluated, so the enclave signature costs no second prompt. A session that
-/// approved without one — the recovery-passphrase gate, whose unlocker ignores `auth` —
-/// takes its own biometric here instead of refusing to sign; that is the only path that
-/// shows a second sheet, and a machine with no usable biometric fails closed with
-/// [`hc_core::mac::secure_enclave::SeErr::TouchIdDenied`].
-pub fn mint(terms: GrantTerms, auth: Option<&LaContext>) -> Result<Signed, GrantErr> {
+/// What the sheet says one grant is for: the keystore and the intent digest it covers. The
+/// caller takes the biometric with this text when it holds no evaluated context, so the human
+/// reads the same words wherever the sheet came from.
+pub fn reason(key_name: &str, intent_digest: B256) -> String {
+    format!("Approve one hot_cheese signature for \"{key_name}\" (intent {intent_digest})")
+}
+
+/// Sign `terms` with the Secure Enclave grant key under the context the human already
+/// satisfied, so the enclave signature costs no second prompt. `terms` carries the expiry
+/// [`verify`] enforces, and it is stamped after that human interaction rather than before it,
+/// so [`GRANT_TTL_MS`] bounds this call and not a person.
+pub fn mint(terms: GrantTerms, auth: &LaContext) -> Result<Signed, GrantErr> {
     if !is_valid_key_name(&terms.key_name) {
         return Err(GrantErr::InvalidName);
     }
-    let reason = format!(
-        "Approve one hot_cheese signature for \"{}\" (intent {})",
-        terms.key_name, terms.intent_digest
-    );
-    let msg = terms.canonical_bytes();
-    let signature = match auth {
-        Some(auth) => grant_sign(SE_GRANT_KEY_LABEL, &msg, Some(auth), &reason)?,
-        None => {
-            let own = LaContext::evaluate_biometric(&reason)?;
-            grant_sign(SE_GRANT_KEY_LABEL, &msg, Some(&own), &reason)?
-        }
-    };
+    let signature = grant_sign(
+        SE_GRANT_KEY_LABEL,
+        &terms.canonical_bytes(),
+        Some(auth),
+        &reason(&terms.key_name, terms.intent_digest),
+    )?;
     Ok(Signed { terms, signature })
 }
 
@@ -266,9 +253,7 @@ mod tests {
 
     /// A grant is only proof if it verifies for the terms that were signed and nothing else:
     /// a signature lifted onto other terms, or one whose expiry has passed, must be refused
-    /// before any `SignGrant` exists. What survives verification carries the WHOLE of what was
-    /// signed, so the policy digest, the manifest digest, the kind, the nonce and the expiry are
-    /// re-assertable where the key is reached and not just the two terms signing reads.
+    /// before any `SignGrant` exists.
     #[test]
     fn verify_refuses_lifted_signatures_and_expired_terms() {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
@@ -286,10 +271,6 @@ mod tests {
         .expect("a fresh grant over its own terms verifies");
         assert_eq!(granted.key_name(), "TRADER");
         assert_eq!(granted.intent_digest(), B256::from([0x11u8; 32]));
-        assert_eq!(granted.terms_digest(), terms().digest());
-        let mut other_policy = terms();
-        other_policy.policy_digest = B256::from([0x99u8; 32]);
-        assert_ne!(granted.terms_digest(), other_policy.digest());
 
         let mut other = terms();
         other.intent_digest = B256::from([0x99u8; 32]);

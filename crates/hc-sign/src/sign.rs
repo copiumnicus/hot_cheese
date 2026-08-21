@@ -125,9 +125,11 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 /// value: the signing path never returns to the filesystem, so a same-uid writer replacing
 /// `<store>/<KEY>` during the human's deliberation cannot change which key signs. `auth` is the
 /// context the approval already evaluated, so neither the enclave grant signature nor the DEK
-/// unwrap shows a second sheet. The verified grant carries every term the enclave signed, and all
-/// of them are re-asserted here — as one [`GrantTerms::digest`] — before the key is reachable, so
-/// what signs is what was approved and not merely a grant for the same keystore and payload.
+/// unwrap shows a second sheet. A session that approved without one — the recovery-passphrase
+/// gate, whose unlocker ignores `auth` — takes its own biometric HERE, before the terms are
+/// stamped, so the grant's few seconds of life start when the finger lands rather than before it;
+/// a machine with no usable biometric fails closed with
+/// [`hc_core::mac::secure_enclave::SeErr::TouchIdDenied`].
 pub fn finish(
     approved: Approved,
     container: Zeroizing<Vec<u8>>,
@@ -136,6 +138,14 @@ pub fn finish(
     auth: Option<&LaContext>,
     reason: &str,
 ) -> Result<SignResponse, SignErr> {
+    let own;
+    let granting = match auth {
+        Some(auth) => auth,
+        None => {
+            own = LaContext::evaluate_biometric(&grant::reason(&approved.key, approved.digest))?;
+            &own
+        }
+    };
     let mut nonce = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let terms = GrantTerms {
@@ -149,15 +159,8 @@ pub fn finish(
             .checked_add(grant::GRANT_TTL_MS)
             .ok_or(grant::GrantErr::ClockOverflow)?,
     };
-    let asked = terms.digest();
-    let signed = grant::mint(terms, auth)?;
+    let signed = grant::mint(terms, granting)?;
     let granted = grant::verify(signed, pinned_grant_pub, grant::now_ms()?)?;
-    if granted.terms_digest() != asked {
-        return Err(SignErr::GrantTermsMismatch {
-            approved: asked,
-            granted: granted.terms_digest(),
-        });
-    }
     let sig = sign_with_grant(backend, &approved.key, container, reason, auth, granted)?;
 
     let mut raw = Vec::with_capacity(65);
@@ -175,8 +178,9 @@ pub fn finish(
 /// arrive BY VALUE: the grant covers exactly one signature and carries the digest, so nothing but
 /// the approved payload can be signed, and the container is the bytes the caller validated before
 /// the approval, so this reads no file and there is nothing for a concurrent writer to swap.
-/// Unlocks the DEK (reusing the pre-evaluated `auth` context so no second prompt), decrypts the
-/// key in memory, signs, verifies the signature recovers to the signer, then zeroizes both.
+/// Parses the container first, so a malformed one is refused before any DEK is unwrapped, then
+/// unlocks (reusing the pre-evaluated `auth` context so no second prompt), decrypts the key in
+/// memory, signs, verifies the signature recovers to the signer, then zeroizes both.
 pub fn sign_with_grant(
     backend: &dyn BackendImpl,
     key: &str,
@@ -196,8 +200,9 @@ pub fn sign_with_grant(
         });
     }
     let digest = grant.intent_digest();
+    let keystore = parse_keystore(&container)?;
     let dek = backend.unlock_dek(reason, auth)?;
-    let secret = parse_keystore(&container)?.open(key, &dek)?;
+    let secret = keystore.open(key, &dek)?;
     let sk = SigningKey::from_slice(&secret)?;
     let (sig, recid) = sk.sign_prehash_recoverable(digest.as_slice())?;
     let recovered = VerifyingKey::recover_from_prehash(digest.as_slice(), &sig, recid)?;

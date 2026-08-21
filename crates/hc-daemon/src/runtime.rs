@@ -8,7 +8,7 @@
 use crate::approval::Approver;
 use crate::bundle_poll::{BundlePoll, PollThread};
 use crate::git_store::GitStore;
-use crate::renderer::{Decision, Renderer};
+use crate::renderer::{peer_may_log, Decision, Renderer};
 use crate::{
     bundle_poll, exposure, flock, git_store, live, socket, HotApi, Listener, OpErr, Peer,
     PrivilegedOp, PENDING_OPS,
@@ -148,13 +148,17 @@ fn refuse_queued(ops: &mut mpsc::Receiver<PrivilegedOp>) -> usize {
 /// Put `woke` and everything queued behind it in front of the operator, one at a time and in
 /// arrival order, and report how many they were shown.
 ///
-/// A queued op on a serving daemon is a live client waiting for an answer, so none of them is
-/// swept: the interactive console caps a drain because its operator is working through a backlog,
-/// but here a cap would deny a service that just asked for four keys at once, and — since nothing
-/// on the loopback listener distinguishes that service from a flood — it would hand an attacker
-/// the power to have everybody refused. The one unprompted refusal left is the operator escaping
-/// a prompt, which is them asking for it — and it is read off the op that was just refused, so a
-/// request the approver never saw can never inherit an older answer.
+/// A queued op on a serving daemon is a live client waiting for an answer, so this loop sweeps
+/// none of them: the interactive console caps a drain because its operator is working through a
+/// backlog, but here a cap would deny a service that just asked for four keys at once, and —
+/// since nothing on the loopback listener distinguishes that service from a flood — it would hand
+/// an attacker the power to have everybody refused. The unprompted refusal this loop can reach is
+/// the operator escaping a prompt, which is them asking for it, and it is read off the op that
+/// was just refused, so a request the approver never saw can never inherit an older answer.
+///
+/// Every receive on `ops` releases one place in the approval line, and places are handed out in
+/// arrival order, so a caller that has been waiting is admitted here before any request submitted
+/// after it. That is the whole of what keeps a continuous submitter off the operator's screen.
 fn answer_queued(
     api: &HotApi,
     approver: &Approver,
@@ -183,6 +187,16 @@ fn answer_queued(
 
 /// Run one queued request on the thread that owns the runtime and answer its reply channel
 /// exactly once. Both renderers' loops come through here, so a caller is never left hanging.
+///
+/// A closed reply channel is a caller that stopped waiting, and it is checked BEFORE the request
+/// reaches the operator: the whole authorization mechanism is a human answering a prompt, so a
+/// request nobody would receive the answer to must never spend one. What makes that check real is
+/// that the connection ends when the caller does, which is why half-closed connections are refused
+/// where the daemon serves them.
+///
+/// Every line here is one an unauthenticated peer can produce at will — by disconnecting, or by
+/// sending a body that fails — so every one of them is gated on [`peer_may_log`] whatever its
+/// level. A peer that can write to the screen a prompt is on can scroll the request away.
 pub fn service_one(api: &HotApi, approver: &Approver, op: PrivilegedOp) -> Outcome {
     let PrivilegedOp {
         ctx,
@@ -191,7 +205,9 @@ pub fn service_one(api: &HotApi, approver: &Approver, op: PrivilegedOp) -> Outco
         outstanding: _outstanding,
     } = op;
     if reply.is_closed() {
-        tracing::debug!(key = %ctx.key, "skipping an operation whose caller disconnected");
+        if peer_may_log("caller_gone") {
+            tracing::debug!(key = %ctx.key, "skipping an operation whose caller disconnected");
+        }
         return Outcome::Failed;
     }
     let result = crate::execute(api, approver, &ctx, &body);
@@ -199,11 +215,13 @@ pub fn service_one(api: &HotApi, approver: &Approver, op: PrivilegedOp) -> Outco
         Ok(_) => Outcome::Approved,
         Err(OpErr::Denied | OpErr::Sign(SignErr::ApprovalDenied)) => Outcome::Denied,
         Err(e) => {
-            tracing::error!(error = ?e, key = %ctx.key, "operation failed");
+            if peer_may_log("operation_failed") {
+                tracing::error!(error = ?e, key = %ctx.key, "operation failed");
+            }
             Outcome::Failed
         }
     };
-    if reply.send(result).is_err() {
+    if reply.send(result).is_err() && peer_may_log("answer_undelivered") {
         tracing::warn!(key = %ctx.key, "caller disconnected before its answer");
     }
     outcome
@@ -294,11 +312,14 @@ impl Runtime {
                 }
                 let (tx, ops) = mpsc::channel(PENDING_OPS);
                 let (shutdown, rx) = watch::channel(false);
+                let paths = crate::GrantPaths::of(&config);
+                let prompt = config.approval_timeout();
                 sockets = socket::AdapterSockets::bind(adapters)?;
                 for (adapter, bound) in sockets.bound.drain(..) {
                     let tx = tx.clone();
                     let queued = pending.clone();
                     let rx = rx.clone();
+                    let paths = paths.clone();
                     tokio.spawn(async move {
                         let id = adapter.manifest.id.clone();
                         let listener = Listener::Unix(bound);
@@ -306,7 +327,9 @@ impl Runtime {
                             manifest: adapter,
                             cred: None,
                         };
-                        if let Err(e) = crate::serve_loop(listener, peer, tx, queued, rx).await {
+                        if let Err(e) =
+                            crate::serve_loop(listener, peer, paths, tx, queued, rx, prompt).await
+                        {
                             tracing::error!(adapter = %id, error = ?e, "adapter listener exited");
                         }
                     });
@@ -315,7 +338,8 @@ impl Runtime {
                 tokio.spawn(async move {
                     let listener = Listener::Tcp(listener, tls);
                     if let Err(e) =
-                        crate::serve_loop(listener, Peer::Loopback, tx, queued, rx).await
+                        crate::serve_loop(listener, Peer::Loopback, paths, tx, queued, rx, prompt)
+                            .await
                     {
                         tracing::error!(error = ?e, "loopback listener exited");
                     }

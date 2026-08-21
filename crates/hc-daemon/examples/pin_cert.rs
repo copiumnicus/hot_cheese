@@ -1,10 +1,12 @@
 //! Reference pinned client: `cargo run --release --example pin_cert -- <base_url> <key_name>`.
 //!
-//! Copy [`HotCheeseAgent`] into your own key consumers. Every `/read` costs the owner a
-//! Touch ID approval, so this reads ONE key and never prints its bytes.
+//! Copy [`HotCheeseAgent`] into your own key consumers. A `/read` costs the owner a Touch ID
+//! approval unless [`GRANT_ENV`] carries a read-grant token, so this reads ONE key and never
+//! prints its bytes.
 use err_mac::create_err_with_impls;
 use hc_core::config::cert_paths;
 use hc_core::crypto::envelope::write_private_file;
+use hc_core::read_grant::{GrantToken, ReadGrantErr, GRANT_HEADER};
 use hc_core::share::{EphemeralClient, ServerEncryptedRes, ShareErr};
 use hc_daemon::{sk_to_adr, ApiBackendErr};
 use pki_types::pem::PemObject;
@@ -29,6 +31,10 @@ const PIN_ENV: &str = "HOT_CHEESE_CERT_SHA256";
 
 /// Where this client keeps its own first-use record, when it has no configured fingerprint.
 const PIN_FILE_ENV: &str = "HOT_CHEESE_CLIENT_PIN";
+
+/// The read-grant token `hot_cheese read-grant allow` printed, if the operator issued one. With
+/// it the read costs them no approval at all; without it `/read` still asks them for one.
+const GRANT_ENV: &str = "HOT_CHEESE_READ_GRANT";
 
 /// Default for [`PIN_FILE_ENV`], under the CLIENT's home rather than the daemon's, because the
 /// daemon rewrites everything in its own.
@@ -162,15 +168,21 @@ impl HotCheeseAgent {
             .send_bytes(&[])?;
         response_text(res)
     }
-    /// Ephemeral P-256 read: the secret is encrypted for this process only. Costs one Touch ID.
+    /// Ephemeral P-256 read: the secret is encrypted for this process only. Costs one Touch ID,
+    /// or none at all while [`GRANT_ENV`] holds a token the operator issued for this key.
     pub fn read(&self, name: &str) -> Result<Zeroizing<Vec<u8>>, HotAgentErr> {
         let client = EphemeralClient::new();
         let (to_send, decryptor) = client.sendable();
-        let res = self
+        let mut request = self
             .agent
             .post(format!("{}{}{}", self.base, "/read/", name).as_str())
-            .set("Content-Type", "application/json")
-            .send_bytes(&serde_json::to_vec(&to_send)?)?;
+            .set("Content-Type", "application/json");
+        if let Ok(offered) = std::env::var(GRANT_ENV) {
+            let offered = Zeroizing::new(offered);
+            let token = GrantToken::parse(offered.trim().as_bytes())?.render();
+            request = request.set(GRANT_HEADER, token.as_str());
+        }
+        let res = request.send_bytes(&serde_json::to_vec(&to_send)?)?;
         let bytes = hc_core::read_bounded(res.into_reader(), MAX_RESPONSE_BYTES)?;
         let enc_res: ServerEncryptedRes = hc_core::wire::strict_json_from_slice(&bytes)?;
         Ok(decryptor.decrypt(name, &enc_res)?)
@@ -189,6 +201,7 @@ create_err_with_impls!(
     NoPinLocation,
     Ureq(ureq::Error),
     Share(ShareErr),
+    ReadGrant(ReadGrantErr),
     Serde(serde_json::Error),
     Pem(pki_types::pem::Error),
     Rustls(rustls::Error),

@@ -275,6 +275,7 @@ impl TunnelManager {
             .map_err(|_| TunnelErr::TunnelIdsExhausted)?;
         let mut watchdog = hc_core::ParentDeathGuard::start()?;
         watchdog.configure(&mut cmd);
+        hc_core::close_inherited_fds_on_exec(&mut cmd);
         let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())

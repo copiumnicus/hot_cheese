@@ -9,7 +9,7 @@
 //! else, so a bundle a hostile peer injected is never redistributed unattended. Signatures still
 //! converge because every device pulls [`Scope::All`] from every peer it enrolled — which makes
 //! enrolment load-bearing in BOTH directions.
-use crate::ingest::{Delivered, Ingest, Verdict};
+use crate::ingest::{Delivered, Ingest, Truth, Verdict};
 use crate::sync::{self, SyncErr, Truncated};
 use crate::{bundle_dir, loaded, Arrival, Scope};
 use alloy_primitives::{Address, B256};
@@ -84,9 +84,12 @@ impl Poller {
         Ok(poller)
     }
 
-    /// Record that this device wrote a file into a bundle, so a tick pushes it and no cap evicts
-    /// it. Fed by an explicit poke and by nothing else — never by a pull, and never by what a
-    /// directory happens to contain.
+    /// Record that this device wrote a file into a bundle, so a tick pushes it. Fed by an explicit
+    /// poke and by nothing else — never by a pull, and never by what a directory happens to
+    /// contain — because this machine relaying a peer's bundle unattended is the thing it must not
+    /// do. What the caps and expiries treat as OURS is not this: that is
+    /// [`crate::ingest::Truth`], read off the disk, so a bundle created through any entry point is
+    /// covered whether or not anything poked this poller.
     pub fn contributed(&mut self, hash: B256) {
         self.contributed.insert(hash);
     }
@@ -103,7 +106,7 @@ impl Poller {
     /// One pass, crediting whatever appeared since the last one to `from`, which is what bounds
     /// one peer's share of the tree across every tick rather than within one.
     fn take_stock(&mut self, from: Delivered<'_>) -> Result<Stock, PollErr> {
-        let verdict = self.ingest.validate(Scope::All, &self.contributed, from)?;
+        let verdict = self.ingest.validate(Scope::All, &Truth::load()?, from)?;
         let mut arrivals = Vec::new();
         if verdict.changed || verdict.judged > 0 || verdict.dirs != self.bundles {
             let mut ready = 0usize;

@@ -18,8 +18,8 @@ use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand};
 use err_mac::create_err_with_impls;
 use hc_core::config::{
-    adapter_socket, adapters_dir, cert_paths, config_path, env_log_level, home_dir, BackupRemote,
-    Config,
+    adapter_socket, adapters_dir, cert_paths, config_path, env_log_level, home_dir,
+    read_grants_dir, BackupRemote, Config,
 };
 use hc_core::crypto::envelope::{
     atomic_write, encrypt_file_new, enforce_store_modes, parse_keystore, read_keystore,
@@ -29,7 +29,10 @@ use hc_core::is_valid_key_name;
 use hc_core::keyring::{EnrollParams, Enrollment, Keyring, VaultId};
 use hc_core::mac::secure_enclave;
 use hc_core::mac::{authorize_with_touch_id, get_password_from_keychain, BackendImpl, MacBackend};
-use hc_core::unlock::{PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker};
+use hc_core::read_grant::{self, Standing, DEFAULT_GRANT_HOURS, MAX_GRANT_HOURS};
+use hc_core::unlock::{
+    enroll_secure_enclave, PassphraseUnlocker, SecureEnclaveUnlocker, UnlockErr, Unlocker,
+};
 use hc_daemon::approval::Approver;
 use hc_daemon::git_store::{self, GitStore};
 use hc_daemon::renderer::Headless;
@@ -81,6 +84,11 @@ const MAX_PEM_BYTES: u64 = 1024 * 1024;
 // `accept-deletions`) with no terminal to type its phrase on, ConfirmationRefused is the same
 // guard when what came back was not the phrase, and NoDeletionsToAccept is `accept-deletions`
 // on a store that has lost nothing.
+// NothingToRestore is `restore-missing` on a store that has lost nothing, and StoreStillMissing
+// is the same verb naming what local history could not put back.
+// StoreMissingRunBackupPull and StoreMissingRunRestoreMissing are `serve` with no keyring in the
+// store, split on whether this machine's own committed tip still holds one: routing an operator to
+// a rewinding remote pull when a local checkout fixes it is advice that costs them history.
 create_err_with_impls!(
     #[derive(Debug)]
     pub CliErr,
@@ -92,8 +100,10 @@ create_err_with_impls!(
     TouchIdDenied,
     GrantKeyMissingRunEnrollGrant,
     StoreMissingRunBackupPull,
+    StoreMissingRunRestoreMissing,
     Config(hc_core::config::ConfigErr),
     Keyring(hc_core::keyring::KeyringErr),
+    ReadGrant(hc_core::read_grant::ReadGrantErr),
     Passphrase(PassphraseErr),
     Unlock(hc_core::unlock::UnlockErr),
     Envelope(hc_core::crypto::envelope::EnvErr),
@@ -125,7 +135,9 @@ create_err_with_impls!(
     GrantKeyPinMismatch { pinned: String, found: String },
     ConfirmationNeedsTerminal { required: &'static str, flag: &'static str },
     ConfirmationRefused { typed: String, required: &'static str },
-    NoDeletionsToAccept { store: PathBuf }
+    NoDeletionsToAccept { store: PathBuf },
+    NothingToRestore { store: PathBuf },
+    StoreStillMissing { paths: Vec<String>, ids: Vec<String> }
 );
 
 // Mismatch is the confirmation entry differing from the first, Empty a passphrase read from an
@@ -231,17 +243,39 @@ enum Commands {
         #[arg(long = "use", value_name = "USE", default_value = "sign-only", value_parser = key_use_parser())]
         key_use: KeyUse,
     },
+    /// Let one agent pull a shareable key over `/read` for a bounded window, with no Touch ID
+    /// on each request. Only `allow` claims the store, unlocks anything, or prompts.
+    #[command(subcommand)]
+    ReadGrant(ReadGrantCmd),
     /// Run the HTTPS daemon. A missing store must be restored explicitly first.
     Serve,
     /// Push or pull the encrypted store to/from configured backup remotes.
     #[command(subcommand)]
     Backup(BackupCmd),
+    /// The add-only local snapshots of the store, one per mutation that adds or changes a
+    /// keystore or `keyring.json`. Nothing in this program ever removes one.
+    #[command(subcommand)]
+    Archive(ArchiveCmd),
+    /// Put store files this machine's own history still holds and the worktree lost back where
+    /// they belong. Records nothing, tells no backup, and is what to run when a keystore vanished.
+    RestoreMissing,
     /// Record store files or enrollments that are already gone, which every other command
-    /// refuses to commit. Names each one, then requires the phrase it asks for.
+    /// refuses to commit. Names each one, says what `restore-missing` would put back instead,
+    /// then requires the phrase it asks for.
     AcceptDeletions {
         /// Confirm without a terminal, by repeating the phrase it asks for.
         #[arg(long, value_name = "PHRASE")]
         confirm_deletion: Option<String>,
+    },
+    /// Remove an enclave key blob squatting this machine's key path, which otherwise blocks the
+    /// Secure Enclave path for good. Shows what is there against what this install records, then
+    /// requires the phrase it asks for. Never touches a key this install DOES record.
+    DiscardEnclaveKey {
+        /// Which of this machine's two enclave key paths to inspect.
+        kind: EnclaveKeyKind,
+        /// Confirm without a terminal, by repeating the phrase it asks for.
+        #[arg(long, value_name = "PHRASE")]
+        confirm_discard: Option<String>,
     },
     /// Migrate legacy Keychain-master keystores into the new envelope format.
     Migrate {
@@ -292,6 +326,31 @@ enum EnrollCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum ReadGrantCmd {
+    /// Mint a token that releases `name` over /read with no further approval until it expires.
+    /// Costs exactly one Touch ID, prints the token once, and replaces any earlier grant.
+    Allow {
+        /// Keystore to release. It must have been sealed shareable.
+        name: String,
+        /// Hours the token stays valid.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = DEFAULT_GRANT_HOURS,
+            value_parser = grant_hours_parser()
+        )]
+        hours: u32,
+    },
+    /// Show every grant still in force, with its expiry and the time it has left.
+    List,
+    /// End one grant now, so its token stops releasing anything.
+    Revoke {
+        /// Keystore whose grant is destroyed.
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum BackupCmd {
     /// Print what this install knows about its store and its remotes. No network, no write.
     Status,
@@ -308,13 +367,30 @@ enum BackupCmd {
         /// Actually discard local history. Without it the destruction is only listed.
         #[arg(long)]
         force: bool,
-        /// Accept a pull that rewinds, forks, deletes store files or replaces them with older
-        /// content, by repeating the phrase it asks for.
+        /// Accept a pull that rewinds, forks, deletes store files, adds ones this machine never
+        /// had, or replaces them with older content, by repeating the phrase it asks for.
         #[arg(long, value_name = "PHRASE", requires = "force")]
         confirm_rewind: Option<String>,
+        /// Accept a pull that leaves this machine with no enrollment of its own, and so no way
+        /// to unwrap its own DEK, by repeating the phrase it asks for.
+        #[arg(long, value_name = "PHRASE", requires = "force")]
+        confirm_lost_enrollments: Option<String>,
     },
     /// List the vaults sharing the first configured remote's folder.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveCmd {
+    /// Show every snapshot in the archive directory, oldest first. No network, no unlock, and no
+    /// claim on the store, so it answers while a console or a daemon is running.
+    List,
+    /// Write a snapshot's store files back. Add-only: it creates the files the store does not
+    /// have, leaves every file it does exactly as it is, and deletes nothing.
+    Restore {
+        /// The snapshot's content digest, as `archive list` prints it.
+        digest: String,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +409,15 @@ enum Chain {
     Solana,
 }
 
+/// Which of this machine's two independent enclave keys a command addresses.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum EnclaveKeyKind {
+    /// The KEK whose Touch-ID-gated ECDH unwraps the DEK, recorded as `se_pub` in `keyring.json`.
+    Se,
+    /// The grant-signing key, pinned as `grant_public_key` in `config.toml`.
+    Grant,
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum UnlockMethod {
     /// This machine's Secure Enclave key (Touch ID per request).
@@ -343,6 +428,13 @@ enum UnlockMethod {
 
 /// `--use` accepts exactly the two spellings, and only those, so `KeyUse` itself stays
 /// free of clap and the key core never links a CLI parser.
+/// The window a grant may be given, refused while parsing the argument. A window nothing can
+/// mint must cost no Touch ID, and the earliest possible refusal is the one that costs nothing
+/// at all: `--hours 0` and `--hours 99999` never reach the store, let alone the enclave.
+fn grant_hours_parser() -> clap::builder::RangedI64ValueParser<u32> {
+    clap::value_parser!(u32).range(1..=i64::from(MAX_GRANT_HOURS))
+}
+
 fn key_use_parser() -> impl TypedValueParser<Value = KeyUse> {
     fn chosen(value: String) -> KeyUse {
         match value.as_str() {
@@ -436,9 +528,16 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
         Commands::List => cmd_list(),
         Commands::Adapters => cmd_adapters(),
         Commands::Seal { name, all, key_use } => cmd_seal(name, all, key_use, unlock),
+        Commands::ReadGrant(cmd) => cmd_read_grant(cmd, unlock),
         Commands::Serve => cmd_serve(unlock),
         Commands::Backup(cmd) => cmd_backup(cmd),
+        Commands::Archive(cmd) => cmd_archive(cmd),
+        Commands::RestoreMissing => cmd_restore_missing(),
         Commands::AcceptDeletions { confirm_deletion } => cmd_accept_deletions(confirm_deletion),
+        Commands::DiscardEnclaveKey {
+            kind,
+            confirm_discard,
+        } => cmd_discard_enclave_key(kind, confirm_discard),
         Commands::Migrate {
             old_store,
             new_store,
@@ -676,8 +775,12 @@ const FORCED_INIT_PHRASE: &str = git_store::Destruction::Replacement.phrase();
 const FORCED_INIT_FLAG: &str = "--confirm-destroy";
 const PULL_REWIND_PHRASE: &str = "roll this store back";
 const PULL_REWIND_FLAG: &str = "--confirm-rewind";
+const PULL_LOST_ENROLLMENTS_PHRASE: &str = "give up every unlock path on this machine";
+const PULL_LOST_ENROLLMENTS_FLAG: &str = "--confirm-lost-enrollments";
 const ACCEPT_DELETION_PHRASE: &str = git_store::Destruction::Deletion.phrase();
 const ACCEPT_DELETION_FLAG: &str = "--confirm-deletion";
+const DISCARD_ENCLAVE_KEY_PHRASE: &str = secure_enclave::DISCARD_UNRECORDED_KEY_PHRASE;
+const DISCARD_ENCLAVE_KEY_FLAG: &str = "--confirm-discard";
 
 /// The one way an irreversible verb takes consent: the exact phrase, typed on a terminal, or
 /// carried by `flag` where there is no terminal to type it on. Anything else refuses, so a
@@ -742,6 +845,158 @@ fn confirm_forced_init(
     )?))
 }
 
+/// The `config.toml` already on disk, when this install can read one. A forced init that cannot
+/// read it says so rather than dropping the operator's backup wiring in silence.
+fn loaded_config() -> Result<Option<Config>, CliErr> {
+    if !path_is_occupied(&config_path())? {
+        return Ok(None);
+    }
+    match Config::load() {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                config = %config_path().display(),
+                "the existing config.toml cannot be read, so this init replaces it and every \
+                 backup remote it configured goes with it"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// What `init` writes to `config.toml`. A forced init minted a fresh [`Config`] here, which
+/// silently discarded `backup_remotes` — the one place the keys the new DEK orphans still exist —
+/// along with the pinned grant key, the port and every annotation. Only the store this init
+/// creates is init's to decide.
+fn init_config(existing: Option<Config>, store: &Path) -> Config {
+    let store = store.to_string_lossy().into_owned();
+    match existing {
+        Some(mut carried) => {
+            carried.store = store;
+            carried
+        }
+        None => Config {
+            service: DEFAULT_SERVICE.to_string(),
+            account: DEFAULT_ACCOUNT.to_string(),
+            store,
+            store_archive: None,
+            port: None,
+            grant_public_key: None,
+            bundle_watch_secs: None,
+            backup_fetch_secs: None,
+            approval_timeout_secs: None,
+            mcp: None,
+            backup_remotes: Vec::new(),
+            adapters: Vec::new(),
+            bundle_peers: Vec::new(),
+            token: Vec::new(),
+            label: Vec::new(),
+        },
+    }
+}
+
+/// Prove the store's repository takes what is already there before a forced init mints the DEK
+/// that orphans it, so a repository that cannot commit fails while the old keyring is still the
+/// one on disk. A keyring this install cannot read blocks nothing here: it is what the init is
+/// replacing.
+///
+/// This is a check that the repository works, not a promise that the keyring about to be
+/// overwritten reaches history: `ensure_repo` passes `Recording::Defer`, which leaves the tip
+/// where it is — and says so — for a store that has already lost a file, and commits nothing at
+/// all for a store with no readable keyring to name a vault with. The forced init's own commit
+/// records the replacement afterwards either way.
+fn commit_replaced_state(store: &Path) -> Result<(), CliErr> {
+    match git_store::local_vault(store) {
+        Ok(_) => {
+            git_store::ensure_repo(store, None)?;
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "the store's keyring cannot be read, so what the new DEK orphans cannot be \
+                 committed before it is replaced"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Put back what the worktree lost and this machine's own history still holds. The safe half of
+/// the pair [`cmd_accept_deletions`] completes, and the one an operator must reach first: a
+/// checkout out of local history moves no ref, records nothing and tells no backup, so getting it
+/// wrong costs a re-run — while recording a loss replicates it to every backup and cannot be
+/// undone.
+///
+/// Runs without [`claimed_store`]: opening the store is the operation that is already failing.
+fn cmd_restore_missing() -> Result<(), CliErr> {
+    let config = Arc::new(Config::load()?);
+    let git = GitStore::cli(config.clone(), flock::store_claim()?)?;
+    let lost = match git.missing() {
+        Ok(lost) => {
+            if lost.is_empty() {
+                return Err(CliErr::NothingToRestore {
+                    store: config.store_path(),
+                });
+            }
+            Some(lost)
+        }
+        Err(git_store::GitErr::LocalKeyringMissing { store }) => {
+            tracing::warn!(
+                store = %store.display(),
+                "the store has no keyring.json at all, so nothing here can name what else it \
+                 lost until one is back"
+            );
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(lost) = &lost {
+        tracing::warn!(
+            store = %config.store_path().display(),
+            files = lost.paths.len(),
+            enrollments = lost.ids.len(),
+            "this worktree has lost store state the last commit still holds; putting it back \
+             records nothing and tells no backup"
+        );
+        for path in &lost.paths {
+            tracing::warn!(file = %path, "  MISSING: a store file the last commit still has");
+        }
+        for id in &lost.ids {
+            tracing::warn!(enrollment = %id, "  MISSING: an unlock path the committed keyring still wraps");
+        }
+    }
+    let remaining = git.restore_missing()?;
+    if let Some(lost) = &lost {
+        for path in &lost.paths {
+            if !remaining.paths.contains(path) {
+                tracing::info!(file = %path, "  RESTORED out of this machine's own history");
+            }
+        }
+        for id in &lost.ids {
+            if !remaining.ids.contains(id) {
+                tracing::info!(enrollment = %id, "  RESTORED out of this machine's own history");
+            }
+        }
+    }
+    if !remaining.is_empty() {
+        tracing::warn!(
+            files = remaining.paths.len(),
+            enrollments = remaining.ids.len(),
+            "a checkout of this machine's own tip did not put the rest back: take it from a \
+             backup that still has it with `hot_cheese backup pull`, and record the loss with \
+             `hot_cheese accept-deletions` only once no backup has it either"
+        );
+        return Err(CliErr::StoreStillMissing {
+            paths: remaining.paths,
+            ids: remaining.ids,
+        });
+    }
+    tracing::info!("restored; no ref moved, nothing was recorded and no backup was told");
+    Ok(())
+}
+
 /// Record store state that is already gone. A routine mutation refuses to, because the backup
 /// exists to survive exactly that loss and a deletion replicates as a clean fast-forward — but
 /// the refusal is permanent and `open` is a commit, so without this the first store file to
@@ -769,6 +1024,12 @@ fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
     for id in &missing.ids {
         tracing::warn!(enrollment = %id, "  GONE: an unlock path the committed keyring still wraps");
     }
+    tracing::warn!(
+        instead = "hot_cheese restore-missing",
+        "RUN `hot_cheese restore-missing` FIRST: it checks every file above back out of this \
+         machine's own history, moves no ref and tells no backup. Recording the loss here is the \
+         half that cannot be undone"
+    );
     let typed = require_typed_confirmation(
         ACCEPT_DELETION_PHRASE,
         ACCEPT_DELETION_FLAG,
@@ -783,6 +1044,62 @@ fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
         enrollments = missing.ids.len(),
         "recorded the loss; the store commits again"
     );
+    Ok(())
+}
+
+/// Remove a key blob squatting one of this machine's enclave key paths. A same-uid process can
+/// drop one there, and the adoption gate then refuses it forever: `serve` will not start, and
+/// `enroll se` will not mint over it, so without this the only remedy is an `rm` the operator has
+/// to work out for themselves.
+///
+/// Whatever is there is named first — its fingerprint against the fingerprints this install
+/// records — because the whole point is that the operator decides whether they are looking at
+/// their own key or a substitution. A key this install records never reaches the question:
+/// [`secure_enclave::unrecorded_se_key`] refuses it, and the phrase is the only thing that
+/// spends the discard.
+fn cmd_discard_enclave_key(kind: EnclaveKeyKind, confirm: Option<String>) -> Result<(), CliErr> {
+    let _store = flock::store_claim()?;
+    let squatter = match kind {
+        EnclaveKeyKind::Se => secure_enclave::unrecorded_se_key(SE_LABEL),
+        EnclaveKeyKind::Grant => secure_enclave::unrecorded_grant_key(GRANT_LABEL),
+    }?;
+    tracing::warn!(
+        path = %squatter.path().display(),
+        found = %secure_enclave::se_fingerprint(squatter.found()),
+        recorded = squatter.recorded().len(),
+        "an enclave key this install never recorded is at this machine's key path; discarding it \
+         deletes that one file and nothing else, and this install cannot use that key either way"
+    );
+    for recorded in squatter.recorded() {
+        tracing::warn!(
+            se_key = %secure_enclave::se_fingerprint(recorded),
+            "  this install RECORDS this enclave key; compare it with `found` above, and stop if \
+             they should be the same key"
+        );
+    }
+    if squatter.recorded().is_empty() {
+        tracing::warn!(
+            "this install records NO enclave key of this kind, so nothing here is wrapped under \
+             the key at that path"
+        );
+    }
+    let typed = require_typed_confirmation(
+        DISCARD_ENCLAVE_KEY_PHRASE,
+        DISCARD_ENCLAVE_KEY_FLAG,
+        confirm.as_deref(),
+    )?;
+    squatter.discard(&typed)?;
+    match kind {
+        EnclaveKeyKind::Se => tracing::info!(
+            "discarded it; `hot_cheese enroll se` will now MINT a new Secure Enclave key, which \
+             changes the set of enclave keys this store trusts. Unlock that enrollment with \
+             `--unlock passphrase`"
+        ),
+        EnclaveKeyKind::Grant => tracing::info!(
+            "discarded it; `hot_cheese enroll grant` will now MINT a new Secure Enclave grant key \
+             and re-pin it in config.toml"
+        ),
+    }
     Ok(())
 }
 
@@ -829,27 +1146,16 @@ fn cmd_init(
         None
     };
 
-    let config = Config {
-        service: DEFAULT_SERVICE.to_string(),
-        account: DEFAULT_ACCOUNT.to_string(),
-        store: store.to_string_lossy().into_owned(),
-        port: None,
-        grant_public_key: None,
-        bundle_watch_secs: None,
-        backup_fetch_secs: None,
-        mcp: None,
-        backup_remotes: Vec::new(),
-        adapters: Vec::new(),
-        bundle_peers: Vec::new(),
-        token: Vec::new(),
-        label: Vec::new(),
-    };
+    let config = init_config(loaded_config()?, &store);
     config.validate()?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&store)?;
     enforce_store_modes(&store)?;
+    if consent.is_some() {
+        commit_replaced_state(&store)?;
+    }
 
     // TLS cert: import the supplied pair, or mint a self-signed localhost cert.
     let tls = match (import_cert, import_key) {
@@ -880,6 +1186,8 @@ fn cmd_init(
     atomic_write(&cert_path, &tls.cert_pem)?;
     write_private_file(&key_path, &tls.key_pem)?;
 
+    config.save()?;
+
     let mut keyring = Keyring::new();
     // A fresh DEK is a fresh vault: it gets its own remote subtree so this install can share
     // a backup folder with other installs instead of overwriting one of them.
@@ -887,9 +1195,6 @@ fn cmd_init(
     keyring.vault_id = Some(vault.clone());
     keyring.add(enrollment);
     keyring.save(&keyring_file(&config))?;
-
-    // Persist config last, once the store + keyring are in place.
-    config.save()?;
 
     git_store::ensure_repo(&store, consent)?;
 
@@ -918,16 +1223,19 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
     let enrollment = match cmd {
         EnrollCmd::Se { label } => {
             let dek = enroll_dek(&keyring, unlock)?;
-            if let Err(e) = secure_enclave::ensure_se_key(SE_LABEL) {
-                tracing::warn!(
-                    "Could not create this machine's Secure Enclave key. Confirm the Mac has a \
-                     Secure Enclave with an enrolled fingerprint and that you are in your GUI \
-                     login session with the screen unlocked (Touch ID cannot prompt over \
-                     ssh/sudo). Use a recovery passphrase in the meantime."
-                );
-                return Err(e.into());
-            }
-            SecureEnclaveUnlocker::new(SE_LABEL).enroll(&label, &dek)?
+            let proven = match secure_enclave::ensure_se_key(SE_LABEL) {
+                Ok(proven) => proven,
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not create this machine's Secure Enclave key. Confirm the Mac has \
+                         a Secure Enclave with an enrolled fingerprint and that you are in your \
+                         GUI login session with the screen unlocked (Touch ID cannot prompt over \
+                         ssh/sudo). Use a recovery passphrase in the meantime."
+                    );
+                    return Err(e.into());
+                }
+            };
+            enroll_secure_enclave(&label, &dek, &proven)?
         }
         EnrollCmd::Passphrase { label } => {
             let pass = prompt_new_passphrase()?;
@@ -935,15 +1243,14 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
             PassphraseUnlocker::from_secret(pass).enroll(&label, &dek)?
         }
         EnrollCmd::Grant => {
-            secure_enclave::ensure_grant_key(GRANT_LABEL)?;
-            let public_key = secure_enclave::grant_public_key(GRANT_LABEL)?;
-            let pinned = hex::encode(&public_key);
+            let proven = secure_enclave::ensure_grant_key(GRANT_LABEL)?;
+            let pinned = hex::encode(proven.public_key());
             let adopted = config.grant_public_key.as_deref() == Some(pinned.as_str());
             Config::update(|pinning| {
                 pinning.grant_public_key = Some(pinned.clone());
                 Ok::<(), CliErr>(())
             })?;
-            let grant_key = se_fingerprint(&public_key);
+            let grant_key = secure_enclave::se_fingerprint(proven.public_key());
             if adopted {
                 tracing::warn!(%grant_key, "ADOPTED the Secure Enclave grant key already on this disk; stop unless this is the fingerprint you enrolled");
             } else {
@@ -966,7 +1273,7 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
                     adopted |= recorded == se_pub;
                 }
             }
-            let se_key = se_fingerprint(se_pub);
+            let se_key = secure_enclave::se_fingerprint(se_pub);
             match adopted {
                 true => EnclaveKeyChange::Adopted { se_key },
                 false => EnclaveKeyChange::Minted { se_key },
@@ -1093,8 +1400,9 @@ fn sign_intent_locally(
     let _store = flock::store_claim()?;
     let config = Arc::new(Config::load()?);
     let (backend, gate) = backend_for(&config, unlock)?;
+    let renderer = Arc::new(Headless::for_config(&config));
     let api = HotApi::new(Box::new(backend), config);
-    let approver = Approver::new(gate, Arc::new(Headless::detect()));
+    let approver = Approver::new(gate, renderer);
     let ctx = OpContext::local(intent.key.clone(), Operation::Sign);
     Ok(api.sign_typed(&ctx, intent, &approver)?)
 }
@@ -1116,7 +1424,7 @@ fn cmd_list() -> Result<(), CliErr> {
                 id = %e.id,
                 kind = "secure_enclave",
                 label = %e.label,
-                se_key = %se_fingerprint(se_pub),
+                se_key = %secure_enclave::se_fingerprint(se_pub),
                 created_at = e.created_at,
                 "  enrollment"
             ),
@@ -1283,6 +1591,82 @@ fn cmd_seal(
     }
 
     git.after_mutation()?;
+    report_dead_grants(&store)
+}
+
+/// The read-grant verbs. `list` and `revoke` write nothing and unlock nothing — `list` reads the
+/// cleartext keystore headers to say whether each grant still releases anything — so they run
+/// while the console holds the store claim; `allow` unlocks, so it takes the claim.
+fn cmd_read_grant(cmd: ReadGrantCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    match cmd {
+        ReadGrantCmd::Allow { name, hours } => cmd_allow(&name, hours, unlock),
+        ReadGrantCmd::List => {
+            let store = Config::load()?.store_path();
+            let live = read_grant::list(&read_grants_dir(), &store, hc_sign::grant::now_secs()?)?;
+            tracing::info!(
+                count = live.len(),
+                dir = %read_grants_dir().display(),
+                max_hours = MAX_GRANT_HOURS,
+                "read grants"
+            );
+            for grant in live {
+                tracing::info!(grant = %grant, "  grant");
+            }
+            Ok(())
+        }
+        ReadGrantCmd::Revoke { name } => {
+            read_grant::revoke(&read_grants_dir(), &name)?;
+            tracing::info!(%name, "revoked the read grant; its token releases nothing now");
+            Ok(())
+        }
+    }
+}
+
+/// Mint one grant. The window is refused while `--hours` is parsed and the permit is taken from
+/// the keystore's cleartext header BEFORE the unlock, so neither an impossible window nor a key
+/// that is not sealed shareable costs a biometric; after that the DEK is unwrapped once, one
+/// keystore is decrypted, and the plaintext is resealed under the token's own KEK. Nothing about
+/// the token survives this function but the printed block.
+fn cmd_allow(name: &str, hours: u32, unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
+    if !is_valid_key_name(name) {
+        return Err(hc_daemon::ApiBackendErr::InvalidName.into());
+    }
+    let _store = flock::store_claim()?;
+    let config = Config::load()?;
+    let permit = read_keystore(&config.store_path().join(name))?.export_permit()?;
+    let (backend, _) = backend_for(&config, unlock)?;
+    let dek = backend.unlock_dek(
+        &format!("Allow \"{name}\" to be read for {hours}h without further approval"),
+        None,
+    )?;
+    let granted = read_grant::create(
+        &read_grants_dir(),
+        name,
+        permit,
+        &dek,
+        hc_sign::grant::now_secs()?,
+        hours,
+    )?;
+    if granted.replaced {
+        tracing::warn!(%name, "an earlier grant for this key was replaced; its token is dead");
+    }
+    println!("{}", read_grant::handoff(&granted, config.port()).as_str());
+    Ok(())
+}
+
+/// Name every grant that no longer releases the key it points at. A grant holds a COPY of the
+/// key, so a command that tightens or removes a keystore ends one silently: the token keeps
+/// existing and only the key's live header decides whether it still releases anything.
+fn report_dead_grants(store: &Path) -> Result<(), CliErr> {
+    for grant in read_grant::list(&read_grants_dir(), store, hc_sign::grant::now_secs()?)? {
+        if grant.standing == Standing::Dead {
+            tracing::warn!(
+                key = %grant.key,
+                expires = grant.expires_at,
+                "a read grant for this key releases nothing now; `read-grant revoke` clears it"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1314,7 +1698,11 @@ fn cmd_serve(unlock: Option<UnlockMethod>) -> Result<(), CliErr> {
         });
     }
 
-    if git_store::local_vault(&config.store_path())? == git_store::LocalVault::Absent {
+    let store_path = config.store_path();
+    if git_store::local_vault(&store_path)? == git_store::LocalVault::Absent {
+        if git_store::committed_vault(&store_path)? != git_store::LocalVault::Absent {
+            return Err(CliErr::StoreMissingRunRestoreMissing);
+        }
         return Err(CliErr::StoreMissingRunBackupPull);
     }
 
@@ -1364,7 +1752,13 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
             git.fetch_every(&config)?;
             let state = git.status().snapshot();
             for remote in &state.remotes {
-                tracing::info!(host = %remote.host, relation = %remote.relation, remote_head = ?remote.remote_head, "  remote");
+                tracing::info!(
+                    host = %remote.host,
+                    relation = %remote.relation,
+                    remote_head = ?remote.remote_head,
+                    refuses_deletions = ?remote.receive_guards.map(git_store::ReceiveGuards::enforced),
+                    "  remote"
+                );
             }
             if let Some((host, local, remote)) = diverged(&state) {
                 return Err(git_store::GitErr::Diverged {
@@ -1379,6 +1773,7 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
             vault,
             force,
             confirm_rewind,
+            confirm_lost_enrollments,
         } => {
             let git = claimed_store(&config)?;
             let remote = first_remote(&config)?;
@@ -1415,6 +1810,9 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
             for name in &doomed.untracked {
                 tracing::warn!(file = %name, "  untracked file deleted by the clean");
             }
+            for name in &doomed.unrecorded {
+                tracing::warn!(file = %name, "  NO COMMIT HERE CARRIES THIS STORE FILE: the pull replaces or deletes it and no local history can put it back");
+            }
             if !force {
                 return Err(CliErr::PullNeedsForce);
             }
@@ -1432,17 +1830,24 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                     git_store::Rewind::Contents => {
                         "OLDER CONTENT: nothing is deleted and no local commit is discarded, and the security-relevant files listed as REPLACED above take older content — which can revive a retired keystore, restore an older keyring.json, or reinstate a looser policy"
                     }
+                    git_store::Rewind::Widens => {
+                        "GRANTED AUTHORITY: nothing is deleted and no local commit is discarded, and the security-relevant files listed as ADDED above did not exist here — a policies/<key>.toml this machine never had turns deny-by-default into allow, and a keystore it never had puts back one a recorded loss retired, under this same vault and this same DEK"
+                    }
+                    git_store::Rewind::Unrecorded => {
+                        "NOT IN ANY COMMIT HERE: the files listed below are security-relevant files this store holds and no commit on this machine carries, so the reset replaces the ones the incoming tip has, the clean deletes the rest, and no local history can put either back. Deleting one branch ref under .git costs nothing, destroys no key, and is all it takes to make a store still holding keys look like a fresh install"
+                    }
                 };
                 tracing::warn!(
                     ground,
                     ?rewind,
                     local_only_commits = doomed.local_only,
+                    added = doomed.added.len(),
                     replaced = doomed.changed.len(),
                     removed = doomed.removed.len(),
                     lost_enrollments = doomed.lost_enrollments.len(),
                     local_committed_at = ?doomed.local_at,
                     remote_committed_at = doomed.remote_at,
-                    "THIS PULL PUTS BACK STATE THIS MACHINE MOVED PAST: every file listed as REPLACED or DELETED above takes the content a remote host chose"
+                    "THIS PULL PUTS BACK STATE THIS MACHINE MOVED PAST: every file listed as ADDED, REPLACED or DELETED above takes the content a remote host chose"
                 );
                 require_typed_confirmation(
                     PULL_REWIND_PHRASE,
@@ -1451,8 +1856,22 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                 )?;
                 doomed.accept_rewind();
             }
+            if !doomed.lost_enrollments.is_empty() {
+                tracing::warn!(
+                    ids = ?doomed.lost_enrollments,
+                    count = doomed.lost_enrollments.len(),
+                    "NO WAY BACK IN: the incoming keyring keeps none of the enrollments above, so applying this leaves THIS MACHINE UNABLE TO UNWRAP ITS OWN DEK — no Touch ID and no recovery passphrase enrolled here opens the store afterwards, and only a passphrase enrolled in the INCOMING keyring does"
+                );
+                require_typed_confirmation(
+                    PULL_LOST_ENROLLMENTS_PHRASE,
+                    PULL_LOST_ENROLLMENTS_FLAG,
+                    confirm_lost_enrollments.as_deref(),
+                )?;
+                doomed.accept_lost_enrollments();
+            }
             git.pull_apply(&doomed)?;
             tracing::info!(host = %remote.host, %vault, head = %doomed.remote_head, "pulled the store from the remote");
+            report_dead_grants(&config.store_path())?;
         }
         BackupCmd::List => {
             let remote = first_remote(&config)?;
@@ -1465,6 +1884,74 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
             for v in &found.legacy {
                 tracing::warn!(vault = %v, "  pre-git backup directory, no longer written to");
             }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_archive(cmd: ArchiveCmd) -> Result<(), CliErr> {
+    let config = Arc::new(Config::load()?);
+    let dir = config.store_archive_path();
+    match cmd {
+        ArchiveCmd::List => {
+            let found = git_store::archive_list(&config)?;
+            tracing::info!(
+                archive = %found.root.display(),
+                snapshots = found.found.len(),
+                "store archive"
+            );
+            for archive in &found.found {
+                tracing::info!(
+                    digest = %archive.digest,
+                    vault = %archive.vault,
+                    bytes = archive.bytes,
+                    first_archived_at = archive.at,
+                    "  snapshot"
+                );
+            }
+            if found.other_vaults > 0 {
+                tracing::info!(
+                    vaults = found.other_vaults,
+                    "other installs archive under this root; their snapshots are theirs to restore \
+                     and none of them are listed above"
+                );
+            }
+            if found.flat > 0 {
+                tracing::warn!(
+                    snapshots = found.flat,
+                    "snapshots lie directly in the archive root, from before it held one subtree \
+                     per vault; they are left where they are, and restoring one by digest still \
+                     refuses it unless it names this vault"
+                );
+            }
+            if found.skipped > 0 {
+                tracing::warn!(
+                    entries = found.skipped,
+                    "the archive holds more entries than one listing describes, so this listing is \
+                     short; `archive restore <digest>` looks a snapshot up by name and is not \
+                     affected"
+                );
+            }
+        }
+        ArchiveCmd::Restore { digest } => {
+            let git = claimed_store(&config)?;
+            let restored = git.archive_restore(&digest)?;
+            for path in &restored.written {
+                tracing::info!(file = %path, "  RESTORED out of the archive");
+            }
+            for path in &restored.kept {
+                tracing::warn!(file = %path, "  already in the store, left exactly as it was");
+            }
+            tracing::info!(
+                archive = %dir.display(),
+                digest = %restored.digest,
+                vault = %restored.vault,
+                written = restored.written.len(),
+                kept = restored.kept.len(),
+                "restored the store from an archived snapshot; nothing was replaced and nothing \
+                 was deleted"
+            );
+            git.after_mutation()?;
         }
     }
     Ok(())
@@ -1625,13 +2112,6 @@ fn generate_localhost_cert() -> Result<TlsMaterial, CliErr> {
     })
 }
 
-/// The 16 lowercase hex characters of SHA-256 over a SEC1 enclave public key, the form the
-/// bootstrap ritual and the `/read` prompt already name an enclave key by.
-fn se_fingerprint(public_key: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(public_key)[..8])
-}
-
 /// Lowercase hex of SHA-256 over `bytes` (cert DER → pinning fingerprint).
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -1678,6 +2158,33 @@ mod tests {
             }
             other => panic!("expected Generate, got {:?}", other),
         }
+    }
+
+    /// `read-grant allow` unlocks the DEK, so a window it would only refuse afterwards is a
+    /// fingerprint spent on a typo. The range is enforced while the argument is parsed, which is
+    /// the one refusal that reaches neither the store nor the enclave.
+    #[test]
+    fn a_grant_window_outside_the_range_costs_no_biometric() {
+        for hours in ["0", "99999", "-1"] {
+            assert!(
+                Cli::try_parse_from(["hot_cheese", "read-grant", "allow", "K", "--hours", hours])
+                    .is_err(),
+                "--hours {hours} must not reach the command that unlocks"
+            );
+        }
+        for (hours, wanted) in [("1", 1u32), ("8760", MAX_GRANT_HOURS)] {
+            let cli =
+                Cli::try_parse_from(["hot_cheese", "read-grant", "allow", "K", "--hours", hours])
+                    .expect("a window inside the range parses");
+            assert!(
+                matches!(cli.command, Some(Commands::ReadGrant(ReadGrantCmd::Allow { hours, .. })) if hours == wanted)
+            );
+        }
+        let cli = Cli::try_parse_from(["hot_cheese", "read-grant", "allow", "K"])
+            .expect("the default window parses");
+        assert!(
+            matches!(cli.command, Some(Commands::ReadGrant(ReadGrantCmd::Allow { hours, .. })) if hours == DEFAULT_GRANT_HOURS)
+        );
     }
 
     /// A key that may leave the daemon has to be asked for by name, everywhere: the default is
@@ -1745,7 +2252,7 @@ mod tests {
             .parse()
             .expect("fixture id parses");
         assert!(
-            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force, confirm_rewind })) if vault == Some(expected) && force && confirm_rewind.is_none())
+            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force, confirm_rewind, confirm_lost_enrollments })) if vault == Some(expected) && force && confirm_rewind.is_none() && confirm_lost_enrollments.is_none())
         );
 
         let cli = Cli::try_parse_from(["hot_cheese", "backup", "pull"]).expect("bare pull parses");
@@ -1754,7 +2261,8 @@ mod tests {
             Some(Commands::Backup(BackupCmd::Pull {
                 vault: None,
                 force: false,
-                confirm_rewind: None
+                confirm_rewind: None,
+                confirm_lost_enrollments: None
             }))
         ));
 
@@ -1772,6 +2280,124 @@ mod tests {
             .is_err(),
             "rollback consent is meaningless without --force"
         );
+    }
+
+    /// Losing every enrollment costs this machine the way into its own DEK, which agreeing to a
+    /// rollback is not agreeing to: the two phrases must be different, neither may answer the
+    /// other, and the unattended flag that carries it is meaningless without `--force`.
+    #[test]
+    fn stranding_every_enrollment_takes_a_confirmation_of_its_own() {
+        assert_ne!(PULL_LOST_ENROLLMENTS_PHRASE, PULL_REWIND_PHRASE);
+        assert!(matches!(
+            require_typed_confirmation(
+                PULL_LOST_ENROLLMENTS_PHRASE,
+                PULL_LOST_ENROLLMENTS_FLAG,
+                Some(PULL_REWIND_PHRASE)
+            ),
+            Err(CliErr::ConfirmationRefused { .. })
+        ));
+        assert!(matches!(
+            require_typed_confirmation(
+                PULL_REWIND_PHRASE,
+                PULL_REWIND_FLAG,
+                Some(PULL_LOST_ENROLLMENTS_PHRASE)
+            ),
+            Err(CliErr::ConfirmationRefused { .. })
+        ));
+        require_typed_confirmation(
+            PULL_LOST_ENROLLMENTS_PHRASE,
+            PULL_LOST_ENROLLMENTS_FLAG,
+            Some(PULL_LOST_ENROLLMENTS_PHRASE),
+        )
+        .expect("its own phrase is what proceeds");
+
+        let cli = Cli::try_parse_from([
+            "hot_cheese",
+            "backup",
+            "pull",
+            "--force",
+            "--confirm-rewind",
+            PULL_REWIND_PHRASE,
+            "--confirm-lost-enrollments",
+            PULL_LOST_ENROLLMENTS_PHRASE,
+        ])
+        .expect("both consents parse together");
+        assert!(
+            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { confirm_rewind, confirm_lost_enrollments, .. }))
+                if confirm_rewind.as_deref() == Some(PULL_REWIND_PHRASE)
+                    && confirm_lost_enrollments.as_deref() == Some(PULL_LOST_ENROLLMENTS_PHRASE))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hot_cheese",
+                "backup",
+                "pull",
+                "--confirm-lost-enrollments",
+                PULL_LOST_ENROLLMENTS_PHRASE
+            ])
+            .is_err(),
+            "consent to lose every unlock path is meaningless without --force"
+        );
+    }
+
+    /// A keystore that vanished has to be recoverable before it is recordable. Restoring one out
+    /// of local history moves no ref, so it takes no phrase and no flag at all — while recording
+    /// the loss, which every backup then replicates, is refused until the exact phrase comes back.
+    #[test]
+    fn restoring_a_lost_store_file_costs_less_than_recording_its_loss() {
+        let cli =
+            Cli::try_parse_from(["hot_cheese", "restore-missing"]).expect("restore-missing parses");
+        assert!(matches!(cli.command, Some(Commands::RestoreMissing)));
+        assert!(
+            Cli::try_parse_from([
+                "hot_cheese",
+                "restore-missing",
+                ACCEPT_DELETION_FLAG,
+                ACCEPT_DELETION_PHRASE
+            ])
+            .is_err(),
+            "a verb that records nothing must not take a destruction phrase"
+        );
+
+        assert!(matches!(
+            require_typed_confirmation(ACCEPT_DELETION_PHRASE, ACCEPT_DELETION_FLAG, Some("y")),
+            Err(CliErr::ConfirmationRefused { .. })
+        ));
+        require_typed_confirmation(
+            ACCEPT_DELETION_PHRASE,
+            ACCEPT_DELETION_FLAG,
+            Some(ACCEPT_DELETION_PHRASE),
+        )
+        .expect("only the exact phrase records a loss");
+    }
+
+    /// `init --force` mints a new DEK, and wrote a fresh `Config` beside it — silently deleting
+    /// the backup remotes that hold the only copies of what that DEK just orphaned, along with
+    /// the pinned grant key `serve` needs. Only the store is init's to decide.
+    #[test]
+    fn a_forced_init_keeps_the_configuration_it_does_not_own() {
+        let mut existing = init_config(None, Path::new("/old/store"));
+        existing.backup_remotes = vec![BackupRemote {
+            host: "backup@10.0.0.2".to_string(),
+            folder: "hot_cheese_store".to_string(),
+        }];
+        existing.grant_public_key = Some("04aa".to_string());
+        existing.port = Some(8443);
+        existing.service = "com.operator.chosen".to_string();
+
+        let carried = init_config(Some(existing), Path::new("/new/store"));
+        assert_eq!(carried.store, "/new/store");
+        assert_eq!(carried.backup_remotes.len(), 1);
+        assert_eq!(carried.backup_remotes[0].host, "backup@10.0.0.2");
+        assert_eq!(carried.grant_public_key.as_deref(), Some("04aa"));
+        assert_eq!(carried.port, Some(8443));
+        assert_eq!(carried.service, "com.operator.chosen");
+
+        let fresh = init_config(None, Path::new("/new/store"));
+        assert_eq!(fresh.store, "/new/store");
+        assert!(fresh.backup_remotes.is_empty());
+        assert_eq!(fresh.service, DEFAULT_SERVICE);
+        assert_eq!(fresh.account, DEFAULT_ACCOUNT);
     }
 
     /// Sync is woven into the bundle verbs rather than being a verb, so its off switch has to
@@ -1977,17 +2603,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// Both surfaces that name an enclave key must render one key as the same 16 characters, or
-    /// the fingerprint an operator wrote down at `enroll` cannot be compared with the one `list`
-    /// and the console print, and the comparison this control exists for is worthless.
-    #[cfg(feature = "console")]
+    /// A squatted enclave key path has to be recoverable without a terminal too, and the discard
+    /// must always say WHICH of the two enclave keys it is about — a `grant` typo that removed
+    /// the KEK would cost the operator the enclave path.
     #[test]
-    fn the_cli_and_the_console_name_an_enclave_key_identically() {
-        let mut key = [4u8; 65];
-        key[1] = 9;
-        let printed = se_fingerprint(&key);
-        assert_eq!(printed.len(), 16);
-        assert_eq!(printed, hc_console::menu::se_fingerprint(&key));
+    fn discarding_an_enclave_key_names_the_key_and_takes_the_phrase_unattended() {
+        let cli = Cli::try_parse_from([
+            "hot_cheese",
+            "discard-enclave-key",
+            "se",
+            "--confirm-discard",
+            DISCARD_ENCLAVE_KEY_PHRASE,
+        ])
+        .expect("discard-enclave-key parses");
+        assert!(
+            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind, confirm_discard })
+                if kind == EnclaveKeyKind::Se
+                    && confirm_discard.as_deref() == Some(DISCARD_ENCLAVE_KEY_PHRASE))
+        );
+
+        let cli = Cli::try_parse_from(["hot_cheese", "discard-enclave-key", "grant"])
+            .expect("the grant key is the other target");
+        assert!(
+            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind, confirm_discard })
+                if kind == EnclaveKeyKind::Grant && confirm_discard.is_none())
+        );
+
+        assert!(
+            Cli::try_parse_from(["hot_cheese", "discard-enclave-key"]).is_err(),
+            "a discard that does not name which enclave key is not a discard"
+        );
+        assert!(Cli::try_parse_from(["hot_cheese", "discard-enclave-key", "TREASURY"]).is_err());
     }
 
     #[test]

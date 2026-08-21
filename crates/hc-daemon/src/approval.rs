@@ -2,63 +2,24 @@
 //! single biometric the Secure-Enclave op reuses away from it.
 use crate::renderer::{Decision, Renderer};
 use crate::runtime::UnlockGate;
-use crate::{OpContext, Operation, Peer};
-use hashbrown::HashMap;
+use crate::{OpContext, Operation};
 use hc_core::mac::local_auth::LaContext;
 use hc_sign::adapter::Summary;
 use hc_sign::SignErr;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Lines of the summary the Touch ID sheet carries, and the lines repeated directly above the
 /// terminal's `[y/N]`. Both are size-limited surfaces the operator answers from, so both take
 /// the WORST alarms the payload raised rather than whichever lines happen to come first; with
 /// no alarms to carry, the sheet falls back to the top of the body.
-const SHEET_LINES: usize = 3;
-
-/// How long the operator's explicit "stop asking about this caller" answer stays in force.
 ///
-/// Nothing else suppresses a prompt. A budget the daemon spends on its own cannot tell an
-/// attacker from the operator's own service — the two are byte-identical on an unauthenticated
-/// loopback listener — so a rule that refuses past a budget is a lever the attacker aims at
-/// everybody. Only the operator, at a prompt, may buy quiet, and it lapses by itself.
-pub const QUIET_PERIOD: Duration = Duration::from_secs(30);
-
-/// One caller's identity, as far as the listener can honestly tell callers apart.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Origin {
-    /// Every client of the loopback listener: it authenticates nobody, so they are one caller.
-    Loopback,
-    /// One adapter socket, named by the manifest that socket was bound for.
-    Adapter(String),
-}
-
-/// Which caller the operator would be silencing, or `None` for the operator's own keyboard,
-/// which no listener can reach and which therefore is never silenced.
-fn origin(peer: &Peer) -> Option<Origin> {
-    match peer {
-        Peer::Cli => None,
-        Peer::Loopback | Peer::Unattributed { .. } => Some(Origin::Loopback),
-        Peer::Adapter { manifest, .. } => Some(Origin::Adapter(manifest.manifest.id.clone())),
-    }
-}
-
-/// How much quiet one silenced caller has left, forgetting it once the quiet has run out so a
-/// single answer can never mute a caller for longer than the operator bought.
-fn quiet_left(
-    quiet: &mut HashMap<Origin, Instant>,
-    origin: &Origin,
-    now: Instant,
-) -> Option<Duration> {
-    let left = quiet.get(origin)?.saturating_duration_since(now);
-    if left.is_zero() {
-        quiet.remove(origin);
-        return None;
-    }
-    Some(left)
-}
+/// It is a budget for the alarms the payload's authority does not depend on. The sheet is the
+/// whole of what the biometric asks about — there is no body beneath it and nothing to scroll —
+/// so [`Summary::head`] spends this on nothing until every alarm that changes who controls the
+/// Safe is on it, however far past three lines that runs.
+const SHEET_LINES: usize = 3;
 
 /// Takes the human decision, then the one biometric a sign reuses. Only the thread that owns the
 /// [`crate::runtime::Runtime`] ever calls this, which is what keeps the `!Send` [`LaContext`] on
@@ -72,8 +33,6 @@ pub struct Approver {
     decision: Mutex<Decision>,
     /// How this session asks, and how it gives the terminal back.
     renderer: Arc<dyn Renderer>,
-    /// When each caller the operator silenced may be put in front of them again.
-    quiet: Mutex<HashMap<Origin, Instant>>,
 }
 
 impl Approver {
@@ -83,7 +42,6 @@ impl Approver {
             shown: AtomicU64::new(1),
             decision: Mutex::new(Decision::Deny),
             renderer,
-            quiet: Mutex::new(HashMap::new()),
         }
     }
 
@@ -96,31 +54,24 @@ impl Approver {
         &self.renderer
     }
 
-    /// Put one request in front of the operator. The only request that does not reach them is one
-    /// from a caller they themselves silenced within the last [`QUIET_PERIOD`]: every automatic
-    /// refusal was removed, because on an unauthenticated listener the daemon cannot tell a flood
-    /// from the operator's own service and would be refusing both.
+    /// Put one request in front of the operator. Every request that reaches this approver reaches
+    /// them: nothing here refuses one on its own, and nothing here carries an answer forward. The
+    /// operator's escape (`q`) denies the request they were asked about and everything already
+    /// queued behind it, and buys no silence past that — on the loopback listener every client is
+    /// the same unauthenticated caller, so "stop asking about this one" would be a promise to
+    /// refuse the operator's own service without ever showing them a request.
+    ///
+    /// That is a claim about this approver and not about the daemon. Two refusals still happen
+    /// with no prompt at all, both reachable by any loopback caller: a caller whose wait for a
+    /// place in the approval line outlasted `LINE_WAIT`, and every op already queued when the
+    /// operator escapes a prompt.
     pub fn approve(
         &self,
         ctx: &OpContext,
         summary: &Summary,
     ) -> Result<Option<LaContext>, SignErr> {
-        let origin = origin(&ctx.peer);
-        if let Some(origin) = &origin {
-            if let Some(left) = quiet_left(&mut self.quiet.lock(), origin, Instant::now()) {
-                *self.decision.lock() = Decision::Deny;
-                tracing::warn!(
-                    peer = %ctx.peer,
-                    op = ?ctx.op,
-                    key = %ctx.key,
-                    quiet_left_secs = left.as_secs(),
-                    "refusing a request without a prompt: the operator silenced this caller"
-                );
-                return Err(SignErr::ApprovalDenied);
-            }
-        }
         let seq = self.shown.fetch_add(1, Ordering::Relaxed);
-        let shown = match summary.alarms.is_empty() {
+        let shown = match summary.alarms().is_empty() {
             true => summary.to_string(),
             false => format!("{summary}\n{}", summary.head(SHEET_LINES)),
         };
@@ -130,16 +81,11 @@ impl Approver {
             Decision::Approve => {}
             Decision::NoTerminal => return Err(SignErr::NoApprovalTerminal),
             Decision::Cancel => {
-                if let Some(origin) = origin {
-                    self.quiet
-                        .lock()
-                        .insert(origin, Instant::now() + QUIET_PERIOD);
-                    tracing::warn!(
-                        peer = %ctx.peer,
-                        quiet_secs = QUIET_PERIOD.as_secs(),
-                        "the operator asked not to be shown this caller's requests"
-                    );
-                }
+                tracing::warn!(
+                    peer = %ctx.peer,
+                    seq,
+                    "the operator escaped the prompt: this request and the whole backlog are denied"
+                );
                 return Err(SignErr::ApprovalDenied);
             }
             Decision::Deny | Decision::Interrupt => return Err(SignErr::ApprovalDenied),
@@ -147,7 +93,7 @@ impl Approver {
         if self.gate == UnlockGate::Passphrase || ctx.op != Operation::Sign {
             return Ok(None);
         }
-        let head = match summary.alarms.is_empty() {
+        let head = match summary.alarms().is_empty() {
             true => summary
                 .body
                 .lines()
@@ -166,54 +112,28 @@ impl Approver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Quiet the operator bought must run out on its own and leave nothing behind, so no single
-    /// answer can silence a caller for longer than the operator asked for.
-    #[test]
-    fn bought_quiet_lapses_by_itself() {
-        let start = Instant::now();
-        let mut quiet = HashMap::new();
-        quiet.insert(Origin::Loopback, start + QUIET_PERIOD);
-
-        assert_eq!(
-            quiet_left(&mut quiet, &Origin::Loopback, start),
-            Some(QUIET_PERIOD)
-        );
-        assert_eq!(
-            quiet_left(&mut quiet, &Origin::Loopback, start + QUIET_PERIOD / 2),
-            Some(QUIET_PERIOD / 2)
-        );
-        assert_eq!(
-            quiet_left(&mut quiet, &Origin::Loopback, start + QUIET_PERIOD),
-            None
-        );
-        assert!(
-            quiet.is_empty(),
-            "a lapsed quiet must be forgotten, not left to be re-read"
-        );
-        assert_eq!(
-            quiet_left(&mut quiet, &Origin::Adapter("bot".to_string()), start),
-            None,
-            "silencing one caller may never silence another"
-        );
-    }
+    use crate::Peer;
 
     fn nothing_to_read() -> Summary {
         Summary {
-            alarms: Vec::new(),
+            authority: Vec::new(),
+            evictable: Vec::new(),
             body: String::new(),
         }
     }
 
-    /// Counts every prompt it was shown and answers all of them the same way.
+    /// Counts every prompt it was shown, keeps the last one's text, and answers all of them the
+    /// same way.
     struct Counting {
         answer: Decision,
         asked: Mutex<usize>,
+        shown: Mutex<String>,
     }
 
     impl Renderer for Counting {
-        fn ask(&self, _seq: u64, _ctx: &OpContext, _summary: &str) -> Decision {
+        fn ask(&self, _seq: u64, _ctx: &OpContext, summary: &str) -> Decision {
             *self.asked.lock() += 1;
+            *self.shown.lock() = summary.to_string();
             self.answer
         }
         fn restore(&self) {}
@@ -223,6 +143,7 @@ mod tests {
         let counting = Arc::new(Counting {
             answer,
             asked: Mutex::new(0),
+            shown: Mutex::new(String::new()),
         });
         let approver = Approver::new(UnlockGate::Biometric, counting.clone());
         (counting, approver)
@@ -255,59 +176,80 @@ mod tests {
         }
     }
 
-    /// The one prompt a request may not get is one from a caller the operator silenced at a
-    /// prompt of their own. It silences that caller and nobody else: the operator's keyboard and
-    /// every other socket keep their prompts.
+    /// The operator's escape denies the request it was typed at, and nothing after it. Loopback
+    /// clients are one unauthenticated caller, so a forward-looking silence keyed on the caller
+    /// would refuse the operator's own service for requests they were never shown — and the
+    /// refusal it produced was a `403` no correct client retries, for a condition meant to lapse.
     #[test]
-    fn only_the_operator_can_buy_quiet_and_only_for_the_caller_they_answered() {
+    fn escaping_a_prompt_buys_no_silence_from_the_next_request() {
         let (counting, approver) = counting(Decision::Cancel);
-        assert!(matches!(
-            approver.approve(&remote("TRADER"), &nothing_to_read()),
-            Err(SignErr::ApprovalDenied)
-        ));
-        assert_eq!(*counting.asked.lock(), 1);
-
-        for _ in 0..64 {
+        for asked in 1..=64 {
             assert!(matches!(
                 approver.approve(&remote("TRADER"), &nothing_to_read()),
                 Err(SignErr::ApprovalDenied)
             ));
+            assert_eq!(
+                *counting.asked.lock(),
+                asked,
+                "request {asked} was refused without ever being shown"
+            );
         }
         assert_eq!(
-            *counting.asked.lock(),
-            1,
-            "the operator asked for quiet and must get it"
+            approver.decision(),
+            Decision::Cancel,
+            "the escape must still be readable, so the queued backlog is drained once"
         );
 
-        let local = OpContext::local("TRADER".to_string(), Operation::EvmAddress);
-        for shown in 2..=17 {
-            assert!(matches!(
-                approver.approve(&local, &nothing_to_read()),
-                Err(SignErr::ApprovalDenied)
-            ));
-            assert_eq!(*counting.asked.lock(), shown);
-        }
-
-        approver.quiet.lock().clear();
+        let tunnelled = OpContext {
+            key: "TRADER".to_string(),
+            op: Operation::EvmAddress,
+            peer: Peer::Unattributed { tunnels: 2 },
+        };
         assert!(matches!(
-            approver.approve(&remote("TRADER"), &nothing_to_read()),
+            approver.approve(&tunnelled, &nothing_to_read()),
+            Err(SignErr::ApprovalDenied)
+        ));
+        let local = OpContext::local("TRADER".to_string(), Operation::EvmAddress);
+        assert!(matches!(
+            approver.approve(&local, &nothing_to_read()),
             Err(SignErr::ApprovalDenied)
         ));
         assert_eq!(
             *counting.asked.lock(),
-            18,
-            "once the quiet lapses the caller is heard again"
+            66,
+            "no peer, tunnelled or not, may lose its prompt to an answer given at another one"
         );
     }
 
-    /// A tunnelled loopback client and a plain one are the same unauthenticated transport, so
-    /// they must share one budget rather than doubling it by opening a tunnel.
+    /// [`SHEET_LINES`] is a budget for the alarms the Safe's authority does not turn on, and the
+    /// block this hands the operator is the whole of what they answer from. A payload that only
+    /// changes who controls the Safe must therefore reach that block whole — never the fallback
+    /// to the top of the body, which is for a payload that raised nothing, and never three of
+    /// six lines.
     #[test]
-    fn tunnelled_loopback_shares_the_loopback_budget() {
-        assert_eq!(
-            origin(&Peer::Loopback),
-            origin(&Peer::Unattributed { tunnels: 2 })
+    fn the_prompt_carries_every_authority_alarm_past_the_sheet_budget() {
+        let (counting, approver) = counting(Decision::Deny);
+        let mut authority = Vec::new();
+        for n in 1..=SHEET_LINES * 2 {
+            authority.push(format!("\u{26a0} OWNER ROTATION [{n}]: swapOwner"));
+        }
+        let summary = Summary {
+            authority,
+            evictable: Vec::new(),
+            body: "multiSend: 6 sub-calls".to_string(),
+        };
+
+        assert!(matches!(
+            approver.approve(&remote("TRADER"), &summary),
+            Err(SignErr::ApprovalDenied)
+        ));
+        let shown = counting.shown.lock().clone();
+        for alarm in &summary.authority {
+            assert!(shown.contains(alarm.as_str()), "{shown}");
+        }
+        assert!(
+            shown.ends_with(&summary.head(SHEET_LINES)),
+            "the block the operator answers from is the sheet, not the top of the body: {shown}"
         );
-        assert_eq!(origin(&Peer::Cli), None);
     }
 }

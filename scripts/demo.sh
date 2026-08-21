@@ -60,6 +60,8 @@ rm -rf -- "$HOT_CHEESE_HOME"
 
 echo
 echo "==> 1) init  (set a recovery passphrase when prompted, twice)"
+echo "    It must be at least 20 characters and use at least 8 distinct ones, or the prompt"
+echo "    refuses it and asks again. Something like 'demo throwaway passphrase 42' will do."
 "$BIN" init
 
 echo
@@ -144,7 +146,13 @@ echo "==> 10) read the filed bundle: who signed, who is still missing, the thres
 
 echo
 echo "==> 11) sign the bundle with DEMO_KEY"
-echo "    ONE Touch ID prompt: that approval mints the per-payload grant AND unlocks the key."
+echo "    First the decoded transaction is printed here and stops at 'Approve request #1? [y/N]'."
+echo "    Answer y. An answer typed inside the first 400ms is reported and asked again, and an"
+echo "    unanswered prompt denies itself between 60 and 80 seconds from now: 60 is the default"
+echo "    of approval_timeout_secs in config.toml, which takes 5..600, and the rest is a jitter"
+echo "    of a third of it, so the deadline is not a clock a caller can read. A denied one just"
+echo "    means re-running this command; each one is a fresh process, so it is never challenged."
+echo "    THEN ONE Touch ID prompt: that approval mints the per-payload grant AND unlocks the key."
 echo "    Only {r,s,v} is filed — never the private key."
 "$BIN" bundle sign "$HASH" --key DEMO_KEY --no-sync
 
@@ -162,4 +170,7 @@ echo "Everything else — the envelope, the Touch ID UX, per-request unlock, ser
 echo "backups, bootstrap — is IDENTICAL to the production Secure Enclave path."
 echo "To go live (no code signing needed): unset HOT_CHEESE_INSECURE_SOFTWARE_ENCLAVE,"
 echo "'cargo build --release', then 'hot_cheese se-selftest' and 'hot_cheese enroll se'."
+echo
+echo "This demo home is left where you can poke at it. Remove it when you are done:"
+echo "    rm -rf \"$HOT_CHEESE_HOME\""
 echo "============================================================================"

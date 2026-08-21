@@ -52,7 +52,6 @@ create_err_with_impls!(
     Se(hc_core::mac::secure_enclave::SeErr)
     ;
     GrantKeyMismatch { grant: String, key: String },
-    GrantTermsMismatch { approved: B256, granted: B256 },
     PolicyKeyMismatch { policy: String, intent: String }
 );
 
