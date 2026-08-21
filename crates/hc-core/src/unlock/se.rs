@@ -66,7 +66,7 @@ fn se_failure(e: secure_enclave::SeErr) -> UnlockErr {
     match e {
         SeErr::KeyNotFound => UnlockErr::SeKeyUnavailableTryUnlockPassphrase,
         source @ (SeErr::BadBlob
-        | SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey { .. }
+        | SeErr::UnrecordedEnclaveKeyAtKeyPath { .. }
         | SeErr::BlobNotOwnerOnly { .. }
         | SeErr::BlobNotAKeyFile { .. }) => {
             tracing::error!(
@@ -280,7 +280,7 @@ mod tests {
             SeErr::InvalidLabel {
                 label: "a_b".into(),
             },
-            SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey {
+            SeErr::UnrecordedEnclaveKeyAtKeyPath {
                 path: path.clone(),
                 found: "0123456789abcdef".into(),
                 recorded: Vec::new(),
@@ -322,7 +322,7 @@ mod tests {
         let path = PathBuf::from("/nonexistent/se_kek_hotcheese.blob");
         let present_but_unproven = [
             SeErr::BadBlob,
-            SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey {
+            SeErr::UnrecordedEnclaveKeyAtKeyPath {
                 path: path.clone(),
                 found: "0123456789abcdef".into(),
                 recorded: vec!["fedcba9876543210".into()],

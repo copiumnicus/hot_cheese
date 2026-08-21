@@ -181,6 +181,10 @@ const MAX_GIT_PROCESS_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REMOTE_VAULTS: usize = 1024;
+/// Commits [`keyrings_in_history`] reads back. A replaced keyring is one commit behind the
+/// replacement, and every enrollment ever recorded here is worth naming, but a store whose history
+/// is long must not turn one question into an unbounded walk of the object database.
+const MAX_HISTORY_KEYRINGS: usize = 256;
 
 /// Store files one `hash-object` names at a time. A store may hold [`hc_core::MAX_STORE_FILES`] of
 /// them and every path is absolute, so the whole set in one argument list would approach `ARG_MAX`
@@ -2292,6 +2296,41 @@ pub fn committed_vault(store: &Path) -> Result<LocalVault, GitErr> {
         Some(v) => Ok(LocalVault::Id(v)),
         None => Ok(LocalVault::Legacy),
     }
+}
+
+/// Every keyring this store's own history still holds, newest first, bounded by
+/// [`MAX_HISTORY_KEYRINGS`]. A replacing init commits the keyring it is about to overwrite one
+/// step before the replacement, so the enrollments only a replaced keyring records — the enclave
+/// key an operator is otherwise told to discard — are still readable here. A commit whose tree
+/// carries no keyring, or one this version cannot parse, is a commit with no keyring to offer and
+/// not a failure.
+pub fn keyrings_in_history(store: &Path) -> Result<Vec<(CommitId, Keyring)>, GitErr> {
+    let git_dir = store.join(GIT_DIR);
+    match std::fs::symlink_metadata(&git_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(GitErr::UnsafeGitDirectory { path: git_dir }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+    let Some(head) = rev(store, "HEAD")? else {
+        return Ok(Vec::new());
+    };
+    let bound = MAX_HISTORY_KEYRINGS.to_string();
+    let listed = git(
+        Some(store),
+        GitOp::Commit,
+        &["rev-list", "--max-count", &bound, &head.to_string()],
+    )?;
+    let mut held = Vec::new();
+    for line in String::from_utf8_lossy(&listed).lines() {
+        let Ok(commit) = parse_id(line.as_bytes(), GitOp::Commit) else {
+            continue;
+        };
+        if let Ok(keyring) = keyring_at(store, commit, GitOp::Commit) {
+            held.push((commit, keyring));
+        }
+    }
+    Ok(held)
 }
 
 /// This install's vault id, minting and saving one for a keyring written before vault ids

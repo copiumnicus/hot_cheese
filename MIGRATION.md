@@ -151,8 +151,8 @@ or any keystore file — and names what it found:
 ExistingStore { store: "…/store", keyring: true, keystores: 3 }
 ```
 
-That guard exists because a second `init` mints a **new DEK**, which permanently orphans
-every keystore encrypted under the old one.
+That guard exists because a second `init` mints a **new DEK**, which orphans every keystore
+encrypted under the old one: the new install cannot read a single one of them.
 
 `--force` no longer overrides that silently. It first lists **every casualty** — each
 keystore the new DEK orphans, by name, and each enrollment the new keyring discards, by id
@@ -162,14 +162,27 @@ and label — and then requires the phrase back, typed exactly:
 destroy the existing hot_cheese keys
 ```
 
-Anything else is `ConfirmationRefused`. With no terminal, pass
-`--confirm-destroy 'destroy the existing hot_cheese keys'`; a non-interactive `--force`
-without it fails with `ConfirmationNeedsTerminal` rather than proceeding. An empty store
-skips the ceremony.
+Anything else is `ConfirmationRefused`. **No flag carries the phrase**: a `--force` with no
+terminal fails with `ConfirmationOnlyFromATerminal` and changes nothing, so nothing running
+unattended as you can reach the destruction. An empty store skips the ceremony.
+
+The forced init is **recoverable**, and says so at the moment it happens. Before minting the
+new DEK it commits the keyring it is about to replace to the store's own git history, then
+prints that commit and the line that checks it back out:
+
+```
+run=git -C <store> checkout <40 hex> -- keyring.json && chmod 600 <store>/keyring.json
+```
+
+Run it, then read the orphaned keys with `--unlock passphrase` and the **old** recovery
+passphrase. Two things end that route: losing the old passphrase, and losing this store's git
+history — nothing else on the machine holds that keyring. Until then, do **not** run
+`discard-enclave-key`: after a forced init the old enclave key reads as unrecorded against the
+new keyring, and discarding it deletes the Touch-ID half of the envelope the recovered keyring
+still opens. `enroll se` names the commit that records it instead.
 
 `hot_cheese accept-deletions` takes consent the same way, with its own phrase
-`record the loss of these hot_cheese files` (or
-`--confirm-deletion 'record the loss of these hot_cheese files'` where there is no terminal).
+`record the loss of these hot_cheese files`, also typed on a terminal and carried by no flag.
 It is the recovery for a store wedged by a store file that is genuinely gone (§8).
 
 A second `init` also mints a **new vault id** (§8), so its backups land *beside* the old
@@ -781,7 +794,8 @@ confirmation — the phrase
 roll this store back
 ```
 
-typed back, or `--confirm-rewind 'roll this store back'` where there is no terminal. The
+typed on a terminal, which no flag carries: a pull with no terminal fails with
+`ConfirmationOnlyFromATerminal` instead of applying. The
 reason is that a fast-forward proves **ancestry and nothing else** — not authorship, not
 freshness, and the remote's commit timestamp is chosen by whoever wrote it. A hostile or
 merely stale backup host could otherwise serve an older, perfectly ancestor-consistent state
@@ -808,8 +822,9 @@ hot_cheese accept-deletions
 ```
 
 It names every missing file and dropped enrollment, then requires
-`record the loss of these hot_cheese files` typed back (`--confirm-deletion '<phrase>'` with no
-terminal; anything else is `ConfirmationRefused`, and a store with nothing gone answers
+`record the loss of these hot_cheese files` typed on a terminal (anything else is
+`ConfirmationRefused`; no terminal at all is `ConfirmationOnlyFromATerminal`, which is what
+keeps an unattended run from recording your loss; and a store with nothing gone answers
 `NoDeletionsToAccept`). It is **CLI-only** — the interactive console cannot do it, because its
 runtime opens the store at startup and that open is the commit already failing. If the missing
 file is `keyring.json` **itself** there is no vault to commit under and it fails with
@@ -977,8 +992,13 @@ command failed error=ApiBackend(Unlock(SeKeyPresentButUnprovenTryUnlockPassphras
 
 The last one is the only one that also refuses to point at a re-enrollment: a key is sitting at
 this machine's key path that no enrollment records, and re-enrolling would wrap this vault's DEK
-under it. Compare the fingerprint it prints with the `se_key` of every enrollment `list` shows;
-if it is none of them, `hot_cheese discard-enclave-key se` removes it behind a typed phrase.
+under it. Compare the fingerprint it prints with the `se_key` of every enrollment `list` shows.
+If it is none of them, check whether an earlier keyring in this store's history records it before
+removing anything: after a forced init the old enclave key reads as unrecorded against the new
+keyring, and discarding it deletes the Touch-ID half of the envelope the recovered keyring still
+opens. `enroll se` names that commit when one exists, and refuses to recommend discarding.
+`hot_cheese discard-enclave-key se` removes it behind a typed phrase only when nothing in history
+claims it.
 
 The escape hatch is the global `--unlock <se|passphrase>` flag, accepted by every command
 that unlocks the DEK (`address`, `add`, `generate`, `bundle sign`, `seal`, `enroll`, `migrate`),
@@ -1028,7 +1048,7 @@ design. `hot_cheese list` warns when no passphrase is enrolled.
 | `GetPassword(NonzeroStatus(-128))` | The login-Keychain ACL dialog was cancelled. | Re-run and choose **Allow**. |
 | `Unlock(SeKeyUnavailableTryUnlockPassphrase)` | This machine's Secure Enclave key blob is missing. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
 | `Unlock(SeKeyUnusableTryUnlockPassphrase { .. })` | The blob is there and the enclave will not use it — a Touch ID re-enrollment alone does this. | Re-run with `--unlock passphrase`, then follow *Recovery* above. |
-| `Unlock(SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { .. })` | A key no enrollment records is at this machine's key path. | Re-run with `--unlock passphrase`. Do **not** re-enrol until you have compared the printed fingerprint with `list`; `discard-enclave-key se` removes it if it is not yours. |
+| `Unlock(SeKeyPresentButUnprovenTryUnlockPassphraseDoNotReenroll { .. })` | A key no enrollment records is at this machine's key path. | Re-run with `--unlock passphrase`. Do **not** re-enrol, and do **not** discard, until you have compared the printed fingerprint with `list` *and* checked this store's history: after a forced init the old key reads as unrecorded against the new keyring, and discarding it deletes the Touch-ID half of the envelope the recovered keyring still opens. |
 
 In every case the old store is left **byte-for-byte unchanged** and no partial new store
 is produced.

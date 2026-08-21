@@ -359,10 +359,26 @@ id and label — and then demands the phrase back, typed exactly:
 destroy the existing hot_cheese keys
 ```
 
-Anything else refuses (`ConfirmationRefused`). With no terminal to type it on, pass it as
-`--confirm-destroy 'destroy the existing hot_cheese keys'`; without that flag a
-non-interactive `--force` fails with `ConfirmationNeedsTerminal` rather than proceeding.
+Anything else refuses (`ConfirmationRefused`). **There is no flag that carries the phrase.**
+A `--force` with no terminal to type it on fails with `ConfirmationOnlyFromATerminal` and
+changes nothing, so no script, cron job or agent running as you can reach the destruction —
+see [A destructive command requires a terminal](#a-destructive-command-requires-a-terminal).
 A store `init` finds empty skips the whole ceremony.
+
+**A forced init is recoverable, and it tells you how.** Before the new DEK is minted, `init`
+commits the keyring it is about to replace to the store's own git history, then prints that
+commit and the exact line that checks it back out:
+
+```
+RECOVERY: this commit carries the keyring that unwraps the OLD DEK …
+  commit=<40 hex>
+  run=git -C <store> checkout <40 hex> -- keyring.json && chmod 600 <store>/keyring.json
+```
+
+Run that line and `hot_cheese --unlock passphrase address …` with the **old** recovery
+passphrase reads every orphaned keystore again, byte for byte. The keys are unreadable by the
+*new* install, not destroyed — for as long as **this store's git history** survives, which is
+the only copy of that keyring on the machine.
 
 ### 2. (Optional) Enroll the Secure Enclave
 
@@ -524,7 +540,7 @@ peer cannot hold listener slots without asking for anything.
 
 | Command | What it does |
 | --- | --- |
-| `init [--import-cert <pem> --import-key <pem>] [--force [--confirm-destroy <phrase>]]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase (≥20 chars, ≥8 distinct), print the cert fingerprint. `--force` over an existing store lists every keystore and enrollment it destroys and then requires the phrase `destroy the existing hot_cheese keys` typed back — `--confirm-destroy` carries it where there is no terminal. |
+| `init [--import-cert <pem> --import-key <pem>] [--force]` | Create home/store, write the TLS cert, mint the DEK, require a recovery passphrase (≥20 chars, ≥8 distinct), print the cert fingerprint. `--force` over an existing store lists every keystore and enrollment it replaces, then requires the phrase `destroy the existing hot_cheese keys` **typed on a terminal**, commits the old keyring to the store's history, and prints the line that checks it back out. |
 | `enroll se [--label <s>]` | Enroll this machine's Secure Enclave as a KEK for the same DEK. No code signing, and **no Touch ID prompt** — it needs only the enclave's public key. Ends on `MINTED` (new key, trusted set changed) or `ADOPTED` (key already on disk taken up), naming it as `se_key=<16 hex>`. Record it and compare it. |
 | `enroll passphrase [--label <s>]` | Enroll an additional recovery passphrase. Records no enclave key, so it prints no fingerprint. |
 | `enroll grant` | Create this machine's Secure Enclave **grant-signing** key and pin its public key in `config.toml`. Prompts nothing — no Touch ID, no passphrase. Required before `serve` or `bundle sign`. Prints `MINTED`/`ADOPTED` with `grant_key=<16 hex>`. Losing this key is benign; re-run to recover. |
@@ -555,10 +571,10 @@ peer cannot hold listener slots without asking for anything.
 | `backup status` | Print this install's vault, its local commit, and every configured remote. No network, no write, no claim. |
 | `backup push` | Push this install's commits to every configured remote, under its vault id. Fails only when **every** remote failed. |
 | `backup fetch` | Fetch and validate every remote without changing the active store. Reports `remote ahead` or fails with `Diverged` when histories fork. |
-| `backup pull --force [--vault <id>] [--confirm-rewind <phrase>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. A pull that is **not** a purely additive fast-forward — one that forks, rewinds onto an ancestor, deletes store files, or replaces store files with older content — additionally requires the phrase `roll this store back`. |
+| `backup pull --force [--vault <id>]` | **Destructive.** Throw away this machine's commits for the first remote's. Without `--force` it names every file it would delete and refuses. A pull that is **not** a purely additive fast-forward — one that forks, rewinds onto an ancestor, deletes store files, adds ones this machine never had, or replaces store files with older content — additionally requires the phrase `roll this store back` **typed on a terminal**, and one that strands every enrollment requires `give up every unlock path on this machine` as well. |
 | `backup list` | List the vaults sharing the first remote's folder, flagging this install's. Prompts nothing. |
-| `accept-deletions [--confirm-deletion <phrase>]` | Record store files or enrollments that are **already gone**, which every other command refuses to commit. Names each one, then requires the phrase `record the loss of these hot_cheese files` typed back — `--confirm-deletion` carries it where there is no terminal. CLI-only, and the only way out of a store wedged by a missing file. |
-| `discard-enclave-key <se\|grant> [--confirm-discard <phrase>]` | Remove an enclave key blob squatting this machine's key path, which otherwise blocks the Secure Enclave path for good. Prints the path, the squatter's fingerprint and every fingerprint this install records, then requires the phrase `discard this unrecorded hot_cheese enclave key` typed back — `--confirm-discard` carries it where there is no terminal. **Refuses outright** to touch a key this install DOES record. |
+| `accept-deletions` | Record store files or enrollments that are **already gone**, which every other command refuses to commit. Names each one, then requires the phrase `record the loss of these hot_cheese files` **typed on a terminal**. CLI-only, and the only way out of a store wedged by a missing file. |
+| `discard-enclave-key <se\|grant>` | Remove an enclave key blob squatting this machine's key path, which otherwise blocks the Secure Enclave path for good. Prints the path, the squatter's fingerprint, every fingerprint this install records, and whether the store's **history** holds a keyring that records it, then requires the phrase `discard this unrecorded hot_cheese enclave key` **typed on a terminal**. **Refuses outright** to touch a key this install DOES record. |
 | `migrate --old-store <dir> --new-store <dir> [--shareable <name>]…` | Migrate legacy Keychain-master keystores into the envelope format. Everything not named `--shareable` lands `sign_only` (see [MIGRATION.md](./MIGRATION.md)). |
 | `bootstrap-from <user@host> [--recovery-passphrase]` | Bootstrap this machine's DEK + store from an authority machine over SSH. Enrolls this machine's Secure Enclave only, unless `--recovery-passphrase` also enrolls a recovery passphrase read from a masked prompt (or from stdin with no terminal). |
 
@@ -575,6 +591,36 @@ unlocker would answer every request from one startup prompt and lose the per-req
 approval — recover, `enroll se` again, then serve.
 
 Logging defaults to `INFO`; override with `RUST_LOG=debug` (or `trace`/`warn`/`error`).
+
+### A destructive command requires a terminal
+
+Five operations can cost you key material or history, and each takes consent as an exact
+phrase typed back:
+
+| Command | Phrase |
+| --- | --- |
+| `init --force` over a store that holds anything | `destroy the existing hot_cheese keys` |
+| `backup pull --force` that is not a purely additive fast-forward | `roll this store back` |
+| `backup pull --force` that strands every enrollment | `give up every unlock path on this machine` |
+| `accept-deletions` | `record the loss of these hot_cheese files` |
+| `discard-enclave-key <se\|grant>` | `discard this unrecorded hot_cheese enclave key` |
+
+**None of them can be answered by an argument.** There is no `--yes`, and no flag carries any
+of these phrases. If stdin is not a terminal the command fails with
+`ConfirmationOnlyFromATerminal { required }` and changes nothing — no ref moves, no file is
+removed, no DEK is minted.
+
+That is deliberate, and it is the whole guard rather than a convenience. Every phrase above is
+a **public constant in this source**, so any process running as you — a shell script, a CI job,
+a coding agent with your shell — can read the phrase and repeat it. What it cannot produce is a
+terminal on your session. Taking the phrases off the command line does not make them secret; it
+makes the destruction unreachable to anything that is not a human at a keyboard. Automating
+around it (a pty, an `expect` script) is automating a decision the tool deliberately declines to
+take on your behalf.
+
+Nothing else changes: the destructive verbs all still exist, because disaster recovery needs
+them. `backup pull --force` still restores a lost store and `accept-deletions` still unwedges
+one. They ask you, at a terminal, first.
 
 ---
 
@@ -1804,9 +1850,10 @@ typed exactly:
 record the loss of these hot_cheese files
 ```
 
-Anything else is `ConfirmationRefused`. With no terminal, carry it as
-`--confirm-deletion 'record the loss of these hot_cheese files'`; without that flag a
-non-interactive run fails with `ConfirmationNeedsTerminal` rather than proceeding. A store
+Anything else is `ConfirmationRefused`. No flag carries the phrase: with no terminal the run
+fails with `ConfirmationOnlyFromATerminal` and records nothing, which is what stops a script
+or an agent from committing your loss for you
+([details](#a-destructive-command-requires-a-terminal)). A store
 with nothing gone answers `NoDeletionsToAccept` and writes nothing. The consent covers exactly
 the loss it named: if the store loses something else while the question is open, the commit is
 refused (`LossPreviewStale`) rather than recorded against an answer nobody gave.
@@ -1839,8 +1886,9 @@ shown):
 | `Deletes` | a fast-forward that **drops store files** your local commit has |
 | `Contents` | a fast-forward that deletes nothing and discards no commit, and **replaces** the content of security-relevant store files with older bytes |
 
-With no terminal, carry it as `--confirm-rewind 'roll this store back'`; without that the
-non-interactive pull fails with `ConfirmationNeedsTerminal` instead of applying. The
+No flag carries that phrase either: with no terminal the pull fails with
+`ConfirmationOnlyFromATerminal` instead of applying
+([details](#a-destructive-command-requires-a-terminal)). The
 preview and the commit the confirmation refers to are pinned, so a background fetch between
 the question and the answer cannot change what you agreed to.
 
@@ -2131,8 +2179,10 @@ Specific residual risks:
   own: it is taken as this machine's key only when its public point is **already
   recorded** — `se_pub` in a `keyring.json` enrollment for the KEK, `grant_public_key` in
   `config.toml` for the grant key — and an unrecorded blob is refused outright
-  (`UnrecordedEnclaveKeyRunDiscardEnclaveKey`, which names the squatter's fingerprint next
-  to every fingerprint this install records, and points at `discard-enclave-key`). That
+  (`UnrecordedEnclaveKeyAtKeyPath`, which names the squatter's fingerprint next
+  to every fingerprint this install records and recommends nothing, because whether the
+  key at that path is a squatter or the previous keyring's is a question only the store's
+  history answers — `enroll se` and `discard-enclave-key` look there). That
   closes the path where a same-uid process planted a
   **non-biometric** enclave key and the next enrollment adopted it as the KEK, after
   which the DEK unwrapped with no biometric at all. What remains: `keyring.json` is plain

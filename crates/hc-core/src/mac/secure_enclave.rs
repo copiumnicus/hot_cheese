@@ -68,7 +68,7 @@ create_err_with_impls!(
     BadSignatureLen { len: usize },
     GrantReuseWindowExceeded { elapsed_ms: u64, window_ms: u64 },
     InvalidLabel { label: String },
-    UnrecordedEnclaveKeyRunDiscardEnclaveKey { path: PathBuf, found: String, recorded: Vec<String> },
+    UnrecordedEnclaveKeyAtKeyPath { path: PathBuf, found: String, recorded: Vec<String> },
     EnclaveKeyPathOccupied { path: PathBuf },
     BlobNotOwnerOnly { path: PathBuf },
     BlobNotAKeyFile { path: PathBuf },
@@ -385,9 +385,9 @@ fn ensure_enclave_key_at(
                 ?recorded,
                 "an enclave key this install never recorded is sitting at the key path; refusing \
                  to adopt it as this machine's key. Compare `found` with the `se_key` of every \
-                 enrollment; if it is none of them, `hot_cheese discard-enclave-key` removes it"
+                 enrollment; do not remove that file on this refusal alone"
             );
-            return Err(SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey {
+            return Err(SeErr::UnrecordedEnclaveKeyAtKeyPath {
                 path: path.to_path_buf(),
                 found,
                 recorded,
@@ -922,7 +922,7 @@ mod tests {
         assert!(
             matches!(
                 ensure_enclave_key_at(&path, &[], SE_KEK_OPS),
-                Err(SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey { .. })
+                Err(SeErr::UnrecordedEnclaveKeyAtKeyPath { .. })
             ),
             "an enclave key no enrollment records must not be adopted"
         );
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(
             matches!(
                 &refusal,
-                Err(SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey { found, recorded, .. })
+                Err(SeErr::UnrecordedEnclaveKeyAtKeyPath { found, recorded, .. })
                     if *found == se_fingerprint(&planted_pub) && recorded.is_empty()
             ),
             "{refusal:?}"
@@ -1025,7 +1025,7 @@ mod tests {
         assert!(
             matches!(
                 &refusal,
-                Err(SeErr::UnrecordedEnclaveKeyRunDiscardEnclaveKey { found, recorded, .. })
+                Err(SeErr::UnrecordedEnclaveKeyAtKeyPath { found, recorded, .. })
                     if *found == se_fingerprint(&planted_pub)
                         && *recorded == [se_fingerprint(&unrelated)]
             ),

@@ -16,6 +16,7 @@ HC_DRYRUN_ALLOW_ANY_PATH="${HC_DRYRUN_ALLOW_ANY_PATH:-}"
 FROM_PHASE="${FROM_PHASE:-}"
 ONLY_PHASES="${ONLY_PHASES:-}"
 DRY_APPROVAL_SECS="${DRY_APPROVAL_SECS:-20}"
+PTY_SETTLE_SECS="${PTY_SETTLE_SECS:-0.6}"
 
 SE_LABEL="hotcheese.se.kek.v1"
 GRANT_LABEL="hotcheese.se.grant.v1"
@@ -309,10 +310,35 @@ run_tty() {
   set -o pipefail
 }
 
+run_pty() {
+  local tag="$1" typed="$2"
+  shift 2
+  RUN_LOG="$OUT_DIR/$tag.log"
+  echo "  ---> $*"
+  echo "  ---> typed into the pty: '$typed'"
+  set +o pipefail
+  { sleep "$PTY_SETTLE_SECS"; printf '%s\n' "$typed"; sleep "$PTY_SETTLE_SECS"; } |
+    script -q /dev/null "$@" 2>&1 | tee "$RUN_LOG"
+  RUN_RC=${PIPESTATUS[1]}
+  set -o pipefail
+}
+
 assert_cmd_fails_with() {
   local tag="$1" needle="$2"
   shift 2
   run_cmd "$tag" "$@"
+  if [[ "$RUN_RC" -eq 0 ]]; then
+    fail "$tag: expected a non-zero exit, got 0"
+  else
+    pass "$tag: exited $RUN_RC as expected"
+  fi
+  assert_contains "$tag: error names $needle" "$needle" "$RUN_LOG"
+}
+
+assert_pty_fails_with() {
+  local tag="$1" needle="$2" typed="$3"
+  shift 3
+  run_pty "$tag" "$typed" "$@"
   if [[ "$RUN_RC" -eq 0 ]]; then
     fail "$tag: expected a non-zero exit, got 0"
   else
@@ -690,7 +716,8 @@ echo "    phase 2  3 passphrase + 1 Touch ID"
 echo "    phase 3  7 Touch ID   (five key operations, one on a file whose use flag was forged,"
 echo "                           and one to mint the read grant; the read grant a sign-only key"
 echo "                           is refused costs 0; plus one short secret at a hidden prompt)"
-echo "    phase 4  0            (enroll grant and discard-enclave-key prompt NOTHING)"
+echo "    phase 4  0            (enroll grant prompts NOTHING; discard-enclave-key asks for its"
+echo "                           phrase, and this script types that into a pty of its own)"
 echo "    phase 5  1 Touch ID   (the allowed sign; all six refusals cost 0)"
 echo "    phase 6  2 Touch ID   (the shareable /read, and the ONE attributable answer at the"
 echo "                           challenged prompt; the sign-only /read, the expired prompt,"
@@ -705,6 +732,13 @@ echo "  with RUN_MIGRATE=1 add phase M: 2 Touch ID + 3 passphrase + 1 login-keyc
 echo "    (phase M now initializes its OWN throwaway install, because migrate refuses any"
 echo "     --new-store that is not the configured store and refuses one holding keystores;"
 echo "     budget up to 4 taps in case macOS re-prompts)"
+echo
+echo "NO DESTRUCTION IN THIS RUN IS TYPED BY YOU, AND NONE OF THEM IS REACHABLE FROM AN"
+echo "ARGUMENT ANY MORE. accept-deletions, discard-enclave-key, init --force and a rewinding"
+echo "backup pull take their phrase from a terminal and from nowhere else — the flags that used"
+echo "to carry one are gone. Every destructive phase below therefore does two things: it checks"
+echo "that the command REFUSES with no terminal, which is what stops a script or an agent, and"
+echo "then types the phrase into a pty the way a human at a terminal would."
 echo
 echo "EVERY NEW PASSPHRASE THIS RUN ASKS FOR MUST BE AT LEAST 20 CHARACTERS AND USE AT LEAST"
 echo "8 DISTINCT CHARACTERS. The rule is enforced at the prompt, before any file is written,"
@@ -917,7 +951,7 @@ echo "  OK    and its .log and .json files are copied to $LOG_KEEP on exit, abor
 
 echo
 echo "==> required tools"
-for tool in cargo swiftc openssl curl shasum lsof security cmp stat find tr sed; do
+for tool in cargo swiftc openssl curl shasum lsof security cmp stat find tr sed script; do
   if command -v "$tool" > /dev/null 2>&1; then
     pass "tool present: $tool"
   else
@@ -1480,11 +1514,13 @@ assert_eq "the honest pin is back in config.toml" "$CFG_GRANT_PUB" "$(toml_value
 echo
 echo "==> 4b: that refusal is permanent, so there has to be a way out of it. discard-enclave-key"
 echo "    is it, and its whole safety is that it will NOT act on a key this install records:"
-echo "    the phrase is checked AFTER the key is identified, so knowing the phrase buys nothing"
-echo "    against your own key. Both of this machine's enclave keys are recorded right now."
+echo "    the phrase is asked for AFTER the key is identified, so the refusals below never reach"
+echo "    a prompt at all. Both of this machine's enclave keys are recorded right now."
+echo "    NOTHING here is typed by you: no flag carries a destruction phrase any more, so this"
+echo "    script types each one into a pty of its own, exactly as a human at a terminal would."
 SE_SHA_GUARDED="$(shasum -a 256 "$SE_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
 assert_cmd_fails_with p4_discard_recorded_se "RecordedEnclaveKeyNotDiscardable" \
-  "$BIN" discard-enclave-key se --confirm-discard "$DISCARD_PHRASE"
+  "$BIN" discard-enclave-key se
 if [[ -n "$SE_KEY_FP" ]]; then
   assert_contains "and it names the enclave key it is protecting, by the fingerprint list shows" \
     "$SE_KEY_FP" "$RUN_LOG"
@@ -1494,28 +1530,38 @@ fi
 assert_eq "the refused discard left the KEK blob byte-identical" \
   "$SE_SHA_GUARDED" "$(shasum -a 256 "$SE_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
 assert_cmd_fails_with p4_discard_recorded_grant "RecordedEnclaveKeyNotDiscardable" \
-  "$BIN" discard-enclave-key grant --confirm-discard "$DISCARD_PHRASE"
+  "$BIN" discard-enclave-key grant
 assert_eq "and left the grant blob byte-identical" \
   "$GRANT_SHA_BEFORE" "$(shasum -a 256 "$GRANT_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
 
 echo
 echo "==> now drop the pin again, which is exactly the state the refusal above leaves an"
-echo "    operator in: a blob at the grant path that nothing records. The wrong phrase must"
-echo "    still refuse, and must leave the blob where it is."
+echo "    operator in: a blob at the grant path that nothing records. WITHOUT A TERMINAL the"
+echo "    destruction is not reachable at all — this is the assertion that stands between an"
+echo "    automated process running as you and a destroyed key, now that no flag carries the"
+echo "    phrase. Then the wrong phrase, typed into a pty, must still refuse and leave the blob."
 write_config "$CFG_SERVICE" "$CFG_ACCOUNT" ""
-assert_cmd_fails_with p4_discard_wrong_phrase "ConfirmationRefused" \
-  "$BIN" discard-enclave-key grant --confirm-discard "yes"
+assert_cmd_fails_with p4_discard_no_terminal "ConfirmationOnlyFromATerminal" \
+  "$BIN" discard-enclave-key grant
+assert_contains "the refusal states the phrase a terminal would have to type" \
+  "$DISCARD_PHRASE" "$RUN_LOG"
+assert_eq "the no-terminal refusal destroyed nothing" \
+  "$GRANT_SHA_BEFORE" "$(shasum -a 256 "$GRANT_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
+assert_pty_fails_with p4_discard_wrong_phrase "ConfirmationRefused" "yes" \
+  "$BIN" discard-enclave-key grant
 assert_contains "and the refusal states the phrase it wanted" "$DISCARD_PHRASE" "$RUN_LOG"
 assert_eq "the wrong phrase destroyed nothing" \
   "$GRANT_SHA_BEFORE" "$(shasum -a 256 "$GRANT_BLOB" 2>/dev/null | cut -d' ' -f1 || true)"
 
 echo
-echo "==> and the right phrase removes that ONE file and nothing else."
-run_cmd p4_discard_grant "$BIN" discard-enclave-key grant --confirm-discard "$DISCARD_PHRASE"
+echo "==> and the right phrase, typed at a terminal, removes that ONE file and nothing else."
+run_pty p4_discard_grant "$DISCARD_PHRASE" "$BIN" discard-enclave-key grant
 assert_eq "discard-enclave-key grant exit code" "0" "$RUN_RC"
 assert_contains "it named the key it was about to remove, by fingerprint" "found=" "$RUN_LOG"
 assert_contains "it said this install records none of that kind" \
   "this install records NO enclave key of this kind" "$RUN_LOG"
+assert_contains "and it looked in the store's HISTORY too, before destroying anything" \
+  "no keyring in this store's history records this enclave key" "$RUN_LOG"
 assert_contains "and it points at the command that mints a replacement" "enroll grant" "$RUN_LOG"
 if [[ -e "$GRANT_BLOB" ]]; then
   fail "the grant blob survived the discard: $GRANT_BLOB"
@@ -1528,7 +1574,7 @@ else
   fail "the discard took the KEK blob $SE_BLOB with it"
 fi
 assert_cmd_fails_with p4_discard_twice "NoEnclaveKeyToDiscard" \
-  "$BIN" discard-enclave-key grant --confirm-discard "$DISCARD_PHRASE"
+  "$BIN" discard-enclave-key grant
 
 echo
 echo "==> with the pin back but the key it names gone, serve must refuse for the OTHER reason"
@@ -2242,7 +2288,7 @@ echo "    'the key is gone' and 'something else is squatting on your key path' a
 echo "    problems, and this is the one command that must never confuse them."
 BIO_START="$(bio_window_start)"
 assert_cmd_fails_with p7_discard_absent "NoEnclaveKeyToDiscard" \
-  "$BIN" discard-enclave-key se --confirm-discard "$DISCARD_PHRASE"
+  "$BIN" discard-enclave-key se
 assert_contains "and it names the empty path it looked at" "$SE_BLOB" "$RUN_LOG"
 assert_taps "that refusal cost no biometric" "0" "$BIO_START"
 
@@ -2324,21 +2370,20 @@ assert_cmd_fails_with p8_list "NoBackupRemote" "$BIN" backup list
 assert_cmd_fails_with p8_pull "NoBackupRemote" "$BIN" backup pull
 
 echo
-echo "==> a forced pull now has two separate confirmations, because it can cost two different"
+echo "==> a forced pull still has two separate confirmations, because it can cost two different"
 echo "    things: history it rewinds, and the last enrollment this machine can unwrap its own"
-echo "    DEK with. Neither phrase is reachable without --force, and neither buys a pull when"
-echo "    there is no remote — which is as far as an offline rehearsal can take them."
-assert_cmd_fails_with p8_rewind_needs_force "required arguments were not provided" \
-  "$BIN" backup pull --confirm-rewind "$PULL_REWIND_PHRASE"
-assert_contains "and names --force as the one it wants" "--force" "$RUN_LOG"
-assert_cmd_fails_with p8_lost_needs_force "required arguments were not provided" \
-  "$BIN" backup pull --confirm-lost-enrollments "$PULL_LOST_ENROLLMENTS_PHRASE"
-assert_cmd_fails_with p8_pull_forced "NoBackupRemote" \
-  "$BIN" backup pull --force --confirm-rewind "$PULL_REWIND_PHRASE" \
-  --confirm-lost-enrollments "$PULL_LOST_ENROLLMENTS_PHRASE"
+echo "    DEK with. NEITHER IS REACHABLE FROM AN ARGUMENT: the flags that used to carry them are"
+echo "    gone, so the parser must refuse both spellings outright. That is what closes the door"
+echo "    an automated process running as you would otherwise walk through."
+assert_cmd_fails_with p8_no_rewind_flag "unexpected argument '--confirm-rewind' found" \
+  "$BIN" backup pull --force --confirm-rewind "$PULL_REWIND_PHRASE"
+assert_cmd_fails_with p8_no_lost_flag "unexpected argument '--confirm-lost-enrollments' found" \
+  "$BIN" backup pull --force --confirm-lost-enrollments "$PULL_LOST_ENROLLMENTS_PHRASE"
+assert_cmd_fails_with p8_pull_forced "NoBackupRemote" "$BIN" backup pull --force
 run_cmd p8_pull_help "$BIN" backup pull --help
-assert_contains "pull documents the enrollment-loss confirmation" \
-  "--confirm-lost-enrollments" "$RUN_LOG"
+assert_not_contains "pull offers no argument that carries a destruction phrase" \
+  "--confirm" "$RUN_LOG"
+assert_contains "and says the phrase is typed on a terminal" "typed on a terminal" "$RUN_LOG"
 assert_contains "and says a pull can ADD files this machine never had, which is also a rewind" \
   "adds ones this machine never had" "$RUN_LOG"
 echo "  note  every ground a forced pull refuses on — an older tip, a fork, a deletion, replaced"
@@ -2347,6 +2392,8 @@ echo "  note  commit here records — needs a second machine's history over ssh.
 echo "  note  configures no remote by design, so watch for all of them on the first real"
 echo "  note  cross-machine pull. The addition is the one that reads as harmless and is not: an"
 echo "  note  incoming policies/<key>.toml where you had none turns deny-by-default into allow."
+echo "  note  each of those phrases is typed at YOUR terminal on that pull. There is no argument"
+echo "  note  that carries one, so a pull run from a script or an agent stops at the question."
 
 PUSH_TARGET="$EXAMPLE_FOLDER/$VAULT_KEYRING.git"
 echo
@@ -2393,10 +2440,9 @@ echo "    getting it wrong costs a re-run. accept-deletions records the loss, wh
 echo "    to every backup as an ordinary fast-forward and cannot be undone. Reach for the first."
 echo "    Neither one unlocks anything, so this whole block costs no prompt of any kind."
 assert_cmd_fails_with p8_restore_nothing "NothingToRestore" "$BIN" restore-missing
-assert_cmd_fails_with p8_accept_nothing "NoDeletionsToAccept" \
-  "$BIN" accept-deletions --confirm-deletion "$ACCEPT_DELETION_PHRASE"
-echo "  note  even the correct phrase records nothing when nothing is missing: the phrase"
-echo "  note  authorizes a loss that already happened, it does not create one."
+assert_cmd_fails_with p8_accept_nothing "NoDeletionsToAccept" "$BIN" accept-deletions
+echo "  note  a store with nothing missing is answered before any phrase is asked for: the"
+echo "  note  phrase authorizes a loss that already happened, it does not create one."
 
 HEAD_BEFORE="$(git -C "$CFG_STORE" rev-parse HEAD 2>/dev/null || true)"
 LOST_SHA_BEFORE="$(shasum -a 256 "$SOL_FILE" 2>/dev/null | cut -d' ' -f1 || true)"
@@ -2408,10 +2454,23 @@ else
 fi
 
 echo
+echo "==> with a file genuinely gone, this is the destruction an unattended process would want."
+echo "    It has no way to reach it: there is no flag, and stdin is not a terminal, so the"
+echo "    commit is refused outright. This assertion is the whole guard now — read it as the"
+echo "    one that keeps a script, a cron job or an agent from recording your loss for you."
+assert_cmd_fails_with p8_accept_no_terminal "ConfirmationOnlyFromATerminal" \
+  "$BIN" accept-deletions
+assert_contains "the refusal states the phrase a terminal would have to type" \
+  "$ACCEPT_DELETION_PHRASE" "$RUN_LOG"
+assert_eq "the no-terminal refusal moved no ref" \
+  "$HEAD_BEFORE" "$(git -C "$CFG_STORE" rev-parse HEAD 2>/dev/null || true)"
+
+echo
 echo "==> accept-deletions must NAME what is gone and point at restore-missing BEFORE it takes"
-echo "    any phrase, and a phrase that is not the exact one must record nothing."
-assert_cmd_fails_with p8_accept_wrong_phrase "ConfirmationRefused" \
-  "$BIN" accept-deletions --confirm-deletion "yes"
+echo "    any phrase, and a phrase that is not the exact one must record nothing. This script"
+echo "    types both into a pty, exactly as a human at a terminal would."
+assert_pty_fails_with p8_accept_wrong_phrase "ConfirmationRefused" "yes" \
+  "$BIN" accept-deletions
 assert_contains "it named the file that is gone" "GONE: a store file the last commit still has" "$RUN_LOG"
 assert_contains "and named it by name" "file=$SOL_KEY" "$RUN_LOG"
 assert_contains "and said recording the loss replicates it to every backup" \

@@ -26,7 +26,7 @@ use hc_core::crypto::envelope::{
     seal_keystore, write_private_file, Dek, EnvErr, KeyUse, KeystoreFile, MAX_SECRET_BYTES,
 };
 use hc_core::is_valid_key_name;
-use hc_core::keyring::{EnrollParams, Enrollment, Keyring, VaultId};
+use hc_core::keyring::{EnrollParams, Enrollment, Keyring, VaultId, KEYRING_FILE};
 use hc_core::mac::secure_enclave;
 use hc_core::mac::{authorize_with_touch_id, get_password_from_keychain, BackendImpl, MacBackend};
 use hc_core::read_grant::{self, Standing, DEFAULT_GRANT_HOURS, MAX_GRANT_HOURS};
@@ -80,10 +80,11 @@ const MAX_PEM_BYTES: u64 = 1024 * 1024;
 // is not the one config.toml pins).
 // GrantKeyMissingRunEnrollGrant is `serve` without an enrolled grant key, which every
 // signature needs: nothing is pinned in config.toml, or the enclave blob is gone.
-// ConfirmationNeedsTerminal is an irreversible verb (`init --force`, a rewinding `backup pull`,
-// `accept-deletions`) with no terminal to type its phrase on, ConfirmationRefused is the same
-// guard when what came back was not the phrase, and NoDeletionsToAccept is `accept-deletions`
-// on a store that has lost nothing.
+// ConfirmationOnlyFromATerminal is an irreversible verb (`init --force`, a rewinding `backup
+// pull`, `accept-deletions`, `discard-enclave-key`) reached with no terminal to type its phrase
+// on, which no flag carries and nothing else waives, ConfirmationRefused is the same guard when
+// what came back was not the phrase, and NoDeletionsToAccept is `accept-deletions` on a store
+// that has lost nothing.
 // NothingToRestore is `restore-missing` on a store that has lost nothing, and StoreStillMissing
 // is the same verb naming what local history could not put back.
 // StoreMissingRunBackupPull and StoreMissingRunRestoreMissing are `serve` with no keyring in the
@@ -133,7 +134,7 @@ create_err_with_impls!(
     NotBundleable { kind: hc_sign::grant::IntentKind },
     SecretInputTooLarge { size: usize, max: usize },
     GrantKeyPinMismatch { pinned: String, found: String },
-    ConfirmationNeedsTerminal { required: &'static str, flag: &'static str },
+    ConfirmationOnlyFromATerminal { required: &'static str },
     ConfirmationRefused { typed: String, required: &'static str },
     NoDeletionsToAccept { store: PathBuf },
     NothingToRestore { store: PathBuf },
@@ -183,12 +184,10 @@ enum Commands {
         /// Import this PEM private key (requires --import-cert).
         #[arg(long, value_name = "PEM")]
         import_key: Option<PathBuf>,
-        /// Overwrite an existing config/store.
+        /// Overwrite an existing config/store, which takes the phrase it asks for typed on a
+        /// terminal.
         #[arg(long)]
         force: bool,
-        /// Confirm a forced overwrite without a terminal, by repeating the phrase it asks for.
-        #[arg(long, value_name = "PHRASE", requires = "force")]
-        confirm_destroy: Option<String>,
     },
     /// Add another way to unlock the same DEK (Secure Enclave or recovery passphrase).
     #[command(subcommand)]
@@ -261,21 +260,15 @@ enum Commands {
     RestoreMissing,
     /// Record store files or enrollments that are already gone, which every other command
     /// refuses to commit. Names each one, says what `restore-missing` would put back instead,
-    /// then requires the phrase it asks for.
-    AcceptDeletions {
-        /// Confirm without a terminal, by repeating the phrase it asks for.
-        #[arg(long, value_name = "PHRASE")]
-        confirm_deletion: Option<String>,
-    },
+    /// then requires the phrase it asks for, typed on a terminal.
+    AcceptDeletions,
     /// Remove an enclave key blob squatting this machine's key path, which otherwise blocks the
     /// Secure Enclave path for good. Shows what is there against what this install records, then
-    /// requires the phrase it asks for. Never touches a key this install DOES record.
+    /// requires the phrase it asks for, typed on a terminal. Never touches a key this install
+    /// DOES record.
     DiscardEnclaveKey {
         /// Which of this machine's two enclave key paths to inspect.
         kind: EnclaveKeyKind,
-        /// Confirm without a terminal, by repeating the phrase it asks for.
-        #[arg(long, value_name = "PHRASE")]
-        confirm_discard: Option<String>,
     },
     /// Migrate legacy Keychain-master keystores into the new envelope format.
     Migrate {
@@ -364,17 +357,11 @@ enum BackupCmd {
         /// Vault to pull (`v_<hex>`); defaults to this install's own vault id.
         #[arg(long, value_name = "ID")]
         vault: Option<VaultId>,
-        /// Actually discard local history. Without it the destruction is only listed.
+        /// Actually discard local history; a pull that rewinds, forks, deletes store files, adds
+        /// ones this machine never had, replaces them with older content, or strands every
+        /// enrollment takes its own phrase typed on a terminal too.
         #[arg(long)]
         force: bool,
-        /// Accept a pull that rewinds, forks, deletes store files, adds ones this machine never
-        /// had, or replaces them with older content, by repeating the phrase it asks for.
-        #[arg(long, value_name = "PHRASE", requires = "force")]
-        confirm_rewind: Option<String>,
-        /// Accept a pull that leaves this machine with no enrollment of its own, and so no way
-        /// to unwrap its own DEK, by repeating the phrase it asks for.
-        #[arg(long, value_name = "PHRASE", requires = "force")]
-        confirm_lost_enrollments: Option<String>,
     },
     /// List the vaults sharing the first configured remote's folder.
     List,
@@ -510,8 +497,7 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
             import_cert,
             import_key,
             force,
-            confirm_destroy,
-        } => cmd_init(import_cert, import_key, force, confirm_destroy),
+        } => cmd_init(import_cert, import_key, force),
         Commands::Enroll(cmd) => cmd_enroll(cmd, unlock),
         Commands::Add {
             name,
@@ -533,11 +519,8 @@ fn dispatch(command: Commands, unlock: Option<UnlockMethod>) -> Result<(), CliEr
         Commands::Backup(cmd) => cmd_backup(cmd),
         Commands::Archive(cmd) => cmd_archive(cmd),
         Commands::RestoreMissing => cmd_restore_missing(),
-        Commands::AcceptDeletions { confirm_deletion } => cmd_accept_deletions(confirm_deletion),
-        Commands::DiscardEnclaveKey {
-            kind,
-            confirm_discard,
-        } => cmd_discard_enclave_key(kind, confirm_discard),
+        Commands::AcceptDeletions => cmd_accept_deletions(),
+        Commands::DiscardEnclaveKey { kind } => cmd_discard_enclave_key(kind),
         Commands::Migrate {
             old_store,
             new_store,
@@ -772,37 +755,23 @@ impl StoreContents {
 }
 
 const FORCED_INIT_PHRASE: &str = git_store::Destruction::Replacement.phrase();
-const FORCED_INIT_FLAG: &str = "--confirm-destroy";
 const PULL_REWIND_PHRASE: &str = "roll this store back";
-const PULL_REWIND_FLAG: &str = "--confirm-rewind";
 const PULL_LOST_ENROLLMENTS_PHRASE: &str = "give up every unlock path on this machine";
-const PULL_LOST_ENROLLMENTS_FLAG: &str = "--confirm-lost-enrollments";
 const ACCEPT_DELETION_PHRASE: &str = git_store::Destruction::Deletion.phrase();
-const ACCEPT_DELETION_FLAG: &str = "--confirm-deletion";
 const DISCARD_ENCLAVE_KEY_PHRASE: &str = secure_enclave::DISCARD_UNRECORDED_KEY_PHRASE;
-const DISCARD_ENCLAVE_KEY_FLAG: &str = "--confirm-discard";
 
-/// The one way an irreversible verb takes consent: the exact phrase, typed on a terminal, or
-/// carried by `flag` where there is no terminal to type it on. Anything else refuses, so a
-/// habitual `-y` and an unattended run both fail closed. The accepted bytes come back, because a
-/// capability that a confirmed destruction mints must be minted from them and not from a constant.
-fn require_typed_confirmation(
-    required: &'static str,
-    flag: &'static str,
-    confirm: Option<&str>,
-) -> Result<String, CliErr> {
-    let typed = match confirm {
-        Some(phrase) => phrase.to_string(),
-        None => {
-            if !std::io::stdin().is_terminal() {
-                return Err(CliErr::ConfirmationNeedsTerminal { required, flag });
-            }
-            tracing::warn!(phrase = %required, "type this phrase to proceed, or Ctrl-C to abort");
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            line
-        }
-    };
+/// The one way an irreversible verb takes consent: the exact phrase, typed on a terminal. No flag
+/// carries it and nothing waives it, so a script, an agent or any other process holding this
+/// operator's uid has no door to one — it reads the phrase out of this source either way, and the
+/// terminal is what it cannot produce. The accepted bytes come back, because a capability that a
+/// confirmed destruction mints must be minted from them and not from a constant.
+fn require_typed_confirmation(required: &'static str) -> Result<String, CliErr> {
+    if !std::io::stdin().is_terminal() {
+        return Err(CliErr::ConfirmationOnlyFromATerminal { required });
+    }
+    tracing::warn!(phrase = %required, "type this phrase to proceed, or Ctrl-C to abort");
+    let mut typed = String::new();
+    std::io::stdin().read_line(&mut typed)?;
     if typed.trim() != required {
         return Err(CliErr::ConfirmationRefused {
             typed: hc_core::safe_diagnostic_text(typed.trim()),
@@ -812,15 +781,21 @@ fn require_typed_confirmation(
     Ok(typed)
 }
 
-/// `--force` mints a new DEK, so every keystore wrapped under the old one becomes permanently
-/// undecryptable. Name each casualty first, then require the phrase back before any of it happens.
+/// `--force` mints a new DEK, so every keystore wrapped under the old one is unreadable by this
+/// install from here on. Name each casualty first, then require the phrase back before any of it
+/// happens.
+///
+/// The old keyring is not destroyed: [`commit_replaced_state`] puts it in this store's history
+/// one commit before the replacement, and prints the line that checks it back out. Calling the
+/// loss permanent here would be false at the one moment an operator is deciding, and would send
+/// someone who typed the phrase by mistake looking for a backup instead of for the commit they
+/// already have.
 ///
 /// The phrase is what mints the capability the replacing commit is recorded under; a store with
 /// nothing to destroy has no replacement to confirm and gets none.
 fn confirm_forced_init(
     store: &Path,
     existing: &StoreContents,
-    confirm: Option<&str>,
 ) -> Result<Option<git_store::Consent>, CliErr> {
     if existing.is_empty() {
         return Ok(None);
@@ -830,15 +805,19 @@ fn confirm_forced_init(
         keystores = existing.keystores.len(),
         enrollments = existing.enrollments.len(),
         entries = existing.entries,
-        "`init --force` mints a NEW DEK; everything below stays encrypted under the OLD one and becomes permanently undecryptable"
+        "`init --force` mints a NEW DEK; everything below stays encrypted under the OLD one, which only the OLD keyring unwraps"
     );
     for name in &existing.keystores {
         tracing::warn!(key = %name, "  keystore orphaned by the new DEK");
     }
     for enrollment in &existing.enrollments {
-        tracing::warn!(id = %enrollment.id, label = %enrollment.label, "  enrollment discarded with the old keyring");
+        tracing::warn!(id = %enrollment.id, label = %enrollment.label, "  enrollment replaced with the old keyring");
     }
-    let typed = require_typed_confirmation(FORCED_INIT_PHRASE, FORCED_INIT_FLAG, confirm)?;
+    tracing::warn!(
+        needs = "the OLD recovery passphrase",
+        "this init commits the OLD keyring to this store's history first and prints the line that checks it back out, so the keys above are recoverable for as long as THIS store's history survives — nothing else on this machine holds that keyring"
+    );
+    let typed = require_typed_confirmation(FORCED_INIT_PHRASE)?;
     Ok(Some(git_store::Consent::confirmed(
         git_store::Destruction::Replacement,
         &typed,
@@ -906,21 +885,38 @@ fn init_config(existing: Option<Config>, store: &Path) -> Config {
 /// where it is — and says so — for a store that has already lost a file, and commits nothing at
 /// all for a store with no readable keyring to name a vault with. The forced init's own commit
 /// records the replacement afterwards either way.
+///
+/// The commit that carries the old keyring is printed here with the exact line that gets it back,
+/// because this is the moment the operator is looking at a terminal and the moment a mistyped
+/// intention is still one checkout away from being undone.
 fn commit_replaced_state(store: &Path) -> Result<(), CliErr> {
-    match git_store::local_vault(store) {
-        Ok(_) => {
-            git_store::ensure_repo(store, None)?;
-            Ok(())
-        }
+    let committed = match git_store::local_vault(store) {
+        Ok(_) => git_store::ensure_repo(store, None)?,
         Err(error) => {
             tracing::warn!(
                 %error,
                 "the store's keyring cannot be read, so what the new DEK orphans cannot be \
                  committed before it is replaced"
             );
-            Ok(())
+            None
         }
+    };
+    match committed {
+        Some(commit) => tracing::warn!(
+            %commit,
+            run = %format!(
+                "git -C {} checkout {commit} -- {KEYRING_FILE} && chmod 600 {}",
+                store.display(),
+                store.join(KEYRING_FILE).display()
+            ),
+            "RECOVERY: this commit carries the keyring that unwraps the OLD DEK; run the `run` line, then `hot_cheese --unlock passphrase` with the OLD recovery passphrase reads every orphaned keystore again"
+        ),
+        None => tracing::warn!(
+            store = %store.display(),
+            "nothing was committed before the replacement, so this store's history holds no keyring for the OLD DEK"
+        ),
     }
+    Ok(())
 }
 
 /// Put back what the worktree lost and this machine's own history still holds. The safe half of
@@ -1003,7 +999,7 @@ fn cmd_restore_missing() -> Result<(), CliErr> {
 /// vanish takes `serve`, `generate` and the forced-pull recovery down with it for good.
 ///
 /// Runs without [`claimed_store`]: opening the store is the operation that is already failing.
-fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
+fn cmd_accept_deletions() -> Result<(), CliErr> {
     let config = Arc::new(Config::load()?);
     let git = GitStore::cli(config.clone(), flock::store_claim()?)?;
     let missing = git.missing()?;
@@ -1030,11 +1026,7 @@ fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
          machine's own history, moves no ref and tells no backup. Recording the loss here is the \
          half that cannot be undone"
     );
-    let typed = require_typed_confirmation(
-        ACCEPT_DELETION_PHRASE,
-        ACCEPT_DELETION_FLAG,
-        confirm.as_deref(),
-    )?;
+    let typed = require_typed_confirmation(ACCEPT_DELETION_PHRASE)?;
     git.mutation().commit_loss(
         git_store::Consent::confirmed(git_store::Destruction::Deletion, &typed)?,
         &missing,
@@ -1044,6 +1036,47 @@ fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
         enrollments = missing.ids.len(),
         "recorded the loss; the store commits again"
     );
+    Ok(())
+}
+
+/// What this store's own history says about the enclave key at this machine's key path.
+///
+/// "An unrecorded key is squatting your key path" and "your keyring was REPLACED and this key
+/// belongs to the previous one" are the same symptom with opposite remedies, and a forced init
+/// produces the second one every time: the new keyring records no enclave key, so the blob that
+/// the old keyring enrolled reads as unrecorded and the adoption gate names `discard-enclave-key`.
+/// Discarding there deletes the Touch-ID half of an envelope this store's history can still open,
+/// which is why the keyring in history is looked for before anything recommends it.
+fn report_enclave_key_in_history(store: &Path, found: &str) -> Result<(), CliErr> {
+    let mut carrier = None;
+    'history: for (commit, keyring) in git_store::keyrings_in_history(store)? {
+        for enrollment in &keyring.enrollments {
+            if let EnrollParams::SecureEnclave { se_pub, .. } = &enrollment.params {
+                if secure_enclave::se_fingerprint(se_pub) == found {
+                    carrier = Some((commit, enrollment.label.clone()));
+                    break 'history;
+                }
+            }
+        }
+    }
+    match carrier {
+        Some((commit, label)) => tracing::warn!(
+            %found,
+            %commit,
+            enrollment = %label,
+            run = %format!(
+                "git -C {} checkout {commit} -- {KEYRING_FILE} && chmod 600 {}",
+                store.display(),
+                store.join(KEYRING_FILE).display()
+            ),
+            "THIS STORE'S HISTORY RECORDS THIS ENCLAVE KEY: the keyring that enrolled it was REPLACED, so the key is the previous keyring's and not a squatter — recover that keyring with the `run` line and do NOT discard the key, which is the Touch-ID half of the envelope it unwraps"
+        ),
+        None => tracing::warn!(
+            %found,
+            "no keyring in this store's history records this enclave key either, so nothing this \
+             store can reach is wrapped under it"
+        ),
+    }
     Ok(())
 }
 
@@ -1057,15 +1090,16 @@ fn cmd_accept_deletions(confirm: Option<String>) -> Result<(), CliErr> {
 /// their own key or a substitution. A key this install records never reaches the question:
 /// [`secure_enclave::unrecorded_se_key`] refuses it, and the phrase is the only thing that
 /// spends the discard.
-fn cmd_discard_enclave_key(kind: EnclaveKeyKind, confirm: Option<String>) -> Result<(), CliErr> {
+fn cmd_discard_enclave_key(kind: EnclaveKeyKind) -> Result<(), CliErr> {
     let _store = flock::store_claim()?;
     let squatter = match kind {
         EnclaveKeyKind::Se => secure_enclave::unrecorded_se_key(SE_LABEL),
         EnclaveKeyKind::Grant => secure_enclave::unrecorded_grant_key(GRANT_LABEL),
     }?;
+    let found = secure_enclave::se_fingerprint(squatter.found());
     tracing::warn!(
         path = %squatter.path().display(),
-        found = %secure_enclave::se_fingerprint(squatter.found()),
+        %found,
         recorded = squatter.recorded().len(),
         "an enclave key this install never recorded is at this machine's key path; discarding it \
          deletes that one file and nothing else, and this install cannot use that key either way"
@@ -1083,11 +1117,15 @@ fn cmd_discard_enclave_key(kind: EnclaveKeyKind, confirm: Option<String>) -> Res
              the key at that path"
         );
     }
-    let typed = require_typed_confirmation(
-        DISCARD_ENCLAVE_KEY_PHRASE,
-        DISCARD_ENCLAVE_KEY_FLAG,
-        confirm.as_deref(),
-    )?;
+    match Config::load() {
+        Ok(config) => report_enclave_key_in_history(&config.store_path(), &found)?,
+        Err(error) => tracing::warn!(
+            %error,
+            "this install's config.toml cannot be read, so no store history was checked for a \
+             keyring that records the key at that path"
+        ),
+    }
+    let typed = require_typed_confirmation(DISCARD_ENCLAVE_KEY_PHRASE)?;
     squatter.discard(&typed)?;
     match kind {
         EnclaveKeyKind::Se => tracing::info!(
@@ -1107,7 +1145,6 @@ fn cmd_init(
     import_cert: Option<PathBuf>,
     import_key: Option<PathBuf>,
     force: bool,
-    confirm_destroy: Option<String>,
 ) -> Result<(), CliErr> {
     // Home dir holds config.toml + the TLS cert/key; the store lives under it so
     // $HOT_CHEESE_HOME fully isolates an install (the demo's /tmp home stays self-contained).
@@ -1127,7 +1164,7 @@ fn cmd_init(
     // ANY prior install is visible — config.toml, a keyring, or keystore files.
     let existing = StoreContents::read(&store)?;
     let consent = if force {
-        confirm_forced_init(&store, &existing, confirm_destroy.as_deref())?
+        confirm_forced_init(&store, &existing)?
     } else {
         let (existing_cert, existing_key) = cert_paths();
         if path_is_occupied(&config_path())?
@@ -1225,14 +1262,20 @@ fn cmd_enroll(cmd: EnrollCmd, unlock: Option<UnlockMethod>) -> Result<(), CliErr
             let dek = enroll_dek(&keyring, unlock)?;
             let proven = match secure_enclave::ensure_se_key(SE_LABEL) {
                 Ok(proven) => proven,
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not create this machine's Secure Enclave key. Confirm the Mac has \
-                         a Secure Enclave with an enrolled fingerprint and that you are in your \
-                         GUI login session with the screen unlocked (Touch ID cannot prompt over \
-                         ssh/sudo). Use a recovery passphrase in the meantime."
-                    );
-                    return Err(e.into());
+                Err(error) => {
+                    match &error {
+                        secure_enclave::SeErr::UnrecordedEnclaveKeyAtKeyPath {
+                            found,
+                            ..
+                        } => report_enclave_key_in_history(&config.store_path(), found)?,
+                        _ => tracing::warn!(
+                            "Could not create this machine's Secure Enclave key. Confirm the Mac \
+                             has a Secure Enclave with an enrolled fingerprint and that you are in \
+                             your GUI login session with the screen unlocked (Touch ID cannot \
+                             prompt over ssh/sudo). Use a recovery passphrase in the meantime."
+                        ),
+                    }
+                    return Err(error.into());
                 }
             };
             enroll_secure_enclave(&label, &dek, &proven)?
@@ -1769,12 +1812,7 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                 .into());
             }
         }
-        BackupCmd::Pull {
-            vault,
-            force,
-            confirm_rewind,
-            confirm_lost_enrollments,
-        } => {
+        BackupCmd::Pull { vault, force } => {
             let git = claimed_store(&config)?;
             let remote = first_remote(&config)?;
             let vault = git_store::pull_vault(&config, remote, vault)?;
@@ -1849,11 +1887,7 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                     remote_committed_at = doomed.remote_at,
                     "THIS PULL PUTS BACK STATE THIS MACHINE MOVED PAST: every file listed as ADDED, REPLACED or DELETED above takes the content a remote host chose"
                 );
-                require_typed_confirmation(
-                    PULL_REWIND_PHRASE,
-                    PULL_REWIND_FLAG,
-                    confirm_rewind.as_deref(),
-                )?;
+                require_typed_confirmation(PULL_REWIND_PHRASE)?;
                 doomed.accept_rewind();
             }
             if !doomed.lost_enrollments.is_empty() {
@@ -1862,11 +1896,7 @@ fn cmd_backup(cmd: BackupCmd) -> Result<(), CliErr> {
                     count = doomed.lost_enrollments.len(),
                     "NO WAY BACK IN: the incoming keyring keeps none of the enrollments above, so applying this leaves THIS MACHINE UNABLE TO UNWRAP ITS OWN DEK — no Touch ID and no recovery passphrase enrolled here opens the store afterwards, and only a passphrase enrolled in the INCOMING keyring does"
                 );
-                require_typed_confirmation(
-                    PULL_LOST_ENROLLMENTS_PHRASE,
-                    PULL_LOST_ENROLLMENTS_FLAG,
-                    confirm_lost_enrollments.as_deref(),
-                )?;
+                require_typed_confirmation(PULL_LOST_ENROLLMENTS_PHRASE)?;
                 doomed.accept_lost_enrollments();
             }
             git.pull_apply(&doomed)?;
@@ -2235,8 +2265,7 @@ mod tests {
     /// Disaster recovery types the vault id in by hand, so the value parser has to turn
     /// `v_<hex>` into a real [`VaultId`] and reject anything that is not one; omitting
     /// `--vault` must stay `None` so the pull falls back to this install's own id. A bare
-    /// `pull` must also stay un-forced and carry no rollback consent, because the forced one
-    /// deletes keystores and the rewinding one replays history a remote host chose.
+    /// `pull` must also stay un-forced, because the forced one deletes keystores.
     #[test]
     fn backup_pull_takes_a_typed_vault_id() {
         let cli = Cli::try_parse_from([
@@ -2252,7 +2281,7 @@ mod tests {
             .parse()
             .expect("fixture id parses");
         assert!(
-            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force, confirm_rewind, confirm_lost_enrollments })) if vault == Some(expected) && force && confirm_rewind.is_none() && confirm_lost_enrollments.is_none())
+            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { vault, force })) if vault == Some(expected) && force)
         );
 
         let cli = Cli::try_parse_from(["hot_cheese", "backup", "pull"]).expect("bare pull parses");
@@ -2260,115 +2289,83 @@ mod tests {
             cli.command,
             Some(Commands::Backup(BackupCmd::Pull {
                 vault: None,
-                force: false,
-                confirm_rewind: None,
-                confirm_lost_enrollments: None
+                force: false
             }))
         ));
 
         assert!(
             Cli::try_parse_from(["hot_cheese", "backup", "pull", "--vault", "nonsense"]).is_err()
         );
-        assert!(
-            Cli::try_parse_from([
-                "hot_cheese",
-                "backup",
-                "pull",
-                "--confirm-rewind",
-                PULL_REWIND_PHRASE
-            ])
-            .is_err(),
-            "rollback consent is meaningless without --force"
-        );
     }
 
-    /// Losing every enrollment costs this machine the way into its own DEK, which agreeing to a
-    /// rollback is not agreeing to: the two phrases must be different, neither may answer the
-    /// other, and the unattended flag that carries it is meaningless without `--force`.
+    /// Every confirmation phrase is a public constant any process running as this operator can
+    /// read, so the terminal is the whole guard: no argument may carry one, and no phrase may
+    /// answer another confirmation's question.
     #[test]
-    fn stranding_every_enrollment_takes_a_confirmation_of_its_own() {
-        assert_ne!(PULL_LOST_ENROLLMENTS_PHRASE, PULL_REWIND_PHRASE);
-        assert!(matches!(
-            require_typed_confirmation(
-                PULL_LOST_ENROLLMENTS_PHRASE,
-                PULL_LOST_ENROLLMENTS_FLAG,
-                Some(PULL_REWIND_PHRASE)
-            ),
-            Err(CliErr::ConfirmationRefused { .. })
-        ));
-        assert!(matches!(
-            require_typed_confirmation(
-                PULL_REWIND_PHRASE,
-                PULL_REWIND_FLAG,
-                Some(PULL_LOST_ENROLLMENTS_PHRASE)
-            ),
-            Err(CliErr::ConfirmationRefused { .. })
-        ));
-        require_typed_confirmation(
-            PULL_LOST_ENROLLMENTS_PHRASE,
-            PULL_LOST_ENROLLMENTS_FLAG,
-            Some(PULL_LOST_ENROLLMENTS_PHRASE),
-        )
-        .expect("its own phrase is what proceeds");
-
-        let cli = Cli::try_parse_from([
-            "hot_cheese",
-            "backup",
-            "pull",
-            "--force",
-            "--confirm-rewind",
-            PULL_REWIND_PHRASE,
-            "--confirm-lost-enrollments",
-            PULL_LOST_ENROLLMENTS_PHRASE,
-        ])
-        .expect("both consents parse together");
-        assert!(
-            matches!(cli.command, Some(Commands::Backup(BackupCmd::Pull { confirm_rewind, confirm_lost_enrollments, .. }))
-                if confirm_rewind.as_deref() == Some(PULL_REWIND_PHRASE)
-                    && confirm_lost_enrollments.as_deref() == Some(PULL_LOST_ENROLLMENTS_PHRASE))
-        );
-        assert!(
-            Cli::try_parse_from([
+    fn no_argument_carries_a_destructive_confirmation() {
+        for line in [
+            ["hot_cheese", "init", "--force", "--confirm-destroy"].as_slice(),
+            ["hot_cheese", "backup", "pull", "--force", "--confirm-rewind"].as_slice(),
+            [
                 "hot_cheese",
                 "backup",
                 "pull",
+                "--force",
                 "--confirm-lost-enrollments",
-                PULL_LOST_ENROLLMENTS_PHRASE
-            ])
-            .is_err(),
-            "consent to lose every unlock path is meaningless without --force"
-        );
+            ]
+            .as_slice(),
+            ["hot_cheese", "accept-deletions", "--confirm-deletion"].as_slice(),
+            [
+                "hot_cheese",
+                "discard-enclave-key",
+                "grant",
+                "--confirm-discard",
+            ]
+            .as_slice(),
+        ] {
+            for phrase in [
+                FORCED_INIT_PHRASE,
+                PULL_REWIND_PHRASE,
+                PULL_LOST_ENROLLMENTS_PHRASE,
+                ACCEPT_DELETION_PHRASE,
+                DISCARD_ENCLAVE_KEY_PHRASE,
+                "y",
+            ] {
+                let mut argv = line.to_vec();
+                argv.push(phrase);
+                assert!(
+                    Cli::try_parse_from(&argv).is_err(),
+                    "{argv:?} parsed: an argument carries a destruction phrase again, so a \
+                     process running as this operator can spend one without a terminal"
+                );
+            }
+        }
+
+        let phrases = [
+            FORCED_INIT_PHRASE,
+            PULL_REWIND_PHRASE,
+            PULL_LOST_ENROLLMENTS_PHRASE,
+            ACCEPT_DELETION_PHRASE,
+            DISCARD_ENCLAVE_KEY_PHRASE,
+        ];
+        for (at, phrase) in phrases.iter().enumerate() {
+            for other in &phrases[at + 1..] {
+                assert_ne!(phrase, other, "one answer stands for two destructions");
+            }
+        }
     }
 
-    /// A keystore that vanished has to be recoverable before it is recordable. Restoring one out
-    /// of local history moves no ref, so it takes no phrase and no flag at all — while recording
-    /// the loss, which every backup then replicates, is refused until the exact phrase comes back.
+    /// A keystore that vanished has to be recoverable before it is recordable, and the verb that
+    /// records nothing must not take the destruction phrase at all.
     #[test]
     fn restoring_a_lost_store_file_costs_less_than_recording_its_loss() {
         let cli =
             Cli::try_parse_from(["hot_cheese", "restore-missing"]).expect("restore-missing parses");
         assert!(matches!(cli.command, Some(Commands::RestoreMissing)));
         assert!(
-            Cli::try_parse_from([
-                "hot_cheese",
-                "restore-missing",
-                ACCEPT_DELETION_FLAG,
-                ACCEPT_DELETION_PHRASE
-            ])
-            .is_err(),
+            Cli::try_parse_from(["hot_cheese", "restore-missing", ACCEPT_DELETION_PHRASE]).is_err(),
             "a verb that records nothing must not take a destruction phrase"
         );
-
-        assert!(matches!(
-            require_typed_confirmation(ACCEPT_DELETION_PHRASE, ACCEPT_DELETION_FLAG, Some("y")),
-            Err(CliErr::ConfirmationRefused { .. })
-        ));
-        require_typed_confirmation(
-            ACCEPT_DELETION_PHRASE,
-            ACCEPT_DELETION_FLAG,
-            Some(ACCEPT_DELETION_PHRASE),
-        )
-        .expect("only the exact phrase records a loss");
     }
 
     /// `init --force` mints a new DEK, and wrote a fresh `Config` beside it — silently deleting
@@ -2549,9 +2546,10 @@ mod tests {
     }
 
     /// `init --force` mints a new DEK, so before anything happens it has to name every keystore
-    /// it strands and every enrollment it drops, and refuse until the phrase comes back exactly.
+    /// it strands and every enrollment it drops — and a store holding nothing to strand has no
+    /// replacement to confirm, so it is never asked for one.
     #[test]
-    fn forced_init_names_what_it_destroys_and_refuses_without_the_phrase() {
+    fn forced_init_names_what_it_destroys_and_asks_an_empty_store_for_nothing() {
         let dir = std::env::temp_dir().join(format!(
             "hot_cheese_forced_init_{}_{}",
             std::process::id(),
@@ -2565,7 +2563,7 @@ mod tests {
 
         let empty = StoreContents::read(&store).expect("an empty store reads");
         assert!(empty.is_empty());
-        assert!(confirm_forced_init(&store, &empty, None)
+        assert!(confirm_forced_init(&store, &empty)
             .expect("an empty store needs no confirmation")
             .is_none());
 
@@ -2589,44 +2587,23 @@ mod tests {
         assert_eq!(existing.enrollments.len(), 1);
         assert_eq!(existing.enrollments[0].label, "recovery");
 
-        assert!(matches!(
-            confirm_forced_init(&store, &existing, Some("y")),
-            Err(CliErr::ConfirmationRefused { .. })
-        ));
-        assert!(
-            confirm_forced_init(&store, &existing, Some(FORCED_INIT_PHRASE))
-                .expect("the exact phrase proceeds")
-                .is_some(),
-            "the phrase is what mints the capability the replacing commit needs"
-        );
-
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// A squatted enclave key path has to be recoverable without a terminal too, and the discard
-    /// must always say WHICH of the two enclave keys it is about — a `grant` typo that removed
-    /// the KEK would cost the operator the enclave path.
+    /// The discard must always say WHICH of the two enclave keys it is about — a `grant` typo
+    /// that removed the KEK would cost the operator the enclave path.
     #[test]
-    fn discarding_an_enclave_key_names_the_key_and_takes_the_phrase_unattended() {
-        let cli = Cli::try_parse_from([
-            "hot_cheese",
-            "discard-enclave-key",
-            "se",
-            "--confirm-discard",
-            DISCARD_ENCLAVE_KEY_PHRASE,
-        ])
-        .expect("discard-enclave-key parses");
+    fn discarding_an_enclave_key_names_which_key_it_is_about() {
+        let cli = Cli::try_parse_from(["hot_cheese", "discard-enclave-key", "se"])
+            .expect("discard-enclave-key parses");
         assert!(
-            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind, confirm_discard })
-                if kind == EnclaveKeyKind::Se
-                    && confirm_discard.as_deref() == Some(DISCARD_ENCLAVE_KEY_PHRASE))
+            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind }) if kind == EnclaveKeyKind::Se)
         );
 
         let cli = Cli::try_parse_from(["hot_cheese", "discard-enclave-key", "grant"])
             .expect("the grant key is the other target");
         assert!(
-            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind, confirm_discard })
-                if kind == EnclaveKeyKind::Grant && confirm_discard.is_none())
+            matches!(cli.command, Some(Commands::DiscardEnclaveKey { kind }) if kind == EnclaveKeyKind::Grant)
         );
 
         assert!(
