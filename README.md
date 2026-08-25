@@ -721,7 +721,7 @@ name = "Vendor payouts"
 | `store` | Directory holding the encrypted keystores + `keyring.json` (`~/` is expanded). |
 | `port` | HTTPS listen port (optional; defaults to `5555`). |
 | `grant_public_key` | Uncompressed SEC1 hex (65 bytes, `04`-prefixed) of the Secure Enclave grant key, written by `enroll grant`. **Required to sign**: every signature verifies its grant against this key, and `serve` refuses to start without it (`GrantKeyMissingRunEnrollGrant`) or when the on-disk grant key exports something else (`GrantKeyPinMismatch`). The *pin* is an identity check against a swapped or restored blob — **not** a defence against someone who can write the home dir. |
-| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. `host` accepts only `[user@]hostname` made of `A-Za-z0-9_-.`, so a bare IPv6 literal or an embedded `:port` is refused at load; use `user@name`. **`host` must be a reachable `user@host`, not a `~/.ssh/config` alias** — every ssh this binary runs passes `-F /dev/null`, so `Host` aliases, `HostName`, `Port`, `User`, `IdentityFile` and `IdentityAgent` from that file are all ignored. See [SSH options](#ssh-options-what-is-pinned-and-what-that-breaks). |
+| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. `host` is `[user@]hostname`, optionally followed by the exact suffix ` -i <identity-file>` (for example, `nixos@tprime2 -i ~/.ssh/copium2`); both pieces accept only a single safe word, and no other SSH option is accepted. A bare IPv6 literal or embedded `:port` is refused at load. **The hostname must be directly reachable, not a `~/.ssh/config` alias** — every ssh this binary runs passes `-F /dev/null`, so settings from that file are ignored. See [SSH options](#ssh-options-what-is-pinned-and-what-that-breaks). |
 | `adapters` | List of `{ id, manifest, sha256 }` trusted signing adapters. `manifest` resolves under the home dir when relative; `sha256` is the pin the file's bytes must hash to *before* they are parsed. `serve` refuses to start on a mismatch, or when a manifest claims more than the key's policy grants. See [Signing Adapters](#signing-adapters). |
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
 | `bundle_watch_secs` | Seconds between ticks of the background bundle poller a session runs (optional; defaults to `30`, floored at `5`). The name is kept so an existing `config.toml` is not silently ignored. |
@@ -2114,14 +2114,14 @@ not on the channel.
 ### SSH options: what is pinned, and what that breaks
 
 Every `ssh` this binary runs — backup push/fetch/pull, the bootstrap pipe, and bundle peer
-sync — is `/usr/bin/ssh` with a fixed option list rather than whatever the environment
-supplies:
+sync — is `/usr/bin/ssh` with a pinned option list rather than whatever the environment
+supplies. A backup target may append its one explicit identity file:
 
 | Path | `StrictHostKeyChecking` | Also always |
 | --- | --- | --- |
-| Backup transport (`backup push`/`fetch`/`pull`, `serve`'s clone) | `yes` | `-F /dev/null`, `UserKnownHostsFile=~/.ssh/known_hosts`, `BatchMode=yes`, `PermitLocalCommand=no`, `ForkAfterAuthentication=no`, `ControlMaster=no`, `ControlPath=none`, `ConnectionAttempts=1` |
-| `bootstrap-from` | `yes` | the same, plus `ClearAllForwardings=yes`, and a cleared environment except `SSH_AUTH_SOCK` |
-| Bundle peer sync (tailnet) | `accept-new` | the same set; a **first** contact enrolls the key, a **changed** key is refused |
+| Backup transport (`backup push`/`fetch`/`pull`, `serve`'s clone) | `yes` | `-F /dev/null`, `UserKnownHostsFile=~/.ssh/known_hosts`, `BatchMode=yes`, `PermitLocalCommand=no`, `ForkAfterAuthentication=no`, `ControlMaster=no`, `ControlPath=none`, `ConnectionAttempts=1`, plus the target's optional `-i <identity-file>` |
+| `bootstrap-from` | `yes` | the same fixed options, with no per-target identity, plus `ClearAllForwardings=yes`, and a cleared environment except `SSH_AUTH_SOCK` |
+| Bundle peer sync (tailnet) | `accept-new` | the same fixed options, with no per-target identity; a **first** contact enrolls the key, a **changed** key is refused |
 
 `-F /dev/null` is the load-bearing one: without it a same-uid process that can write
 `~/.ssh/config` attaches its own `ProxyCommand` to your backup connection. With it, the
@@ -2133,8 +2133,9 @@ is named explicitly too (`ssh` expands `~` from the passwd database, not `$HOME`
 > `HostName`, `Port`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump` — is ignored.
 > A `backup_remotes` entry or a `bundle_peers` entry written as an alias
 > (`host = "backup"`) now fails to resolve. Rewrite it as a directly reachable
-> `user@host`, put the key in your agent (`SSH_AUTH_SOCK` is the one variable the
-> bootstrap child keeps), and check with `hot_cheese backup fetch` before relying on it.
+> `user@host`; a backup entry alone may use `user@host -i ~/.ssh/key`, while bundle peers
+> still require an agent-held key. `SSH_AUTH_SOCK` is the one variable the bootstrap child
+> keeps. Check with `hot_cheese backup fetch` before relying on it.
 > A non-default port cannot be expressed in a `backup_remotes` `host` at all.
 
 ---

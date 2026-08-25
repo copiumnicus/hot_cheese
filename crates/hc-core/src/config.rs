@@ -59,10 +59,16 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupRemote {
-    /// SSH target, e.g. "user@1.2.3.4".
+    /// SSH target, optionally followed by `-i` and one identity-file path.
     pub host: String,
     /// Remote folder under the home dir, e.g. "hot_cheese_store".
     pub folder: String,
+}
+
+impl BackupRemote {
+    pub fn ssh_parts(&self) -> (&str, Option<&str>) {
+        backup_ssh_parts(&self.host)
+    }
 }
 
 /// Where a peer keeps its bundles when `config.toml` does not say otherwise.
@@ -608,6 +614,30 @@ pub fn validate_ssh_target(target: &str) -> Result<(), SshTargetErr> {
     })
 }
 
+fn backup_ssh_parts(target: &str) -> (&str, Option<&str>) {
+    match target.split_once(" -i ") {
+        Some((host, identity_file)) => (host, Some(identity_file)),
+        None => (target, None),
+    }
+}
+
+pub fn validate_backup_ssh_target(target: &str) -> Result<(), SshTargetErr> {
+    let (host, identity_file) = backup_ssh_parts(target);
+    let valid_identity = identity_file.is_none_or(|path| {
+        !path.is_empty()
+            && !path.starts_with('-')
+            && path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~'))
+    });
+    if target.len() <= MAX_SSH_TARGET_BYTES && validate_ssh_target(host).is_ok() && valid_identity {
+        return Ok(());
+    }
+    Err(SshTargetErr::Invalid {
+        target: target.to_string(),
+    })
+}
+
 pub fn validate_remote_path(path: &str) -> Result<(), RemotePathErr> {
     let trimmed = path.trim_end_matches('/');
     let valid = !trimmed.is_empty()
@@ -896,10 +926,14 @@ impl Config {
         check_count("label", self.label.len(), MAX_ANNOTATIONS)?;
 
         for (at, remote) in self.backup_remotes.iter().enumerate() {
-            validate_ssh_target(&remote.host)?;
+            validate_backup_ssh_target(&remote.host)?;
             validate_remote_path(&remote.folder)?;
             if self.backup_remotes[at + 1..].iter().any(|other| {
-                other.host.eq_ignore_ascii_case(&remote.host) && other.folder == remote.folder
+                other
+                    .ssh_parts()
+                    .0
+                    .eq_ignore_ascii_case(remote.ssh_parts().0)
+                    && other.folder == remote.folder
             }) {
                 return Err(ConfigErr::DuplicateBackupRemote {
                     host: remote.host.clone(),
@@ -1356,6 +1390,61 @@ mod tests {
                 field: "nonce_window",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn backup_targets_allow_one_safe_identity_file_only() {
+        for target in [
+            "host",
+            "nixos@tprime2 -i ~/.ssh/copium2",
+            "backup.example -i /Users/operator/.ssh/id_ed25519",
+        ] {
+            assert!(validate_backup_ssh_target(target).is_ok(), "{target}");
+        }
+        for target in [
+            "host -p 2222",
+            "host -o ProxyCommand=x",
+            "host -i",
+            "host -i ",
+            "host -i -key",
+            "host -i ~/.ssh/key other",
+            "host -i ~/.ssh/key;touch",
+            "host -i ~/.ssh/key -i ~/.ssh/other",
+        ] {
+            assert!(validate_backup_ssh_target(target).is_err(), "{target}");
+        }
+
+        let mut cfg = loaded("").expect("base config");
+        cfg.backup_remotes.push(BackupRemote {
+            host: "nixos@tprime2 -i ~/.ssh/copium2".to_string(),
+            folder: "backups".to_string(),
+        });
+        assert!(cfg.validate().is_ok());
+
+        let mut duplicate = loaded("").expect("base config");
+        duplicate.backup_remotes.extend([
+            BackupRemote {
+                host: "nixos@tprime2".to_string(),
+                folder: "backups".to_string(),
+            },
+            BackupRemote {
+                host: "NIXOS@TPRIME2 -i ~/.ssh/copium2".to_string(),
+                folder: "backups".to_string(),
+            },
+        ]);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ConfigErr::DuplicateBackupRemote { .. })
+        ));
+
+        cfg.bundle_peers.push(BundlePeer {
+            host: "nixos@tprime2 -i ~/.ssh/copium2".to_string(),
+            dir: None,
+        });
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigErr::SshTarget(SshTargetErr::Invalid { .. }))
         ));
     }
 

@@ -44,8 +44,9 @@ backup.
   produces a machine enrolled to its Secure Enclave only, with no recovery path.
 - **§8 — every `ssh` now runs with `-F /dev/null`, so `~/.ssh/config` Host aliases stop
   working.** A `backup_remotes` or `bundle_peers` entry written as an alias, or relying on a
-  custom `HostName`/`Port`/`User`/`IdentityFile`/`IdentityAgent`, must be rewritten as a
-  reachable `user@host` before it will connect.
+  custom `HostName`/`Port`/`User`/`IdentityAgent`, must be rewritten as a reachable
+  `user@host` before it will connect. A backup entry may append ` -i <identity-file>`;
+  bundle peers still need an agent-held key.
 - **§3 — the Keychain identity must match the OLD install** before `migrate`, or it
   reads the wrong/no master.
 - **§4b — `hot_cheese enroll grant` is required before `serve`.** An install cutting over
@@ -726,7 +727,8 @@ entirely — that is what stops a same-uid process from attaching a `ProxyComman
 backup or bootstrap connection. The consequence is that **`Host` aliases no longer work**:
 a `backup_remotes` or `bundle_peers` entry written as an alias, or one relying on a custom
 `HostName`, `Port`, `User`, `IdentityFile` or `IdentityAgent` from that file, will now fail.
-Rewrite it as a directly reachable `user@host` and keep the key in your agent
+Rewrite it as a directly reachable `user@host`. A backup entry may instead name its key as
+`user@host -i ~/.ssh/key`; bundle peers and bootstrap still need an agent-held key
 (`SSH_AUTH_SOCK` is the one variable `bootstrap-from` passes to the ssh child). Host keys
 are checked with `StrictHostKeyChecking=yes` against `~/.ssh/known_hosts` for the backup
 transport and for `bootstrap-from` — so **the host key must already be there**; first

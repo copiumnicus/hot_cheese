@@ -52,7 +52,7 @@
 //! be a worse trade than writing it twice.
 use crate::flock;
 use err_mac::create_err_with_impls;
-use hc_core::config::{BackupRemote, Config};
+use hc_core::config::{validate_backup_ssh_target, BackupRemote, Config};
 use hc_core::crypto::envelope::{
     atomic_write_new, enforce_store_modes, EnvErr, GIT_DIR, MAX_KEYSTORE_FILE_BYTES,
 };
@@ -243,6 +243,7 @@ create_err_with_impls!(
     Grant(GrantErr),
     Hex(hex::FromHexError),
     Json(serde_json::Error),
+    SshTarget(hc_core::config::SshTargetErr),
     ParseInt(std::num::ParseIntError),
     Utf8(std::str::Utf8Error)
     ;
@@ -1289,8 +1290,9 @@ impl GitStore {
         }
         release_preview(&store)?;
         reclaim_fetch_objects(&store, MAX_FETCH_OBJECT_FILES, MAX_FETCH_OBJECT_BYTES)?;
-        git(
+        git_remote(
             Some(&store),
+            remote,
             GitOp::ForcedPull,
             &[
                 "fetch",
@@ -1443,7 +1445,7 @@ impl GitStore {
         let url = url(remote, vault);
         let refspec = format!("{head}:{HEAD_REF}");
         let argv = ["push", "--quiet", &url, &refspec];
-        let first = run(Some(store), GitOp::Push, &argv)?;
+        let first = run_remote(Some(store), remote, GitOp::Push, &argv)?;
         if first.code == 0 {
             return Ok(());
         }
@@ -1460,7 +1462,7 @@ impl GitStore {
                 stderr: first.stderr,
             });
         }
-        git(Some(store), GitOp::Push, &argv)?;
+        git_remote(Some(store), remote, GitOp::Push, &argv)?;
         Ok(())
     }
 
@@ -1474,7 +1476,7 @@ impl GitStore {
     fn fetch_one(&self, store: &Path, remote: &BackupRemote, vault: &VaultId) -> Step<Found> {
         let url = url(remote, vault);
         let probe = ["ls-remote", "--exit-code", &url, HEAD_REF];
-        let probed = run(None, GitOp::Fetch, &probe)?;
+        let probed = run_remote(None, remote, GitOp::Fetch, &probe)?;
         match probed.code {
             0 => {}
             2 => {
@@ -1497,8 +1499,9 @@ impl GitStore {
                 });
             }
         }
-        git(
+        git_remote(
             Some(store),
+            remote,
             GitOp::Fetch,
             &[
                 "fetch",
@@ -1988,10 +1991,19 @@ fn ssh_options() -> Vec<String> {
     options
 }
 
+fn backup_ssh_options(remote: &BackupRemote) -> Result<Vec<String>, GitErr> {
+    validate_backup_ssh_target(&remote.host)?;
+    let mut options = ssh_options();
+    if let Some(identity_file) = remote.ssh_parts().1 {
+        options.push(format!("-i{identity_file}"));
+    }
+    Ok(options)
+}
+
 /// The one `Command` constructor here. `store` is `Some` for anything addressing the store's
 /// repository and `None` for a clone or a bare URL probe, which have no repository to be inside
 /// yet.
-fn scrubbed(store: Option<&Path>) -> Command {
+fn scrubbed(store: Option<&Path>, remote: Option<&BackupRemote>) -> Result<Command, GitErr> {
     let mut cmd = Command::new("/usr/bin/git");
     for (name, _) in std::env::vars_os() {
         if is_scrubbed(&name.to_string_lossy()) {
@@ -2005,7 +2017,14 @@ fn scrubbed(store: Option<&Path>) -> Command {
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env(
             "GIT_SSH_COMMAND",
-            format!("{SSH_PROGRAM} {}", ssh_options().join(" ")),
+            format!(
+                "{SSH_PROGRAM} {}",
+                match remote {
+                    Some(remote) => backup_ssh_options(remote)?,
+                    None => ssh_options(),
+                }
+                .join(" ")
+            ),
         )
         .stdin(Stdio::null());
     if let Some(store) = store {
@@ -2026,7 +2045,7 @@ fn scrubbed(store: Option<&Path>) -> Command {
         .arg("core.fsmonitor=false")
         .arg("-c")
         .arg("protocol.ext.allow=never");
-    cmd
+    Ok(cmd)
 }
 
 fn owned(argv: &[&str]) -> Vec<String> {
@@ -2143,7 +2162,22 @@ fn reclaim_fetch_objects(store: &Path, max_files: usize, max_bytes: u64) -> Resu
 /// rather than failures. Both streams are captured: a console owns the terminal and library
 /// code may not draw into it.
 fn run(store: Option<&Path>, op: GitOp, argv: &[&str]) -> Step<Ran> {
-    let mut command = scrubbed(store);
+    run_with_remote(store, None, op, argv)
+}
+
+fn run_remote(store: Option<&Path>, remote: &BackupRemote, op: GitOp, argv: &[&str]) -> Step<Ran> {
+    run_with_remote(store, Some(remote), op, argv)
+}
+
+fn run_with_remote(
+    store: Option<&Path>,
+    remote: Option<&BackupRemote>,
+    op: GitOp,
+    argv: &[&str],
+) -> Step<Ran> {
+    #[cfg(test)]
+    let remote = remote.filter(|remote| !Path::new(&remote.host).is_absolute());
+    let mut command = scrubbed(store, remote).map_err(|error| step_failure(op, error))?;
     let is_fetch = argv.first() == Some(&"fetch");
     if is_fetch {
         let store = store.ok_or_else(|| step_failure(op, GitErr::MalformedRemoteTree))?;
@@ -2193,7 +2227,25 @@ fn run(store: Option<&Path>, op: GitOp, argv: &[&str]) -> Step<Ran> {
 
 /// Run one git that must succeed, and hand back its stdout.
 fn git(store: Option<&Path>, op: GitOp, argv: &[&str]) -> Step<Vec<u8>> {
-    let ran = run(store, op, argv)?;
+    git_with_remote(store, None, op, argv)
+}
+
+fn git_remote(
+    store: Option<&Path>,
+    remote: &BackupRemote,
+    op: GitOp,
+    argv: &[&str],
+) -> Step<Vec<u8>> {
+    git_with_remote(store, Some(remote), op, argv)
+}
+
+fn git_with_remote(
+    store: Option<&Path>,
+    remote: Option<&BackupRemote>,
+    op: GitOp,
+    argv: &[&str],
+) -> Step<Vec<u8>> {
+    let ran = run_with_remote(store, remote, op, argv)?;
     if ran.code != 0 {
         tracing::warn!(?op, ?argv, stderr = %ran.stderr, "git failed");
         return Err(Failed {
@@ -2215,8 +2267,8 @@ fn ssh(remote: &BackupRemote, argv: &[&str]) -> Result<Vec<u8>, GitErr> {
         command.env_remove(name);
     }
     command
-        .args(ssh_options())
-        .arg(&remote.host)
+        .args(backup_ssh_options(remote)?)
+        .arg(remote.ssh_parts().0)
         .args(argv)
         .stdin(Stdio::null());
     let out = hc_core::output_bounded_timeout(
@@ -2255,7 +2307,7 @@ fn remote_repo(remote: &BackupRemote, vault: &VaultId) -> String {
 
 /// The scp-syntax URL of one vault's bare repository on one remote.
 fn url(remote: &BackupRemote, vault: &VaultId) -> String {
-    format!("{}:{}", remote.host, remote_repo(remote, vault))
+    format!("{}:{}", remote.ssh_parts().0, remote_repo(remote, vault))
 }
 
 /// Read the store's vault id from cleartext `keyring.json`. Unlocks nothing.
@@ -3735,7 +3787,7 @@ mod tests {
         for keep in ["HOME", "SSH_AUTH_SOCK", "PATH", "USER", "TMPDIR"] {
             assert!(!is_scrubbed(keep), "{keep} was taken from ssh");
         }
-        let command = scrubbed(None);
+        let command = scrubbed(None, None).expect("build the git command");
         for (name, value) in command.get_envs() {
             if value.is_none() {
                 assert!(
@@ -3782,17 +3834,58 @@ mod tests {
         }
         let expected = std::ffi::OsString::from(format!("{SSH_PROGRAM} {}", options.join(" ")));
         assert!(
-            scrubbed(None)
+            scrubbed(None, None)
+                .expect("build the git command")
                 .get_envs()
                 .any(|(name, value)| name == "GIT_SSH_COMMAND"
                     && value == Some(expected.as_os_str())),
             "the git transport reaches a backup host through different ssh options"
         );
+
+        let remote = BackupRemote {
+            host: "nixos@tprime2 -i ~/.ssh/copium2".to_string(),
+            folder: "backups".to_string(),
+        };
+        let identity_options = backup_ssh_options(&remote).expect("accept the identity file");
+        assert_eq!(identity_options.last().unwrap(), "-i~/.ssh/copium2");
+        for option in &identity_options {
+            assert!(
+                !option.starts_with('~')
+                    && option
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_./=~".contains(c)),
+                "{option} is not a single shell word"
+            );
+        }
+        let expected =
+            std::ffi::OsString::from(format!("{SSH_PROGRAM} {}", identity_options.join(" ")));
+        assert!(scrubbed(None, Some(&remote))
+            .expect("build the remote git command")
+            .get_envs()
+            .any(|(name, value)| name == "GIT_SSH_COMMAND" && value == Some(expected.as_os_str())));
+        assert!(url(&remote, &VaultId::random()).starts_with("nixos@tprime2:"));
+
+        let injected = BackupRemote {
+            host: "nixos@tprime2 -i ~/.ssh/key;touch".to_string(),
+            folder: "backups".to_string(),
+        };
+        assert!(matches!(
+            scrubbed(None, Some(&injected)),
+            Err(GitErr::SshTarget(_))
+        ));
+        let malformed = BackupRemote {
+            host: "nixos@tprime2;touch".to_string(),
+            folder: "backups".to_string(),
+        };
+        assert!(matches!(
+            scrubbed(None, Some(&malformed)),
+            Err(GitErr::SshTarget(_))
+        ));
     }
 
     #[test]
     fn fetches_pin_the_verified_pack_path_and_resource_controls() {
-        let mut command = scrubbed(None);
+        let mut command = scrubbed(None, None).expect("build the git command");
         harden_fetch(&mut command).expect("install the fixed fetch limits");
         let args = command
             .get_args()
