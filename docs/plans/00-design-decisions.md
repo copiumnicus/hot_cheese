@@ -85,21 +85,13 @@ which was written against an earlier, stricter reading of decision 7.
    (`crates/hc-sign/src/adapter/annotate.rs:1-7,56-74`); making a missing `[[token]]` or
    `[[label]]` a refusal would mean a fresh `init` could sign nothing.
 
-8. **The renderer chooses the bind. REVISED after audit.** An earlier version of this
-   decision put both renderers on `config.port()` and made `scan_stranded` load-bearing.
-   The audit showed `scan_stranded` cannot carry that weight: it runs
-   `/bin/ps -axo pid=,args=` with no `-ww` (`crates/hc-console/src/exposure.rs:165-166`),
-   so BSD/macOS truncates to ~79 columns while this repo's own `ssh_reverse_args`
-   (`exposure.rs:74-90`) puts the `-R` token past column 90 — it would miss the exact
-   tunnel shape it exists to find, and its test feeds synthetic text so it never catches
-   this. It is also one-shot at startup, misses other uids' argv, and matches only `ssh`.
-   The ephemeral port's real contribution was *unpredictability*, which no startup scan
-   restores.
-
-   So: the terminal renderer binds an **ephemeral** TCP port, exactly as today, keeping
-   the property that a stranded reverse tunnel from an earlier session points at nothing.
-   The headless renderer binds `config.port()` for services. This is a `BindPort` enum on
-   `Runtime`, not two runtimes — everything else stays unified.
+8. **One configured port. REVISED by the owner.** Both renderers bind `config.port()`
+   (default `5555`), and a console reverse tunnel publishes that same number as its remote
+   port. There is no per-renderer or per-tunnel port choice. `scan_stranded` refuses startup
+   when it sees an earlier process forwarding into that port. The scan remains best effort:
+   it runs once, another uid's argv may be hidden, and a forward opened from the remote side
+   is invisible; `-ww` and matching the `-R` shape rather than a program name keep locally
+   visible forwards from being missed unnecessarily.
 
    **Both** renderers bind the adapter unix sockets. Those are 0600 filesystem paths
    guarded by the existing flock (`crates/hc-daemon/src/socket.rs:25`), so they carry no
@@ -215,10 +207,8 @@ Found by reading the current code. A plan that ignores one of these is incomplet
 - `LaContext` is `!Send` and must be created on the main thread. The console already
   routes approvals to the main thread over `mpsc`; the daemon instead builds it inside
   `spawn_blocking`. The unified runtime uses the main-thread model.
-- The console binds an ephemeral port and no adapter sockets today; `run_server` binds
-  `config.port()` plus one unix socket per manifest. Unification means the terminal
-  renderer gains adapter sockets, and console-plus-serve can no longer coexist. The store
-  lock must produce a clean typed refusal, not a corrupt store.
+- Both renderers bind `config.port()` plus one unix socket per manifest, and console-plus-serve
+  cannot coexist. The store lock must produce a clean typed refusal, not a corrupt store.
 - A passphrase session currently refuses to serve (`Serving::Refused`). That behaviour is
   load-bearing and must survive.
 - Under `UnlockGate::Passphrase` the console must still not expose or read-test.

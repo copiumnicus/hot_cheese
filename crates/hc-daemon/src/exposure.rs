@@ -76,18 +76,15 @@ pub struct StrandedTunnel {
     pub argv: String,
 }
 
-/// The exact `ssh` argv for a reverse tunnel: no shell, no user or system `ssh_config` (which is
-/// where a same-uid attacker would otherwise attach a `ProxyCommand` and sit in the middle of the
-/// tunnel), the far end authenticated by a host key checked against the invoking user's own
-/// known-hosts file, the remote end pinned to the remote's loopback, fail on a taken remote port,
-/// and drop the tunnel within ~45s of the link dying rather than leaving a black hole open.
-/// `ssh` expands `~` from the passwd database, never from `$HOME`.
+/// The exact `ssh` argv for a reverse tunnel: no shell, normal user and system `ssh_config` for
+/// aliases and routes, the far end authenticated by a host key checked against the invoking
+/// user's own known-hosts file, the remote end pinned to the remote's loopback, fail on a taken
+/// remote port, and drop the tunnel within ~45s of the link dying rather than leaving a black
+/// hole open. `ssh` expands `~` from the passwd database, never from `$HOME`.
 pub fn ssh_reverse_args(spec: &TunnelSpec) -> Vec<String> {
     vec![
         "-N".to_string(),
         "-T".to_string(),
-        "-F".to_string(),
-        "/dev/null".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(),
@@ -387,15 +384,14 @@ impl Drop for TunnelManager {
 mod tests {
     use super::*;
 
-    /// The exposure surface pins noninteractive/no-fork/no-multiplex behavior and refuses the
-    /// `ssh_config` a same-uid attacker would put a `ProxyCommand` in, then maps the remote's
-    /// LOOPBACK port onto this console's loopback port. Without the `localhost:` prefix a remote
-    /// sshd set to `GatewayPorts clientspecified` publishes the key-release API on every
-    /// interface it has.
+    /// The exposure surface reads normal `ssh_config` for aliases while pinning noninteractive/
+    /// no-fork/no-multiplex behavior, then maps the remote's LOOPBACK port onto this console's
+    /// loopback port. Without the `localhost:` prefix a remote sshd set to
+    /// `GatewayPorts clientspecified` publishes the key-release API on every interface it has.
     #[test]
-    fn reverse_args_pin_both_ends_to_loopback() {
+    fn reverse_args_keep_ssh_config_and_pin_both_ends_to_loopback() {
         let args = ssh_reverse_args(&TunnelSpec {
-            target: "ops@tprime2".to_string(),
+            target: "dprime2".to_string(),
             remote_port: 7777,
             local_port: 5555,
         });
@@ -404,8 +400,6 @@ mod tests {
             vec![
                 "-N",
                 "-T",
-                "-F",
-                "/dev/null",
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
@@ -432,7 +426,7 @@ mod tests {
                 "ServerAliveCountMax=3",
                 "-R",
                 "localhost:7777:localhost:5555",
-                "ops@tprime2",
+                "dprime2",
             ]
         );
     }

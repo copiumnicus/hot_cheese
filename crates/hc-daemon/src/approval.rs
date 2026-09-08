@@ -21,7 +21,8 @@ use std::sync::Arc;
 /// Safe is on it, however far past three lines that runs.
 const SHEET_LINES: usize = 3;
 
-/// Takes the human decision, then the one biometric a sign reuses. Only the thread that owns the
+/// Takes the human decision. A listening Secure-Enclave daemon uses Touch ID as that decision;
+/// local signing may still take an explicit terminal answer first. Only the thread that owns the
 /// [`crate::runtime::Runtime`] ever calls this, which is what keeps the `!Send` [`LaContext`] on
 /// one thread without anything having to say so.
 pub struct Approver {
@@ -33,6 +34,10 @@ pub struct Approver {
     decision: Mutex<Decision>,
     /// How this session asks, and how it gives the terminal back.
     renderer: Arc<dyn Renderer>,
+    /// A serving Secure-Enclave session uses the biometric sheet itself as the answer. Local
+    /// CLI signing keeps the explicit terminal confirmation it has historically used.
+    direct_biometric: bool,
+    biometric: fn(&str) -> Result<LaContext, SignErr>,
 }
 
 impl Approver {
@@ -42,7 +47,17 @@ impl Approver {
             shown: AtomicU64::new(1),
             decision: Mutex::new(Decision::Deny),
             renderer,
+            direct_biometric: false,
+            biometric: |reason| Ok(LaContext::evaluate_biometric(reason)?),
         }
+    }
+
+    /// Build the approver used by a listening daemon. An arriving viable request immediately
+    /// raises Touch ID; there is no separate terminal answer to discover first.
+    pub fn direct(gate: UnlockGate, renderer: Arc<dyn Renderer>) -> Self {
+        let mut approver = Self::new(gate, renderer);
+        approver.direct_biometric = gate == UnlockGate::Biometric;
+        approver
     }
 
     /// How the operator left the last prompt, so a flood can be escaped between two of them.
@@ -71,6 +86,23 @@ impl Approver {
         summary: &Summary,
     ) -> Result<Option<LaContext>, SignErr> {
         let seq = self.shown.fetch_add(1, Ordering::Relaxed);
+        let head = match summary.alarms().is_empty() {
+            true => summary
+                .body
+                .lines()
+                .take(SHEET_LINES)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            false => summary.head(SHEET_LINES),
+        };
+        if self.direct_biometric {
+            let result = (self.biometric)(&format!("#{seq} {}\n{head}", ctx.reason()));
+            *self.decision.lock() = match result {
+                Ok(_) => Decision::Approve,
+                Err(_) => Decision::Deny,
+            };
+            return result.map(Some);
+        }
         let shown = match summary.alarms().is_empty() {
             true => summary.to_string(),
             false => format!("{summary}\n{}", summary.head(SHEET_LINES)),
@@ -93,15 +125,6 @@ impl Approver {
         if self.gate == UnlockGate::Passphrase || ctx.op != Operation::Sign {
             return Ok(None);
         }
-        let head = match summary.alarms().is_empty() {
-            true => summary
-                .body
-                .lines()
-                .take(SHEET_LINES)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            false => summary.head(SHEET_LINES),
-        };
         Ok(Some(LaContext::evaluate_biometric(&format!(
             "#{seq} {}\n{head}",
             ctx.reason()
@@ -155,6 +178,24 @@ mod tests {
             op: Operation::EvmAddress,
             peer: Peer::Loopback,
         }
+    }
+
+    fn biometric_denied(_: &str) -> Result<LaContext, SignErr> {
+        Err(SignErr::ApprovalDenied)
+    }
+
+    #[test]
+    fn daemon_biometric_is_the_decision_without_a_terminal_question() {
+        let (counting, mut approver) = counting(Decision::Approve);
+        approver.direct_biometric = true;
+        approver.biometric = biometric_denied;
+
+        assert!(matches!(
+            approver.approve(&remote("TRADER"), &nothing_to_read()),
+            Err(SignErr::ApprovalDenied)
+        ));
+        assert_eq!(*counting.asked.lock(), 0);
+        assert_eq!(approver.decision(), Decision::Deny);
     }
 
     /// Nothing on the loopback listener tells the operator's own service from a flood, so a

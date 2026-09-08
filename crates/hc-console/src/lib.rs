@@ -9,8 +9,8 @@
 //!
 //! Exposure lasts exactly as long as the session. Every ending the process can act on — a normal
 //! return, an error, a panic unwind, SIGINT, SIGTERM, SIGHUP — closes every tunnel and gives the
-//! terminal back, and the listener takes a kernel-chosen port so the one ending it cannot act
-//! on, `SIGKILL`, leaves its `ssh` children pointed at a port the next session will not hold.
+//! terminal back. At startup, the runtime refuses any reverse tunnel left pointing at the
+//! configured port by an ending it cannot act on, `SIGKILL`.
 pub mod approval;
 pub(crate) mod bundles;
 pub mod menu;
@@ -28,7 +28,7 @@ use hc_core::mac::BackendImpl;
 use hc_daemon::exposure::TunnelManager;
 use hc_daemon::flock;
 use hc_daemon::renderer::Renderer;
-use hc_daemon::runtime::{BindPort, Runtime, UnlockGate};
+use hc_daemon::runtime::{Runtime, UnlockGate};
 use renderer::Terminal;
 use std::io::Write;
 use std::sync::Arc;
@@ -128,14 +128,7 @@ fn session(
     store: flock::Claim,
 ) -> Result<(), ConsoleErr> {
     let log = status::install_subscriber(&home_dir(), hc_core::config::env_log_level())?;
-    let rt = Runtime::start(
-        config,
-        backend,
-        gate,
-        Arc::new(Terminal),
-        BindPort::Ephemeral,
-        store,
-    )?;
+    let rt = Runtime::start(config, backend, gate, Arc::new(Terminal), store)?;
 
     let previous_hook = std::panic::take_hook();
     let panicking = rt.tunnels.clone();

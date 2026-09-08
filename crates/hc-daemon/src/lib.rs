@@ -33,7 +33,6 @@ use hc_core::crypto::envelope::{
 };
 use hc_core::crypto::{keccak256, random_pk};
 use hc_core::is_valid_key_name;
-#[cfg(test)]
 use hc_core::mac::local_auth::LaContext;
 use hc_core::mac::BackendImpl;
 use hc_core::read_grant::{GrantToken, ReadGrantErr, GRANT_HEADER};
@@ -145,7 +144,6 @@ pub fn serve(
         backend,
         runtime::UnlockGate::Biometric,
         renderer,
-        runtime::BindPort::Configured,
         store,
     )?;
     let result = rt.approve_forever();
@@ -704,21 +702,21 @@ pub fn execute(
             let permit = api.export_permit(ctx)?;
             let recipient = api.recipient(body)?;
             let digest = hex::encode(Sha256::digest(body));
-            approver.approve(
+            let auth = approver.approve(
                 ctx,
                 &stated(format!(
                     "recipient key sha256 {recipient}\nrequest body sha256 {}",
                     &digest[..DIGEST_CHARS]
                 )),
             )?;
-            Ok(api.read(ctx, body, permit)?)
+            Ok(api.read(ctx, body, permit, auth.as_ref())?)
         }
         Operation::Sign => Ok(api.sign_intent(ctx, body, approver)?),
         Operation::EvmGenerate => {
             api.preflight_vacant(ctx)?;
-            approver.approve(ctx, &stated(String::new()))?;
+            let auth = approver.approve(ctx, &stated(String::new()))?;
             let mutation = api.git.as_ref().map(|git| git.mutation());
-            api.generate(ctx, KeyUse::SignOnly)?;
+            api.generate_with_auth(ctx, KeyUse::SignOnly, auth.as_ref())?;
             if let Some(mutation) = mutation {
                 mutation.commit()?;
             }
@@ -726,9 +724,9 @@ pub fn execute(
         }
         Operation::SolanaGenerate => {
             api.preflight_vacant(ctx)?;
-            approver.approve(ctx, &stated(String::new()))?;
+            let auth = approver.approve(ctx, &stated(String::new()))?;
             let mutation = api.git.as_ref().map(|git| git.mutation());
-            api.generate_solana(ctx, KeyUse::SignOnly)?;
+            api.generate_solana_with_auth(ctx, KeyUse::SignOnly, auth.as_ref())?;
             if let Some(mutation) = mutation {
                 mutation.commit()?;
             }
@@ -736,13 +734,13 @@ pub fn execute(
         }
         Operation::EvmAddress => {
             let container = api.preflight_existing(ctx)?;
-            approver.approve(ctx, &stated(String::new()))?;
-            Ok(api.address_of(ctx, container)?.into_bytes())
+            let auth = approver.approve(ctx, &stated(String::new()))?;
+            Ok(api.address_of(ctx, container, auth.as_ref())?.into_bytes())
         }
         Operation::SolanaAddress => {
             let container = api.preflight_existing(ctx)?;
-            approver.approve(ctx, &stated(String::new()))?;
-            Ok(api.address_solana_of(ctx, container)?.into_bytes())
+            let auth = approver.approve(ctx, &stated(String::new()))?;
+            Ok(api.address_solana_of(ctx, container, auth.as_ref())?.into_bytes())
         }
     }
 }
@@ -996,7 +994,7 @@ impl HotApi {
     }
 
     pub fn address(&self, ctx: &OpContext) -> Result<String, ApiBackendErr> {
-        self.address_of(ctx, self.preflight_existing(ctx)?)
+        self.address_of(ctx, self.preflight_existing(ctx)?, None)
     }
     /// Derive the EVM address from the container [`HotApi::preflight_existing`] validated,
     /// carried here by value: nothing reopens the file, so a writer that swaps
@@ -1005,29 +1003,39 @@ impl HotApi {
         &self,
         ctx: &OpContext,
         container: KeystoreFile,
+        auth: Option<&LaContext>,
     ) -> Result<String, ApiBackendErr> {
-        let dek = self.inner.unlock_dek(&ctx.reason(), None)?;
+        let dek = self.inner.unlock_dek(&ctx.reason(), auth)?;
         let key = container.open(&ctx.key, &dek)?;
         sk_to_adr(&key)
     }
     pub fn address_solana(&self, ctx: &OpContext) -> Result<String, ApiBackendErr> {
-        self.address_solana_of(ctx, self.preflight_existing(ctx)?)
+        self.address_solana_of(ctx, self.preflight_existing(ctx)?, None)
     }
     /// The same carry-forward for a Solana keypair.
     fn address_solana_of(
         &self,
         ctx: &OpContext,
         container: KeystoreFile,
+        auth: Option<&LaContext>,
     ) -> Result<String, ApiBackendErr> {
-        let dek = self.inner.unlock_dek(&ctx.reason(), None)?;
+        let dek = self.inner.unlock_dek(&ctx.reason(), auth)?;
         let key = container.open(&ctx.key, &dek)?;
         solana_address(key.as_slice()).map_err(|_| ApiBackendErr::FailReadKeypair)
     }
     pub fn generate_solana(&self, ctx: &OpContext, key_use: KeyUse) -> Result<(), ApiBackendErr> {
+        self.generate_solana_with_auth(ctx, key_use, None)
+    }
+    fn generate_solana_with_auth(
+        &self,
+        ctx: &OpContext,
+        key_use: KeyUse,
+        auth: Option<&LaContext>,
+    ) -> Result<(), ApiBackendErr> {
         self.preflight_vacant(ctx)?;
         let mut rng = rand::rngs::OsRng;
         let pk = generate_solana_keypair(&mut rng).map_err(|_| ApiBackendErr::FailReadKeypair)?;
-        let dek = self.inner.unlock_dek(&ctx.reason(), None)?;
+        let dek = self.inner.unlock_dek(&ctx.reason(), auth)?;
         match encrypt_file_new(
             &self.inner.store_path(),
             &ctx.key,
@@ -1044,10 +1052,18 @@ impl HotApi {
         Ok(())
     }
     pub fn generate(&self, ctx: &OpContext, key_use: KeyUse) -> Result<(), ApiBackendErr> {
+        self.generate_with_auth(ctx, key_use, None)
+    }
+    fn generate_with_auth(
+        &self,
+        ctx: &OpContext,
+        key_use: KeyUse,
+        auth: Option<&LaContext>,
+    ) -> Result<(), ApiBackendErr> {
         self.preflight_vacant(ctx)?;
         let mut rng = rand::rngs::OsRng;
         let pk = Zeroizing::new(random_pk(&mut rng).to_bytes().to_vec());
-        let dek = self.inner.unlock_dek(&ctx.reason(), None)?;
+        let dek = self.inner.unlock_dek(&ctx.reason(), auth)?;
         match encrypt_file_new(
             &self.inner.store_path(),
             &ctx.key,
@@ -1088,11 +1104,12 @@ impl HotApi {
         ctx: &OpContext,
         body: &[u8],
         permit: ExportPermit,
+        auth: Option<&LaContext>,
     ) -> Result<Vec<u8>, ApiBackendErr> {
         Self::validate_key(ctx)?;
         let req: ClientReq = hc_core::wire::strict_json_from_slice(body)?;
         tracing::info!(client_key = %recipient_fingerprint(&req.pubk), "accepted ephemeral read key");
-        let dek = self.inner.unlock_dek(&ctx.reason(), None)?;
+        let dek = self.inner.unlock_dek(&ctx.reason(), auth)?;
         let key = permit.open(&ctx.key, &dek)?;
         let server = EphemeralServer::new();
         let res = server.encrypt_secret(&req, &ctx.key, &key)?;

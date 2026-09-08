@@ -42,11 +42,17 @@ backup.
 - **§8 — `HOT_CHEESE_BOOTSTRAP_PASSPHRASE` is deleted.** `bootstrap-from` now takes
   `--recovery-passphrase` instead. A provisioning script that set the variable silently
   produces a machine enrolled to its Secure Enclave only, with no recovery path.
-- **§8 — every `ssh` now runs with `-F /dev/null`, so `~/.ssh/config` Host aliases stop
-  working.** A `backup_remotes` or `bundle_peers` entry written as an alias, or relying on a
-  custom `HostName`/`Port`/`User`/`IdentityAgent`, must be rewritten as a reachable
-  `user@host` before it will connect. A backup entry may append ` -i <identity-file>`;
-  bundle peers still need an agent-held key.
+- **§8 — backup, bootstrap, and bundle-sync `ssh` now run with `-F /dev/null`, so
+  `~/.ssh/config` aliases stop working on those paths.** A `backup_remotes` or `bundle_peers`
+  entry written as an alias, or relying on a custom `HostName`/`Port`/`User`/`IdentityAgent`,
+  must be rewritten as a reachable `user@host` before it will connect. A backup entry may
+  append ` -i <identity-file>`; bundle peers still need an agent-held key. The console's
+  reverse-tunnel prompt honors SSH config aliases.
+- **§8 — the console now binds the same configured `port` as `serve`, and exposure publishes
+  that same number remotely.** The console no longer picks an ephemeral port and no longer asks
+  for a separate remote port. Make sure the configured port (default `5555`) is free on both
+  machines; a local collision refuses startup and a remote collision makes the tunnel exit.
+  Explicit `port = 0` is now refused as `InvalidPort`.
 - **§3 — the Keychain identity must match the OLD install** before `migrate`, or it
   reads the wrong/no master.
 - **§4b — `hot_cheese enroll grant` is required before `serve`.** An install cutting over
@@ -722,19 +728,20 @@ recovery enrollment and no cross-machine restore path, silently.** Pass the flag
 `hot_cheese enroll passphrase` on the new machine afterwards; `hot_cheese list` warns while
 none is enrolled.
 
-**Every `ssh` this binary runs passes `-F /dev/null`**, which discards `~/.ssh/config`
+**Backup, bootstrap, and bundle-sync `ssh` pass `-F /dev/null`**, which discards `~/.ssh/config`
 entirely — that is what stops a same-uid process from attaching a `ProxyCommand` to your
-backup or bootstrap connection. The consequence is that **`Host` aliases no longer work**:
-a `backup_remotes` or `bundle_peers` entry written as an alias, or one relying on a custom
-`HostName`, `Port`, `User`, `IdentityFile` or `IdentityAgent` from that file, will now fail.
-Rewrite it as a directly reachable `user@host`. A backup entry may instead name its key as
-`user@host -i ~/.ssh/key`; bundle peers and bootstrap still need an agent-held key
+backup or bootstrap connection. The consequence is that **`Host` aliases no longer work on
+those paths**: a `backup_remotes` or `bundle_peers` entry written as an alias, or one relying
+on a custom `HostName`, `Port`, `User`, `IdentityFile` or `IdentityAgent` from that file, will
+now fail. Rewrite it as a directly reachable `user@host`. A backup entry may instead name its
+key as `user@host -i ~/.ssh/key`; bundle peers and bootstrap still need an agent-held key
 (`SSH_AUTH_SOCK` is the one variable `bootstrap-from` passes to the ssh child). Host keys
 are checked with `StrictHostKeyChecking=yes` against `~/.ssh/known_hosts` for the backup
 transport and for `bootstrap-from` — so **the host key must already be there**; first
 contact is refused, not prompted. Bundle peer sync uses `accept-new` instead: a first
 contact enrolls, a *changed* key is refused. Verify with `hot_cheese backup fetch` before
-you rely on any of it.
+you rely on any of it. The console's reverse-tunnel prompt honors normal SSH configuration,
+so a `Host` alias works there.
 
 Adapter manifests and their pins are deliberately **outside** the store, so they travel with
 neither the backup nor `bootstrap-from`. A restored or bootstrapped machine comes up with

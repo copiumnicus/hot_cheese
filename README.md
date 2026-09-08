@@ -502,31 +502,17 @@ does the same rather than writing underneath a live daemon. `address`, `list`,
 `adapters`, `backup status`, `backup list` and every `bundle` verb still work while
 one is running.
 
-Every request that arrives over the network surface — the loopback listener and
-the adapter sockets — prints itself on the daemon's terminal and waits for `y`
-before any unlock. Run it in the foreground where you can answer it. With no
-terminal at all the daemon refuses those requests by type rather than pretending
-somebody said no.
+Every viable request that arrives over the network surface — the loopback listener and
+the adapter sockets — immediately raises a Touch ID sheet in the active GUI login session.
+That biometric is the approval: there is no terminal `y` prompt to discover first. The sheet
+names the request, key and caller, and signing requests include the highest-priority decoded
+summary lines. The approved `LAContext` is reused for the Secure Enclave unlock, so approval
+and key use still cost one Touch ID interaction.
 
-**The daemon refuses nothing on its own.** There is no rate limit and no per-pass prompt
-cap: the loopback listener authenticates nobody, so a request from an attacker and a
-request from your own service are byte-identical, and any budget the daemon spent by
-itself would be a lever an attacker aims at *everybody* — a cheap way to have every
-legitimate request refused. What bounds a flood is the operator:
-
-- **Prompts are strictly serial.** One approval thread, one prompt at a time, in arrival
-  order. Each one is on screen at least **400 ms** before a keystroke counts as an answer
-  to it (an answer that lands inside that window is reported and asked again, never
-  silently used as the answer to a request you had not read).
-- **A prompt left unanswered for 60 seconds auto-DENIES** and the daemon logs
-  `denying a request the operator never answered`. A closed terminal or an over-long
-  answer line denies too. There is no "assume yes" and no unbounded wait.
-- **`q` at a prompt is the escape hatch you control.** It denies that request, denies the
-  whole queued backlog without prompting, and buys **30 seconds of quiet from that caller
-  only**. The quiet lapses by itself and is scoped as finely as the listener can honestly
-  tell callers apart: **every client of the loopback listener is one caller** (loopback
-  authenticates nobody), each adapter socket is its own caller named by its manifest id,
-  and the operator's own CLI can never be silenced because no listener can reach it.
+Touch ID prompts are strictly serialized on the daemon's main thread and shown in arrival
+order. Rejecting or cancelling the sheet denies that request; approving it lets only that
+request reuse the resulting authentication context. Requests rejected by public validation or
+policy checks never raise Touch ID.
 
 A denied request answers **403**, deliberately not `500` — a client that retries every
 server error would otherwise turn your refusal into a retry loop and starve itself. At
@@ -573,7 +559,7 @@ peer cannot hold listener slots without asking for anything.
 | `bundle peer add <name>` | Enroll a tailnet machine, once, after checking it answers and has a bundles dir. Writes `[[bundle_peers]]`. |
 | `bundle peer rm <name>` | Stop syncing with a machine. |
 | `bundle … --no-sync` | Do the verb and touch no peer. Accepted on every bundle verb, anywhere in the line. |
-| `serve` | Run the HTTPS daemon and the adapter sockets. Takes this install's store claim, prompts on its own terminal for every request, and refuses to start without a local store or an enrolled grant key matching the `config.toml` pin. Restore a missing store explicitly with `backup pull --force` first. |
+| `serve` | Run the HTTPS daemon and the adapter sockets. Takes this install's store claim and immediately raises Touch ID for each viable incoming request—no terminal confirmation first. Refuses to start without a local store or an enrolled grant key matching the `config.toml` pin. Restore a missing store explicitly with `backup pull --force` first. |
 | `backup status` | Print this install's vault, its local commit, and every configured remote. No network, no write, no claim. |
 | `backup push` | Push this install's commits to every configured remote, under its vault id. Fails only when **every** remote failed. |
 | `backup fetch` | Fetch and validate every remote without changing the active store. Reports `remote ahead` or fails with `Diverged` when histories fork. |
@@ -719,9 +705,9 @@ name = "Vendor payouts"
 | --- | --- |
 | `service`, `account` | **Legacy** Keychain identifiers, used **only** by `migrate` to read the old master. Ignored by the envelope path. |
 | `store` | Directory holding the encrypted keystores + `keyring.json` (`~/` is expanded). |
-| `port` | HTTPS listen port (optional; defaults to `5555`). |
+| `port` | HTTPS listen port for both the console and `serve`, and the reverse-tunnel remote port (optional; defaults to `5555`; `0` is refused). |
 | `grant_public_key` | Uncompressed SEC1 hex (65 bytes, `04`-prefixed) of the Secure Enclave grant key, written by `enroll grant`. **Required to sign**: every signature verifies its grant against this key, and `serve` refuses to start without it (`GrantKeyMissingRunEnrollGrant`) or when the on-disk grant key exports something else (`GrantKeyPinMismatch`). The *pin* is an identity check against a swapped or restored blob — **not** a defence against someone who can write the home dir. |
-| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. `host` is `[user@]hostname`, optionally followed by the exact suffix ` -i <identity-file>` (for example, `nixos@tprime2 -i ~/.ssh/copium2`); both pieces accept only a single safe word, and no other SSH option is accepted. A bare IPv6 literal or embedded `:port` is refused at load. **The hostname must be directly reachable, not a `~/.ssh/config` alias** — every ssh this binary runs passes `-F /dev/null`, so settings from that file are ignored. See [SSH options](#ssh-options-what-is-pinned-and-what-that-breaks). |
+| `backup_remotes` | List of `{ host, folder }` git remotes reached over `ssh`. `folder` is relative to the remote home dir unless absolute, and several installs may share one — each pushes to its own bare repository at `<folder>/<vault_id>.git` (see [Backups](#backups)). The host needs `git`. `host` is `[user@]hostname`, optionally followed by the exact suffix ` -i <identity-file>` (for example, `nixos@tprime2 -i ~/.ssh/copium2`); both pieces accept only a single safe word, and no other SSH option is accepted. A bare IPv6 literal or embedded `:port` is refused at load. **The hostname must be directly reachable, not a `~/.ssh/config` alias** — backup SSH passes `-F /dev/null`, so settings from that file are ignored. See [SSH options](#ssh-options-what-is-pinned-and-what-that-breaks). |
 | `adapters` | List of `{ id, manifest, sha256 }` trusted signing adapters. `manifest` resolves under the home dir when relative; `sha256` is the pin the file's bytes must hash to *before* they are parsed. `serve` refuses to start on a mismatch, or when a manifest claims more than the key's policy grants. See [Signing Adapters](#signing-adapters). |
 | `bundle_peers` | List of `{ host, dir }` machines to exchange **bundles** with, written by `bundle peer add`. `host` is a Tailscale MagicDNS name (optionally `user@`-prefixed); `dir` is optional and defaults to `.config/hot_cheese/bundles`, relative to the peer's home dir. A **separate key from `backup_remotes`, pointed at a separate directory, with no vault namespace** — the store never travels this path. See [Bundle sync](#transport-tailscale-discovery-rsync-over-ssh-outbound-only). |
 | `bundle_watch_secs` | Seconds between ticks of the background bundle poller a session runs (optional; defaults to `30`, floored at `5`). The name is kept so an existing `config.toml` is not silently ignored. |
@@ -1144,11 +1130,9 @@ proves the file outlived its process, and only then is it unlinked. Nothing is e
 blind-unlinked. A clean exit unlinks its own sockets.
 
 Both front ends bind the adapter sockets: they are the same runtime with a different way of
-asking the operator. The interactive console binds a **kernel-chosen** loopback port instead of
-`config.port`, because its listener is reached only through tunnels it opens itself and hands
-`ssh` the real port at that moment — so an `ssh -R` that outlived an earlier session points at
-a port nothing will be holding. `serve` takes the documented port, because its clients have to
-find it.
+asking the operator. Both bind the configured loopback `port` (default `5555`), and a reverse
+tunnel publishes that same port number on the remote. At startup, either front end refuses if
+an `ssh -R` left by an earlier process still points at the port.
 
 A console session and a serving daemon therefore **cannot** run at the same time: the second
 one refuses immediately with the store claim's typed error naming `<home>/.store.lock`, rather
@@ -2113,9 +2097,10 @@ not on the channel.
 
 ### SSH options: what is pinned, and what that breaks
 
-Every `ssh` this binary runs — backup push/fetch/pull, the bootstrap pipe, and bundle peer
-sync — is `/usr/bin/ssh` with a pinned option list rather than whatever the environment
-supplies. A backup target may append its one explicit identity file:
+Backup push/fetch/pull, the bootstrap pipe, and bundle peer sync use `/usr/bin/ssh` with a
+pinned option list rather than whatever the environment supplies. A backup target may append
+its one explicit identity file. The console's reverse-tunnel path is the exception: it reads
+the normal user and system SSH configuration, so `Host` aliases work there.
 
 | Path | `StrictHostKeyChecking` | Also always |
 | --- | --- | --- |
@@ -2123,10 +2108,10 @@ supplies. A backup target may append its one explicit identity file:
 | `bootstrap-from` | `yes` | the same fixed options, with no per-target identity, plus `ClearAllForwardings=yes`, and a cleared environment except `SSH_AUTH_SOCK` |
 | Bundle peer sync (tailnet) | `accept-new` | the same fixed options, with no per-target identity; a **first** contact enrolls the key, a **changed** key is refused |
 
-`-F /dev/null` is the load-bearing one: without it a same-uid process that can write
-`~/.ssh/config` attaches its own `ProxyCommand` to your backup connection. With it, the
-host key is the only thing authenticating the far end, which is why the known-hosts file
-is named explicitly too (`ssh` expands `~` from the passwd database, not `$HOME`).
+`-F /dev/null` is load-bearing on those three paths: without it a same-uid process that can
+write `~/.ssh/config` attaches its own `ProxyCommand` to your backup connection. With it, the
+host key is the only thing authenticating the far end, which is why the known-hosts file is
+named explicitly too (`ssh` expands `~` from the passwd database, not `$HOME`).
 
 > **This breaks `~/.ssh/config` aliases, and it will break real setups on upgrade.**
 > `-F /dev/null` discards that file entirely, so a `Host` alias and everything under it —

@@ -57,6 +57,7 @@ create_err_with_impls!(
     NoEnrolledPeers,
     BadHexSecret,
     ReadTestTimedOut,
+    PendingRequest,
     Inquire(inquire::InquireError),
     Tunnel(hc_daemon::exposure::TunnelErr),
     Approval(super::approval::ApprovalErr),
@@ -291,11 +292,12 @@ menu_enum!(KeyAction {
 
 menu_enum!(ExposureAction {
     Open => "Open a reverse ssh tunnel",
-        "Runs ssh -R to the host you name, so a remote port reaches this session's https \
-         listener. The tunnel dies with the session.",
+        "Runs ssh -R to the host or ~/.ssh/config alias you name, so a remote port reaches this \
+         session's https listener on the same configured port. The tunnel dies with the \
+         session.",
     List => "List open tunnels",
-        "Prints the tunnels this session opened with their remote and local ports. Touches \
-         nothing.",
+        "Prints this session's tunnel SSH processes that are still running, with their remote \
+         and local ports. It does not prove the forwards are established.",
     Close => "Close a tunnel",
         "Kills one tunnel's ssh child, and the remote port stops answering at once.",
     ReadTest => "Read test over the pinned TLS route",
@@ -437,6 +439,7 @@ pub fn run(console: &mut Console) -> Result<(), MenuErr> {
         draw(console, &notice)?;
         let step = match screen(console, state) {
             Ok(step) => step,
+            Err(MenuErr::PendingRequest) => continue,
             Err(MenuErr::Inquire(InquireError::OperationCanceled)) => Step {
                 choice: MenuChoice::Back,
                 notice: String::new(),
@@ -831,15 +834,19 @@ fn exposure_screen(console: &mut Console) -> Result<Step, MenuErr> {
         }
         ExposureAction::ReadTest => return read_test(console, addr),
         ExposureAction::Open => {
-            let target = ask!(nav(Text::new("SSH target (user@host)").prompt()));
-            let remote_port = ask!(nav(CustomType::<u16>::new("Remote port").prompt()));
+            let target = ask!(nav(
+                Text::new("SSH target (host alias or user@host)").prompt()
+            ));
             let spec = TunnelSpec {
                 target: target.trim().to_string(),
-                remote_port,
+                remote_port: addr.port(),
                 local_port: addr.port(),
             };
             let id = console.rt.tunnels.open(spec.clone())?;
-            format!("opened {}", tunnel_label(id, &spec))
+            format!(
+                "started {}; List open tunnels shows whether its SSH process is still running",
+                tunnel_label(id, &spec)
+            )
         }
         ExposureAction::List => {
             let open = console.rt.tunnels.list();

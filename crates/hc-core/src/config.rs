@@ -374,6 +374,7 @@ create_err_with_impls!(
     TooManyEntries { field: String, found: usize, max: usize },
     InvalidMcpLimit { field: &'static str, found: u64, min: u64, max: u64 },
     InvalidApprovalTimeout { found: u64, min: u64, max: u64 },
+    InvalidPort { found: u16 },
     InvalidMcpKey { key: String },
     DuplicateAnchor { safe: Address, chain_id: U256 },
     InvalidAdapterId { id: String },
@@ -830,6 +831,9 @@ impl Config {
         validate_store_path(&self.store)?;
         if let Some(archive) = &self.store_archive {
             validate_store_archive_path(archive, &self.store)?;
+        }
+        if self.port == Some(0) {
+            return Err(ConfigErr::InvalidPort { found: 0 });
         }
         for (field, value) in [("service", &self.service), ("account", &self.account)] {
             if value.len() > MAX_LEGACY_KEYCHAIN_FIELD_BYTES || value.contains('\0') {
@@ -1390,6 +1394,14 @@ mod tests {
                 field: "nonce_window",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn an_ephemeral_listener_port_is_refused() {
+        assert!(matches!(
+            loaded("port = 0\n"),
+            Err(ConfigErr::InvalidPort { found: 0 })
         ));
     }
 

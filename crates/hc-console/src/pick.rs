@@ -480,6 +480,12 @@ pub(crate) fn pick<T: Pick>(
     let _screen = RawScreen;
     let mut state = State::new(&rows, filter);
     let outcome = loop {
+        // Touch ID and the Secure-Enclave context must stay on this main thread. Yield the menu
+        // as soon as a listener publishes work so `menu::run` can drain it immediately, without
+        // waiting for the operator to press a key or enter another screen.
+        if live.pending.get() > 0 {
+            return Err(MenuErr::PendingRequest);
+        }
         if state.band.tick(live)? {
             state.dirty = true;
         }

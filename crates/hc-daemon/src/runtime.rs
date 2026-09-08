@@ -2,7 +2,7 @@
 //! approver fed over an mpsc channel, the background tasks, and the store claim.
 //!
 //! The renderer is injected, so `hot_cheese` and `hot_cheese serve` differ in how they ask the
-//! human and in which TCP port they ask the kernel for — and in nothing else. The thread that
+//! human — and in nothing else. The thread that
 //! owns a [`Runtime`] is the only thread that ever calls [`Approver::approve`], which is what
 //! keeps the `!Send` [`hc_core::mac::local_auth::LaContext`] on one thread by construction.
 use crate::approval::Approver;
@@ -28,14 +28,6 @@ use tokio::sync::{mpsc, watch};
 /// How long the tokio runtime is given to finish in-flight connections at exit.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// Port the terminal renderer asks the kernel for: any free one. `config.port` is the `serve`
-/// daemon's contract with its clients; the console's listener is reached only through tunnels
-/// the console opens itself, and it hands `ssh` the real port at that moment, so no peer ever
-/// needs to predict it. A fixed port is the entire mechanism of the silent re-attach: an
-/// `ssh -R 7777:localhost:5555` that outlived its session serves every request to a remote the
-/// next session cannot see, because that tunnel is not in its [`exposure::TunnelManager`].
-const EPHEMERAL: u16 = 0;
-
 create_err_with_impls!(
     #[derive(Debug)]
     pub RuntimeErr,
@@ -50,17 +42,6 @@ create_err_with_impls!(
     ;
     StrandedTunnels { port: u16, found: Vec<exposure::StrandedTunnel> }
 );
-
-/// Which TCP port the loopback listener asks for. The terminal renderer keeps the kernel-chosen
-/// one so a stranded reverse tunnel points at nothing; the headless renderer takes the
-/// documented one so services can reach it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindPort {
-    /// Whatever the kernel gives, read back with `local_addr()` after the bind.
-    Ephemeral,
-    /// `config.port()`, the `serve` daemon's contract with its clients.
-    Configured,
-}
 
 /// Which KEK unlocked this session, and therefore whether keys may leave the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,7 +250,6 @@ impl Runtime {
         backend: Box<dyn BackendImpl>,
         gate: UnlockGate,
         renderer: Arc<dyn Renderer>,
-        bind: BindPort,
         store: flock::Claim,
     ) -> Result<Self, RuntimeErr> {
         let config = Arc::new(config);
@@ -294,13 +274,7 @@ impl Runtime {
                 let adapters = hc_sign::manifest::load_all(&config)?;
                 let count = adapters.len();
                 let tls = crate::tls_from_home()?;
-                let wanted = SocketAddr::new(
-                    Ipv4Addr::LOCALHOST.into(),
-                    match bind {
-                        BindPort::Ephemeral => EPHEMERAL,
-                        BindPort::Configured => config.port(),
-                    },
-                );
+                let wanted = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), config.port());
                 let listener = tokio.block_on(TcpListener::bind(wanted))?;
                 let addr = listener.local_addr()?;
                 let found = exposure::scan_stranded(addr.port())?;
@@ -383,7 +357,7 @@ impl Runtime {
         Ok(Runtime {
             api: HotApi::runtime(backend, config.clone(), git.clone()),
             gate,
-            approver: Approver::new(gate, renderer),
+            approver: Approver::direct(gate, renderer),
             serving,
             tunnels,
             tokio,
